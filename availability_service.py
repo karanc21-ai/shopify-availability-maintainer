@@ -35,6 +35,8 @@ Env you MUST set (Render → Environment):
 Start command (Render):
 /opt/render/project/src/.venv/bin/gunicorn -w 1 -t 600 -b 0.0.0.0:$PORT availability_service:app
 """
+import hmac, base64, threading, time, os
+from flask import request
 
 import os, time, json, sys, csv, re, warnings, threading
 from datetime import datetime
@@ -595,6 +597,73 @@ def process_collection(handle: str) -> Dict[str, Any]:
 app = Flask(__name__)
 run_lock = threading.Lock()
 is_running = False
+# ---- Webhook HMAC verification ----
+def _verify_shopify_hmac(raw_body: bytes, header_hmac: str, secret: str) -> bool:
+    try:
+        digest = hmac.new(secret.encode("utf-8"), raw_body, digestmod="sha256").digest()
+        expected = base64.b64encode(digest).decode("utf-8")
+        return hmac.compare_digest(expected, header_hmac or "")
+    except Exception:
+        return False
+
+# ---- Debounced background runner ----
+_last_kick = 0.0
+_kick_lock = threading.Lock()
+
+def _kick_collection_run(handle: str, force: bool = False, min_interval_sec: int = 30) -> None:
+    """Start process_collection(handle) in a thread, but at most once per min_interval_sec."""
+    global _last_kick
+    now = time.time()
+    with _kick_lock:
+        if now - _last_kick < min_interval_sec:
+            # Too soon since last run — skip (debounced)
+            return
+        _last_kick = now
+
+    def _worker():
+        try:
+            # If your script supports a force flag, pass it in; otherwise ignore.
+            print(f"[WEBHOOK] Running availability sync for collection '{handle}' (debounced)")
+            process_collection(handle)
+        except Exception as e:
+            print(f"[WEBHOOK] run error: {e}")
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+# Root route so Render health checks don’t 404
+@app.get("/")
+def root_ok():
+    return "ok", 200
+
+# Health route (if not already present)
+@app.get("/health")
+def health_ok():
+    return "ok", 200
+
+# ---- Inventory webhook endpoint ----
+@app.post("/webhook/inventory")
+def webhook_inventory():
+    secret = os.environ.get("SHOPIFY_WEBHOOK_SECRET", "")
+    if not secret:
+        return "server misconfigured (no SHOPIFY_WEBHOOK_SECRET)", 500
+
+    raw = request.get_data()
+    header_hmac = request.headers.get("X-Shopify-Hmac-SHA256", "")
+
+    if not _verify_shopify_hmac(raw, header_hmac, secret):
+        return "unauthorized", 401
+
+    # Optional: look at topic / shop if you want
+    topic = request.headers.get("X-Shopify-Topic", "")
+    shop  = request.headers.get("X-Shopify-Shop-Domain", "")
+    print(f"[WEBHOOK] {topic} from {shop}")
+
+    # Kick background run for the collection you care about
+    handle = os.environ.get("COLLECTION_HANDLE", "pearl-pendant-gold-plated")
+    _kick_collection_run(handle, force=False, min_interval_sec=30)
+
+    # Always ACK quickly (Shopify expects 200)
+    return "ok", 200
 
 def _cors(resp):
     resp.headers["Access-Control-Allow-Origin"] = "*"
