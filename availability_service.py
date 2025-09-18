@@ -6,7 +6,7 @@ Shopify availability → status + metafields updater (event-driven via webhook)
 Admin API: 2024-10
 
 Behavior:
-- Listens to Shopify webhook: inventory_levels/update
+- Listens to Shopify webhook: inventory_levels/update (recommended), also accepts inventory_items/update
 - For each inventory_item_id in the webhook, finds the owning product
 - Recomputes product availability = sum of ALL tracked variants' inventoryQuantity
 - If availability == 0:
@@ -33,8 +33,7 @@ from flask import Flask, request, jsonify
 # --------------------
 # CONFIG (via env)
 # --------------------
-ADMIN_HOST = os.environ.get("ADMIN_HOST", "silver-rudradhan.myshopify.com")
-SHOP = ADMIN_HOST
+ADMIN_HOST = os.environ.get("ADMIN_HOST", "silver-rudradhan.myshopify.com")  # myshopify host
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN")                 # REQUIRED (Admin access token)
 SHOPIFY_WEBHOOK_SECRET = os.environ.get("SHOPIFY_WEBHOOK_SECRET")  # REQUIRED (webhook signing key / app API secret)
 API_VERSION = os.environ.get("ADMIN_API_VERSION", "2024-10")
@@ -44,8 +43,8 @@ DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 CHANGE_STATUS = os.environ.get("CHANGE_STATUS", "false").lower() == "true"
 
 # Metafields
-MF_NAMESPACE = os.environ.get("MF_NAMESPACE", "custom")
-MF_BADGES_KEY = os.environ.get("MF_BADGES_KEY", "badges")
+MF_NAMESPACE    = os.environ.get("MF_NAMESPACE", "custom")
+MF_BADGES_KEY   = os.environ.get("MF_BADGES_KEY", "badges")
 MF_DELIVERY_KEY = os.environ.get("MF_DELIVERY_KEY", "delivery_time")
 
 BADGE_READY    = os.environ.get("BADGE_READY", "Ready To Ship")
@@ -55,7 +54,6 @@ DELIVERY_MTO   = os.environ.get("DELIVERY_MTO", "12-15 Days Across India")
 # If your badges metafield is a LIST, keep this override; if scalar, change to "single_line_text_field"
 TYPE_OVERRIDE: Dict[Tuple[str, str], str] = {
     (MF_NAMESPACE, MF_BADGES_KEY): os.environ.get("BADGES_TYPE", "list.single_line_text_field"),
-    # You can force delivery_time type too if needed:
     # (MF_NAMESPACE, MF_DELIVERY_KEY): "single_line_text_field",
 }
 
@@ -68,15 +66,15 @@ DEBOUNCE_SEC = int(os.environ.get("DEBOUNCE_SEC", "10"))
 app = Flask(__name__)
 app.url_map.strict_slashes = False
 
-HEADERS = {
-    "X-Shopify-Access-Token": ADMIN_TOKEN or "",
-    "Content-Type": "application/json",
-}
-
 if not ADMIN_TOKEN:
     raise RuntimeError("ADMIN_TOKEN env var is required")
 if not SHOPIFY_WEBHOOK_SECRET:
     raise RuntimeError("SHOPIFY_WEBHOOK_SECRET env var is required")
+
+HEADERS = {
+    "X-Shopify-Access-Token": ADMIN_TOKEN,
+    "Content-Type": "application/json",
+}
 
 # --------------------
 # Helpers
@@ -104,7 +102,7 @@ def rest_get_variants_by_inventory_item_ids(inv_ids: list) -> list:
     Map inventory_item_ids -> variants (then -> product_id).
     Uses REST: /variants.json?inventory_item_ids=...
     """
-    base = f"https://{SHOP}/admin/api/{ADMIN_API_VERSION}/variants.json"
+    base = f"https://{ADMIN_HOST}/admin/api/{API_VERSION}/variants.json"
     out = []
     CHUNK = 50
     for i in range(0, len(inv_ids), CHUNK):
@@ -117,7 +115,6 @@ def rest_get_variants_by_inventory_item_ids(inv_ids: list) -> list:
         out.extend(js.get("variants", []))
         time.sleep(0.2)
     return out
-
 
 # --------------------
 # Availability logic
@@ -307,7 +304,6 @@ def schedule_product_update(product_id_numeric: str):
         if now - last < DEBOUNCE_SEC:
             return
         _last_run_by_product[product_id_numeric] = now
-
     threading.Thread(target=recompute_and_apply, args=(product_id_numeric,), daemon=True).start()
 
 # --------------------
@@ -331,7 +327,6 @@ def run_manual():
     return jsonify({"queued": pid}), 200
 
 @app.route("/webhook/inventory", methods=["POST", "GET"])
-@app.route("/webhook/inventory", methods=["POST", "GET"])
 def webhook_inventory():
     # Quick liveness probe (Shopify will POST; GET is for you)
     if request.method == "GET":
@@ -353,14 +348,13 @@ def webhook_inventory():
     def _add(val):
         s = str(val or "").strip()
         if s:
-            # only keep digits (inventory item IDs are numeric)
+            # keep digits only (inventory item IDs are numeric)
             s = "".join(ch for ch in s if ch.isdigit())
             if s:
                 inv_ids.add(s)
 
-    # ----- Accept both shapes -----
-    # A) inventory_levels/update (what fires when you change "Available" on a variant)
-    if "levels" in topic:
+    # A) inventory_levels/update (fires when “Available” changes)
+    if "inventory_levels/update" in topic:
         if isinstance(payload, dict):
             if "inventory_item_id" in payload:
                 _add(payload.get("inventory_item_id"))
@@ -369,8 +363,8 @@ def webhook_inventory():
             if "InventoryLevel" in gid and "inventory_item_id=" in gid:
                 _add(gid.split("inventory_item_id=")[-1].split("&")[0])
 
-    # B) inventory_items/update (top-level id is the inventory item id)
-    if "items" in topic:
+    # B) inventory_items/update (when item changes)
+    if "inventory_items/update" in topic:
         if isinstance(payload, dict):
             if "id" in payload:
                 _add(payload.get("id"))
@@ -379,14 +373,14 @@ def webhook_inventory():
             if "InventoryItem" in gid:
                 _add(gid.split("/")[-1].split("?")[0])
 
-    # C) Some send arrays
+    # C) Array payloads
     if isinstance(payload, list):
         for it in payload:
             if not isinstance(it, dict):
                 continue
             if "inventory_item_id" in it:
                 _add(it.get("inventory_item_id"))
-            if "id" in it and "items" in topic:
+            if "id" in it and "inventory_items/update" in topic:
                 _add(it.get("id"))
             gid = it.get("admin_graphql_api_id", "")
             if "InventoryLevel" in gid and "inventory_item_id=" in gid:
@@ -407,23 +401,6 @@ def webhook_inventory():
 
         print(f"[WEBHOOK] will recompute {len(product_ids)} product(s)")
         for pid in product_ids:
-            # If your code has a queue: schedule_product_update(pid)
-            try:
-                schedule_product_update(pid)  # preferred if you already have it
-            except NameError:
-                # direct fallback
-                recompute_and_push_for_product(pid)
-    except Exception as e:
-        print(f"[ERR] mapping inventory_item -> product: {e}")
-
-    return "ok", 200
-
-    try:
-        variants = rest_get_variants_by_inventory_item_ids(sorted(inv_ids))
-        product_ids = {str(v.get("product_id")) for v in variants if v.get("product_id")}
-        if not product_ids:
-            print(f"[INFO] no variants found for inv_item_ids={sorted(inv_ids)}")
-        for pid in product_ids:
             schedule_product_update(pid)
     except Exception as e:
         print(f"[ERR] mapping inventory_item -> product: {e}")
@@ -441,6 +418,5 @@ _print_routes()
 # Gunicorn entrypoint
 # --------------------
 if __name__ == "__main__":
-    # Local dev
     port = int(os.environ.get("PORT", "5050"))
     app.run(host="0.0.0.0", port=port, debug=False)
