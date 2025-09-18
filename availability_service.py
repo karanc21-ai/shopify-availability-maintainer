@@ -34,6 +34,7 @@ from flask import Flask, request, jsonify
 # CONFIG (via env)
 # --------------------
 ADMIN_HOST = os.environ.get("ADMIN_HOST", "silver-rudradhan.myshopify.com")
+SHOP = ADMIN_HOST
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN")                 # REQUIRED (Admin access token)
 SHOPIFY_WEBHOOK_SECRET = os.environ.get("SHOPIFY_WEBHOOK_SECRET")  # REQUIRED (webhook signing key / app API secret)
 API_VERSION = os.environ.get("ADMIN_API_VERSION", "2024-10")
