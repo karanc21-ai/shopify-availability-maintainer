@@ -98,15 +98,25 @@ def gql(query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any
         raise RuntimeError(f"GraphQL errors: {json.dumps(data['errors'], indent=2)}")
     return data.get("data", {})
 
-def rest_get_variants_by_inventory_item_ids(inventory_item_ids: List[str]) -> List[Dict[str, Any]]:
-    """Use REST to map inventory_item_id → variant (which gives product_id)."""
-    ids_param = ",".join(inventory_item_ids)
-    url = f"https://{ADMIN_HOST}/admin/api/{API_VERSION}/variants.json?inventory_item_ids={ids_param}&fields=id,product_id,inventory_item_id"
-    r = requests.get(url, headers={"X-Shopify-Access-Token": ADMIN_TOKEN}, timeout=60)
-    if r.status_code != 200:
-        raise RuntimeError(f"REST variants HTTP {r.status_code}: {r.text}")
-    j = r.json() or {}
-    return j.get("variants", []) or []
+def rest_get_variants_by_inventory_item_ids(inv_ids: list) -> list:
+    """
+    Map inventory_item_ids -> variants (then -> product_id).
+    Uses REST: /variants.json?inventory_item_ids=...
+    """
+    base = f"https://{SHOP}/admin/api/{ADMIN_API_VERSION}/variants.json"
+    out = []
+    CHUNK = 50
+    for i in range(0, len(inv_ids), CHUNK):
+        ids = ",".join(inv_ids[i:i+CHUNK])
+        r = requests.get(base, headers=HEADERS, params={"inventory_item_ids": ids, "limit": 250}, timeout=30)
+        if r.status_code != 200:
+            print(f"[REST] variants http {r.status_code}: {r.text[:200]}")
+            continue
+        js = r.json()
+        out.extend(js.get("variants", []))
+        time.sleep(0.2)
+    return out
+
 
 # --------------------
 # Availability logic
@@ -320,13 +330,16 @@ def run_manual():
     return jsonify({"queued": pid}), 200
 
 @app.route("/webhook/inventory", methods=["POST", "GET"])
+@app.route("/webhook/inventory", methods=["POST", "GET"])
 def webhook_inventory():
+    # Quick liveness probe (Shopify will POST; GET is for you)
     if request.method == "GET":
         return "route-alive", 200
 
     raw = request.get_data()
     header_hmac = request.headers.get("X-Shopify-Hmac-SHA256", "")
     if not _verify_shopify_hmac(raw, header_hmac):
+        print("[WEBHOOK] 401 bad HMAC")
         return "unauthorized", 401
 
     topic = (request.headers.get("X-Shopify-Topic", "") or "").strip()
@@ -336,46 +349,73 @@ def webhook_inventory():
     payload = request.get_json(silent=True) or {}
     inv_ids = set()
 
-    def maybe_add_inventory_item_id(val):
+    def _add(val):
         s = str(val or "").strip()
-        if s.isdigit():
-            inv_ids.add(s)
+        if s:
+            # only keep digits (inventory item IDs are numeric)
+            s = "".join(ch for ch in s if ch.isdigit())
+            if s:
+                inv_ids.add(s)
 
-    # ---- Accept both topics & shapes ----
-    # A) inventory_levels/update → has inventory_item_id (int) and sometimes an InventoryLevel GID with a query param
-    if isinstance(payload, dict):
-        if "inventory_item_id" in payload:
-            maybe_add_inventory_item_id(payload.get("inventory_item_id"))
+    # ----- Accept both shapes -----
+    # A) inventory_levels/update (what fires when you change "Available" on a variant)
+    if "levels" in topic:
+        if isinstance(payload, dict):
+            if "inventory_item_id" in payload:
+                _add(payload.get("inventory_item_id"))
+            gid = payload.get("admin_graphql_api_id", "")
+            # gid://shopify/InventoryLevel/<level>?inventory_item_id=27187834659643
+            if "InventoryLevel" in gid and "inventory_item_id=" in gid:
+                _add(gid.split("inventory_item_id=")[-1].split("&")[0])
 
-        gid = payload.get("admin_graphql_api_id", "")
-        # InventoryLevel GID sometimes looks like:
-        # gid://shopify/InventoryLevel/<level_id>?inventory_item_id=27187834659643
-        if "InventoryLevel" in gid and "inventory_item_id=" in gid:
-            inv_ids.add(gid.split("inventory_item_id=")[-1].split("&")[0])
+    # B) inventory_items/update (top-level id is the inventory item id)
+    if "items" in topic:
+        if isinstance(payload, dict):
+            if "id" in payload:
+                _add(payload.get("id"))
+            gid = payload.get("admin_graphql_api_id", "")
+            # gid://shopify/InventoryItem/27187834659643
+            if "InventoryItem" in gid:
+                _add(gid.split("/")[-1].split("?")[0])
 
-    # B) inventory_items/update → top-level "id" is the inventory item id
-    if isinstance(payload, dict) and "id" in payload and "inventory_items" in topic:
-        maybe_add_inventory_item_id(payload.get("id"))
-
-    # C) Some apps/tests send arrays of objects
+    # C) Some send arrays
     if isinstance(payload, list):
         for it in payload:
             if not isinstance(it, dict):
                 continue
             if "inventory_item_id" in it:
-                maybe_add_inventory_item_id(it.get("inventory_item_id"))
-            if "id" in it and "inventory_items" in topic:
-                maybe_add_inventory_item_id(it.get("id"))
+                _add(it.get("inventory_item_id"))
+            if "id" in it and "items" in topic:
+                _add(it.get("id"))
             gid = it.get("admin_graphql_api_id", "")
             if "InventoryLevel" in gid and "inventory_item_id=" in gid:
-                inv_ids.add(gid.split("inventory_item_id=")[-1].split("&")[0])
+                _add(gid.split("inventory_item_id=")[-1].split("&")[0])
             if "InventoryItem" in gid:
-                # gid://shopify/InventoryItem/27187834659643
-                inv_ids.add(gid.split("/")[-1].split("?")[0])
+                _add(gid.split("/")[-1].split("?")[0])
 
     if not inv_ids:
         print("[WEBHOOK] no inventory_item_id found in payload")
         return "ok", 200
+
+    try:
+        variants = rest_get_variants_by_inventory_item_ids(sorted(inv_ids))
+        product_ids = {str(v.get("product_id")) for v in variants if v.get("product_id")}
+        if not product_ids:
+            print(f"[WEBHOOK] no variants for inventory_item_ids={sorted(inv_ids)}")
+            return "ok", 200
+
+        print(f"[WEBHOOK] will recompute {len(product_ids)} product(s)")
+        for pid in product_ids:
+            # If your code has a queue: schedule_product_update(pid)
+            try:
+                schedule_product_update(pid)  # preferred if you already have it
+            except NameError:
+                # direct fallback
+                recompute_and_push_for_product(pid)
+    except Exception as e:
+        print(f"[ERR] mapping inventory_item -> product: {e}")
+
+    return "ok", 200
 
     try:
         variants = rest_get_variants_by_inventory_item_ids(sorted(inv_ids))
