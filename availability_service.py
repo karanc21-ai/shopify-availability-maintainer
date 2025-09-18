@@ -343,7 +343,7 @@ def webhook_inventory():
         return "unauthorized", 401
 
     topic = (request.headers.get("X-Shopify-Topic", "") or "").strip()
-    shop  = (request.headers.get("X-Shopify-Shop-Domain", "") or "").strip()
+    SHOP  = (request.headers.get("X-Shopify-Shop-Domain", "") or "").strip()
     print(f"[WEBHOOK] {topic} from {shop}")
 
     payload = request.get_json(silent=True) or {}
