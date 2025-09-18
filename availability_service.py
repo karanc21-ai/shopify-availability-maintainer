@@ -322,7 +322,6 @@ def run_manual():
 @app.route("/webhook/inventory", methods=["POST", "GET"])
 def webhook_inventory():
     if request.method == "GET":
-        # Quick existence check
         return "route-alive", 200
 
     raw = request.get_data()
@@ -330,34 +329,59 @@ def webhook_inventory():
     if not _verify_shopify_hmac(raw, header_hmac):
         return "unauthorized", 401
 
-    topic = request.headers.get("X-Shopify-Topic", "")
-    shop  = request.headers.get("X-Shopify-Shop-Domain", "")
+    topic = (request.headers.get("X-Shopify-Topic", "") or "").strip()
+    shop  = (request.headers.get("X-Shopify-Shop-Domain", "") or "").strip()
     print(f"[WEBHOOK] {topic} from {shop}")
 
-    # Parse payload and collect inventory_item_id(s)
     payload = request.get_json(silent=True) or {}
-    inv_ids: List[str] = []
+    inv_ids = set()
 
-    # Most common payload has top-level "inventory_item_id"
-    if "inventory_item_id" in payload:
-        inv_ids.append(str(payload.get("inventory_item_id")))
-    # Some bulk/test formats might carry a list
+    def maybe_add_inventory_item_id(val):
+        s = str(val or "").strip()
+        if s.isdigit():
+            inv_ids.add(s)
+
+    # ---- Accept both topics & shapes ----
+    # A) inventory_levels/update → has inventory_item_id (int) and sometimes an InventoryLevel GID with a query param
+    if isinstance(payload, dict):
+        if "inventory_item_id" in payload:
+            maybe_add_inventory_item_id(payload.get("inventory_item_id"))
+
+        gid = payload.get("admin_graphql_api_id", "")
+        # InventoryLevel GID sometimes looks like:
+        # gid://shopify/InventoryLevel/<level_id>?inventory_item_id=27187834659643
+        if "InventoryLevel" in gid and "inventory_item_id=" in gid:
+            inv_ids.add(gid.split("inventory_item_id=")[-1].split("&")[0])
+
+    # B) inventory_items/update → top-level "id" is the inventory item id
+    if isinstance(payload, dict) and "id" in payload and "inventory_items" in topic:
+        maybe_add_inventory_item_id(payload.get("id"))
+
+    # C) Some apps/tests send arrays of objects
     if isinstance(payload, list):
         for it in payload:
-            if isinstance(it, dict) and "inventory_item_id" in it:
-                inv_ids.append(str(it["inventory_item_id"]))
+            if not isinstance(it, dict):
+                continue
+            if "inventory_item_id" in it:
+                maybe_add_inventory_item_id(it.get("inventory_item_id"))
+            if "id" in it and "inventory_items" in topic:
+                maybe_add_inventory_item_id(it.get("id"))
+            gid = it.get("admin_graphql_api_id", "")
+            if "InventoryLevel" in gid and "inventory_item_id=" in gid:
+                inv_ids.add(gid.split("inventory_item_id=")[-1].split("&")[0])
+            if "InventoryItem" in gid:
+                # gid://shopify/InventoryItem/27187834659643
+                inv_ids.add(gid.split("/")[-1].split("?")[0])
 
-    inv_ids = [i for i in inv_ids if i and i.isdigit()]
     if not inv_ids:
-        # Nothing to do; acknowledge
+        print("[WEBHOOK] no inventory_item_id found in payload")
         return "ok", 200
 
-    # Map inv_item → variant(s) → product_id(s)
     try:
-        variants = rest_get_variants_by_inventory_item_ids(inv_ids)
+        variants = rest_get_variants_by_inventory_item_ids(sorted(inv_ids))
         product_ids = {str(v.get("product_id")) for v in variants if v.get("product_id")}
         if not product_ids:
-            print(f"[INFO] no variants found for inv_item_ids={inv_ids}")
+            print(f"[INFO] no variants found for inv_item_ids={sorted(inv_ids)}")
         for pid in product_ids:
             schedule_product_update(pid)
     except Exception as e:
