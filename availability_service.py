@@ -5,19 +5,16 @@
 Shopify availability → status + metafields updater (collection-scoped)
 + Sales inference (no webhooks): sales_total & sales_dates on availability drops.
 
-Key fixes in this version:
-- Matches store metafield definitions automatically:
-  * Detects metafield definition types via GraphQL metafieldDefinitions(ownerType=PRODUCT)
-  * Uses the correct type when writing (prevents "Type 'list.date' must be consistent with 'date'")
-  * For KEY_DATES:
-      - If definition is 'date' → writes today's date string (single scalar)
-      - If definition is 'list.date' → writes JSON list of dates as before
-- Rate limit hardening:
-  * Retries on HTTP 429 and GraphQL THROTTLED errors with exponential backoff + jitter
-- More robust type resolution for badges/delivery (node → definition → default)
+Polling-only build:
+- Scheduler polls collections every RUN_EVERY_MIN minutes (0 = disabled).
+- Optional no-op webhook routes return 200 to avoid 404 logs; actual webhook logic is disabled by default.
+
+Key hardening:
+- Metafield type auto-detection via metafieldDefinitions (prevents list.date vs date mismatch).
+- Exponential backoff + jitter on GraphQL THROTTLED / HTTP 429.
 """
 
-import os, time, json, sys, csv, re, warnings, threading, random
+import os, time, json, sys, csv, re, warnings, threading, random, base64, hmac, hashlib
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List, Tuple
 
@@ -49,6 +46,10 @@ PIXEL_SHARED_SECRET = os.getenv("PIXEL_SHARED_SECRET", "").strip()
 if not PIXEL_SHARED_SECRET:
     raise RuntimeError("PIXEL_SHARED_SECRET env var is required")
 
+# Webhook handling toggle (default OFF). We still mount no-op routes to avoid 404 noise.
+ENABLE_WEBHOOKS = os.getenv("ENABLE_WEBHOOKS", "0") == "1"
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+
 # Multiple collection handles allowed, comma-separated
 COLLECTION_HANDLES = [h.strip() for h in os.getenv("COLLECTION_HANDLES", "pearl-pendant-gold-plated").split(",") if h.strip()]
 RUN_EVERY_MIN = int(os.getenv("RUN_EVERY_MIN", "0"))   # 0 = disabled
@@ -75,10 +76,8 @@ BADGE_READY    = "Ready To Ship"
 DELIVERY_READY = "2-5 Days Across India"
 DELIVERY_MTO   = "12-15 Days Across India"
 
-# If badges is a LIST (your store uses list.single_line_text_field), keep as is.
-# If scalar, this will be overridden automatically by metafield definition lookup.
+# Type override: usually let definitions drive this; uncomment if you KNOW it's a list.
 TYPE_OVERRIDE = {
-    # Keep this if your store's "badges" is definitively a list type; otherwise, remove and rely on definition lookup.
     # (MF_NAMESPACE, MF_BADGES_KEY): "list.single_line_text_field",
 }
 
@@ -97,17 +96,13 @@ class Throttled(Exception):
     pass
 
 GQL_ENDPOINT = f"https://{ADMIN_HOST}/admin/api/{ADMIN_API_VERSION}/graphql.json"
-HEADERS = {
-    "X-Shopify-Access-Token": ADMIN_TOKEN,
-    "Content-Type": "application/json",
-}
+HEADERS = {"X-Shopify-Access-Token": ADMIN_TOKEN, "Content-Type": "application/json"}
 
 def _maybe_raise_throttled_from_graphql_errors(errors: List[Dict[str, Any]]):
     for e in errors or []:
         code = ((e.get("extensions") or {}).get("code") or "").upper()
         if code == "THROTTLED":
             raise Throttled(json.dumps(errors))
-    # Not throttled → raise generic
     raise RuntimeError(f"GraphQL errors: {json.dumps(errors, indent=2)}")
 
 def gql(query: str, variables: Optional[Dict[str, Any]] = None, max_attempts: int = 7) -> Dict[str, Any]:
@@ -128,7 +123,6 @@ def gql(query: str, variables: Optional[Dict[str, Any]] = None, max_attempts: in
         except Throttled as te:
             if attempt >= max_attempts:
                 raise RuntimeError(f"Throttled after {attempt} attempts: {te}")
-            # exponential backoff with jitter, capped
             sleep_s = min(0.5 * (2 ** (attempt - 1)), 10.0) + random.uniform(0, 0.25)
             if DEBUG_VERBOSE:
                 print(f"[BACKOFF] THROTTLED attempt {attempt}/{max_attempts} → sleep {sleep_s:.2f}s", flush=True)
@@ -189,13 +183,7 @@ query ProductMF($id: ID!) {
 QUERY_MF_DEFINITION = """
 query MFDef($ownerType: MetafieldOwnerType!, $namespace: String!, $key: String!) {
   metafieldDefinitions(first: 1, ownerType: $ownerType, namespace: $namespace, key: $key) {
-    edges {
-      node {
-        id
-        name
-        type { name }
-      }
-    }
+    edges { node { id name type { name } } }
   }
 }
 """
@@ -323,19 +311,14 @@ def _save_json(path, data):
 # =========================
 # Metafield Definition Cache & Resolution
 # =========================
-MF_DEF_CACHE: Dict[Tuple[str, str], str] = {}  # (namespace,key) -> type name (e.g., "list.date" or "date")
+MF_DEF_CACHE: Dict[Tuple[str, str], str] = {}  # (namespace,key) -> type name (e.g., "date", "list.date")
 
 def get_definition_type(namespace: str, key: str, owner_type: str = "PRODUCT") -> Optional[str]:
-    """Fetch and cache the metafield definition type (e.g., 'date', 'list.date')."""
     ck = (namespace, key)
     if ck in MF_DEF_CACHE:
         return MF_DEF_CACHE[ck]
     try:
-        data = gql(QUERY_MF_DEFINITION, {
-            "ownerType": owner_type,
-            "namespace": namespace,
-            "key": key
-        })
+        data = gql(QUERY_MF_DEFINITION, {"ownerType": owner_type, "namespace": namespace, "key": key})
         edges = (((data.get("metafieldDefinitions") or {}).get("edges")) or [])
         if edges:
             tname = (((edges[0].get("node") or {}).get("type") or {}).get("name")) or ""
@@ -349,7 +332,7 @@ def get_definition_type(namespace: str, key: str, owner_type: str = "PRODUCT") -
     return None
 
 def resolve_mf_type(ns: str, key: str, node: Optional[Dict[str, Any]]) -> str:
-    """Prefer: explicit override → existing node type → store definition → safe default."""
+    # Prefer: explicit override → existing node type → store definition → safe default
     t = TYPE_OVERRIDE.get((ns, key))
     if t:
         return t
@@ -358,7 +341,6 @@ def resolve_mf_type(ns: str, key: str, node: Optional[Dict[str, Any]]) -> str:
     tdef = get_definition_type(ns, key, owner_type="PRODUCT")
     if tdef:
         return tdef
-    # Safe fallback (kept minimal to avoid type mismatches)
     return "single_line_text_field"
 
 def format_value_for_type(desired_value: str, mf_type: str) -> str:
@@ -571,7 +553,7 @@ def process_collection(handle: str, seed_only: bool = False) -> Dict[str, Any]:
     # For batching sales metafields
     sales_mf_inputs: List[Dict[str, Any]] = []
 
-    QUERY = QUERY_COLLECTION_PAGE  # already formatted with PER_PAGE & keys
+    QUERY = QUERY_COLLECTION_PAGE  # already formatted
     today = today_ist_str()
 
     # Pre-fetch store definition types for sales fields (once)
@@ -620,20 +602,16 @@ def process_collection(handle: str, seed_only: bool = False) -> Dict[str, Any]:
                     sold = -diff
                     # Update counters
                     sales_counts[pid_num] = int(sales_counts.get(pid_num, 0)) + sold
-                    dates_set = set(sale_dates.get(pid_num, []))
-                    dates_set.add(today)
-                    if len(dates_set) > SALES_DATES_LIMIT:
-                        dates_set = set(sorted(dates_set)[-SALES_DATES_LIMIT:])
-                    sale_dates[pid_num] = sorted(dates_set)
-
-                    # Stage metafield writes for this product
-                    # Resolve node types (prefer node → store def → default)
+                    dates = set(sale_dates.get(pid_num, []))
+                    dates.add(today)
+                    if len(dates) > SALES_DATES_LIMIT:
+                        dates = set(sorted(dates)[-SALES_DATES_LIMIT:])
+                    sale_dates[pid_num] = sorted(dates)
+                    # stage metafields writes for this product
                     sales_total_node = p.get("salesTotal") or {}
                     sales_dates_node = p.get("salesDates") or {}
-
                     st_type = sales_total_node.get("type") or sales_total_def_type or "number_integer"
                     sd_type = sales_dates_node.get("type") or sales_dates_def_type or "list.date"
-
                     sales_mf_inputs.append({
                         "ownerId": pid_gid,
                         "namespace": MF_NAMESPACE,
@@ -641,9 +619,7 @@ def process_collection(handle: str, seed_only: bool = False) -> Dict[str, Any]:
                         "type": st_type,
                         "value": str(int(sales_counts[pid_num])),
                     })
-
                     if sd_type == "date":
-                        # Store only the latest date (scalar)
                         sales_mf_inputs.append({
                             "ownerId": pid_gid,
                             "namespace": MF_NAMESPACE,
@@ -660,7 +636,7 @@ def process_collection(handle: str, seed_only: bool = False) -> Dict[str, Any]:
                             "value": json.dumps(sale_dates[pid_num]),
                         })
                     else:
-                        # Fallback: attempt scalar date to be safe
+                        # Safe fallback
                         sales_mf_inputs.append({
                             "ownerId": pid_gid,
                             "namespace": MF_NAMESPACE,
@@ -671,7 +647,7 @@ def process_collection(handle: str, seed_only: bool = False) -> Dict[str, Any]:
                 # Always refresh baseline after check
                 avail_baseline[pid_num] = int(avail)
 
-            # --- Existing READY/MTO behavior ---
+            # --- READY/MTO behavior ---
             badges_node = p.get("badges") or None
             dtime_node  = p.get("dtime")  or None
             badges_before = normalize_text_value((badges_node or {}).get("value"))
@@ -793,6 +769,19 @@ def _cors(resp):
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return resp
 
+def _verify_shopify_hmac(req) -> bool:
+    # Only used if ENABLE_WEBHOOKS=1; for stubs we just 200.
+    if not WEBHOOK_SECRET:
+        key_q = (req.args.get("key") or "").strip()
+        return key_q == PIXEL_SHARED_SECRET
+    try:
+        received = req.headers.get("X-Shopify-Hmac-Sha256", "")
+        digest = hmac.new(WEBHOOK_SECRET.encode("utf-8"), req.data, hashlib.sha256).digest()
+        computed = base64.b64encode(digest).decode("utf-8")
+        return hmac.compare_digest(received, computed)
+    except Exception:
+        return False
+
 @app.route("/health", methods=["GET"])
 def health():
     return "ok", 200
@@ -803,14 +792,17 @@ def run_options():
 
 @app.route("/availability/run", methods=["GET", "POST"])
 def run_now():
+    # simple key check
     key = (request.args.get("key") or request.form.get("key") or "").strip()
     if key != PIXEL_SHARED_SECRET:
         return _cors(make_response(("forbidden", 403)))
 
     handle = (request.args.get("handle") or request.form.get("handle") or "").strip()
     if not handle:
+        # default to first configured handle
         handle = COLLECTION_HANDLES[0]
 
+    # allow ad-hoc overrides via query
     global DRY_RUN, CHANGE_STATUS, FORCE_WRITE_METAFIELDS
     if "dry_run" in request.args:
         DRY_RUN = request.args.get("dry_run") in ("1", "true", "True")
@@ -819,6 +811,7 @@ def run_now():
     if "force_write" in request.args:
         FORCE_WRITE_METAFIELDS = request.args.get("force_write") in ("1", "true", "True")
 
+    # prevent concurrent runs
     global is_running
     with run_lock:
         if is_running:
@@ -886,7 +879,33 @@ def seed_all():
             is_running = False
 
 # =========================
-# Optional scheduler
+# Webhook routes (no-op by default to avoid 404 logs)
+# =========================
+if ENABLE_WEBHOOKS:
+    @app.route("/webhook/inventory", methods=["POST"])
+    def webhook_inventory():
+        if not _verify_shopify_hmac(request):
+            return _cors(make_response(("forbidden", 403)))
+        # If you ever enable real-time, you can trigger runs here.
+        return _cors(make_response(("ok", 200)))
+
+    @app.route("/webhook/orders_create", methods=["POST"])
+    def webhook_orders_create():
+        if not _verify_shopify_hmac(request):
+            return _cors(make_response(("forbidden", 403)))
+        return _cors(make_response(("ok", 200)))
+else:
+    # No-op stubs: always 200 OK; keeps logs clean if something pings the URL.
+    @app.route("/webhook/inventory", methods=["POST"])
+    def webhook_inventory_noop():
+        return _cors(make_response(("ok", 200)))
+
+    @app.route("/webhook/orders_create", methods=["POST"])
+    def webhook_orders_create_noop():
+        return _cors(make_response(("ok", 200)))
+
+# =========================
+# Optional scheduler (polling)
 # =========================
 def scheduler_loop():
     if RUN_EVERY_MIN <= 0:
@@ -921,6 +940,6 @@ app = app  # gunicorn expects module:app
 
 if __name__ == "__main__":
     print(f"[BOOT] Availability service on {ADMIN_HOST} | API {ADMIN_API_VERSION}", flush=True)
-    print(f"[CFG] DRY_RUN={DRY_RUN} CHANGE_STATUS={CHANGE_STATUS} FORCE_WRITE_METAFIELDS={FORCE_WRITE_METAFIELDS} DEBUG_VERBOSE={DEBUG_VERBOSE}", flush=True)
+    print(f"[CFG] DRY_RUN={DRY_RUN} CHANGE_STATUS={CHANGE_STATUS} FORCE_WRITE_METAFIELDS={FORCE_WRITE_METAFIELDS} DEBUG_VERBOSE={DEBUG_VERBOSE} RUN_EVERY_MIN={RUN_EVERY_MIN} ENABLE_WEBHOOKS={ENABLE_WEBHOOKS}", flush=True)
     from werkzeug.serving import run_simple
-    run_simple("0.0.0.0", int(os.getenv("PORT", "5050")), app)
+    run_simple("0.0.0.0", PORT, app)
