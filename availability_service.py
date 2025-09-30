@@ -5,47 +5,19 @@
 Shopify availability → status + metafields updater (collection-scoped)
 + Sales inference (no webhooks): sales_total & sales_dates on availability drops.
 
-Runs as a web service with on-demand endpoints and an optional scheduler.
-
-Behavior:
-- Availability = sum of tracked variants' inventoryQuantity.
-- If availability == 0:
-    - (optionally) status → DRAFT        [CHANGE_STATUS]
-    - badges → **deleted** (clear all)
-    - delivery_time → "12-15 Days Across India"
-- If availability > 0:
-    - (optionally) status → ACTIVE       [CHANGE_STATUS]
-    - badges → "Ready To Ship" (exact choice)
-    - delivery_time → "2-5 Days Across India"
-
-Sales inference:
-- Maintains a per-product availability baseline on disk.
-- On each run, if current_avail - baseline < 0, that negative delta is counted as sales:
-    - custom.sales_total += (-delta)
-    - custom.sales_dates ← add today (IST) once (date list, max size limit)
-- Baseline is then set to current_avail to avoid double counting.
-
-Security:
-- Endpoints require ?key=PIXEL_SHARED_SECRET.
-
-Scheduler:
-- If RUN_EVERY_MIN > 0, a background thread runs all handles in COLLECTION_HANDLES every N minutes.
-
-Env you MUST set (Render → Environment):
-- ADMIN_HOST                e.g. silver-rudradhan.myshopify.com
-- ADMIN_TOKEN               Admin API access token
-- PIXEL_SHARED_SECRET
-- (optional) COLLECTION_HANDLES     comma-separated collection handles
-- (optional) RUN_EVERY_MIN          integer minutes (0 = disabled)
-- (optional) CHANGE_STATUS          "1" to enable product status changes
-- (optional) DRY_RUN                "1" to simulate writes
-- (optional) FORCE_WRITE_METAFIELDS "1" to force rewrite on READY↔MTO flips
-
-Start command (Render):
-/opt/render/project/src/.venv/bin/gunicorn -w 1 -t 600 -b 0.0.0.0:$PORT availability_service:app
+Key fixes in this version:
+- Matches store metafield definitions automatically:
+  * Detects metafield definition types via GraphQL metafieldDefinitions(ownerType=PRODUCT)
+  * Uses the correct type when writing (prevents "Type 'list.date' must be consistent with 'date'")
+  * For KEY_DATES:
+      - If definition is 'date' → writes today's date string (single scalar)
+      - If definition is 'list.date' → writes JSON list of dates as before
+- Rate limit hardening:
+  * Retries on HTTP 429 and GraphQL THROTTLED errors with exponential backoff + jitter
+- More robust type resolution for badges/delivery (node → definition → default)
 """
 
-import os, time, json, sys, csv, re, warnings, threading
+import os, time, json, sys, csv, re, warnings, threading, random
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List, Tuple
 
@@ -104,10 +76,10 @@ DELIVERY_READY = "2-5 Days Across India"
 DELIVERY_MTO   = "12-15 Days Across India"
 
 # If badges is a LIST (your store uses list.single_line_text_field), keep as is.
-# If scalar, change to "single_line_text_field".
+# If scalar, this will be overridden automatically by metafield definition lookup.
 TYPE_OVERRIDE = {
-    (MF_NAMESPACE, MF_BADGES_KEY): "list.single_line_text_field",
-    # (MF_NAMESPACE, MF_DELIVERY_KEY): "single_line_text_field",  # usually scalar; leave unset to auto
+    # Keep this if your store's "badges" is definitively a list type; otherwise, remove and rely on definition lookup.
+    # (MF_NAMESPACE, MF_BADGES_KEY): "list.single_line_text_field",
 }
 
 LOG_CSV_PATH = "availability_sync_log.csv"
@@ -119,23 +91,49 @@ SALES_JSON          = "sales_counts.json"     # pid(num) -> int
 SALE_DATES_JSON     = "sale_dates.json"       # pid(num) -> [YYYY-MM-DD,...]
 
 # =========================
-# GraphQL Helpers
+# GraphQL Helpers (+ backoff)
 # =========================
+class Throttled(Exception):
+    pass
+
 GQL_ENDPOINT = f"https://{ADMIN_HOST}/admin/api/{ADMIN_API_VERSION}/graphql.json"
 HEADERS = {
     "X-Shopify-Access-Token": ADMIN_TOKEN,
     "Content-Type": "application/json",
 }
 
-def gql(query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _maybe_raise_throttled_from_graphql_errors(errors: List[Dict[str, Any]]):
+    for e in errors or []:
+        code = ((e.get("extensions") or {}).get("code") or "").upper()
+        if code == "THROTTLED":
+            raise Throttled(json.dumps(errors))
+    # Not throttled → raise generic
+    raise RuntimeError(f"GraphQL errors: {json.dumps(errors, indent=2)}")
+
+def gql(query: str, variables: Optional[Dict[str, Any]] = None, max_attempts: int = 7) -> Dict[str, Any]:
     payload = {"query": query, "variables": variables or {}}
-    r = requests.post(GQL_ENDPOINT, headers=HEADERS, json=payload, timeout=60)
-    if r.status_code != 200:
-        raise RuntimeError(f"GraphQL HTTP {r.status_code}: {r.text}")
-    data = r.json()
-    if "errors" in data and data["errors"]:
-        raise RuntimeError(f"GraphQL errors: {json.dumps(data['errors'], indent=2)}")
-    return data.get("data", {})
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            r = requests.post(GQL_ENDPOINT, headers=HEADERS, json=payload, timeout=60)
+            if r.status_code == 429:
+                raise Throttled(f"HTTP 429: {r.text}")
+            if r.status_code != 200:
+                raise RuntimeError(f"GraphQL HTTP {r.status_code}: {r.text}")
+            data = r.json()
+            if "errors" in data and data["errors"]:
+                _maybe_raise_throttled_from_graphql_errors(data["errors"])
+            return data.get("data", {})
+        except Throttled as te:
+            if attempt >= max_attempts:
+                raise RuntimeError(f"Throttled after {attempt} attempts: {te}")
+            # exponential backoff with jitter, capped
+            sleep_s = min(0.5 * (2 ** (attempt - 1)), 10.0) + random.uniform(0, 0.25)
+            if DEBUG_VERBOSE:
+                print(f"[BACKOFF] THROTTLED attempt {attempt}/{max_attempts} → sleep {sleep_s:.2f}s", flush=True)
+            time.sleep(sleep_s)
+            continue
 
 # =========================
 # GraphQL Queries/Mutations
@@ -162,6 +160,8 @@ query ProductsInCollection($handle: String!, $cursor: String) {
         }
         badges: metafield(namespace: "%(NS)s", key: "%(BK)s") { id value type }
         dtime:  metafield(namespace: "%(NS)s", key: "%(DK)s") { id value type }
+        salesTotal: metafield(namespace: "%(NS)s", key: "%(KS)s") { id value type }
+        salesDates: metafield(namespace: "%(NS)s", key: "%(KD)s") { id value type }
       }
     }
   }
@@ -171,6 +171,8 @@ query ProductsInCollection($handle: String!, $cursor: String) {
     "NS": MF_NAMESPACE,
     "BK": MF_BADGES_KEY,
     "DK": MF_DELIVERY_KEY,
+    "KS": KEY_SALES,
+    "KD": KEY_DATES,
 }
 
 QUERY_PRODUCT_MF = """
@@ -182,6 +184,21 @@ query ProductMF($id: ID!) {
   }
 }
 """.replace("%(NS)s", MF_NAMESPACE).replace("%(BK)s", MF_BADGES_KEY).replace("%(DK)s", MF_DELIVERY_KEY)
+
+# Metafield definition lookup (ownerType PRODUCT)
+QUERY_MF_DEFINITION = """
+query MFDef($ownerType: MetafieldOwnerType!, $namespace: String!, $key: String!) {
+  metafieldDefinitions(first: 1, ownerType: $ownerType, namespace: $namespace, key: $key) {
+    edges {
+      node {
+        id
+        name
+        type { name }
+      }
+    }
+  }
+}
+"""
 
 MUTATION_PRODUCT_UPDATE = """
 mutation ProductUpdate($input: ProductInput!) {
@@ -304,6 +321,54 @@ def _save_json(path, data):
     os.replace(tmp, path)
 
 # =========================
+# Metafield Definition Cache & Resolution
+# =========================
+MF_DEF_CACHE: Dict[Tuple[str, str], str] = {}  # (namespace,key) -> type name (e.g., "list.date" or "date")
+
+def get_definition_type(namespace: str, key: str, owner_type: str = "PRODUCT") -> Optional[str]:
+    """Fetch and cache the metafield definition type (e.g., 'date', 'list.date')."""
+    ck = (namespace, key)
+    if ck in MF_DEF_CACHE:
+        return MF_DEF_CACHE[ck]
+    try:
+        data = gql(QUERY_MF_DEFINITION, {
+            "ownerType": owner_type,
+            "namespace": namespace,
+            "key": key
+        })
+        edges = (((data.get("metafieldDefinitions") or {}).get("edges")) or [])
+        if edges:
+            tname = (((edges[0].get("node") or {}).get("type") or {}).get("name")) or ""
+            tname = (tname or "").strip()
+            if tname:
+                MF_DEF_CACHE[ck] = tname
+                return tname
+    except Exception as e:
+        if DEBUG_VERBOSE:
+            print(f"[WARN] get_definition_type failed for {namespace}.{key}: {e}", flush=True)
+    return None
+
+def resolve_mf_type(ns: str, key: str, node: Optional[Dict[str, Any]]) -> str:
+    """Prefer: explicit override → existing node type → store definition → safe default."""
+    t = TYPE_OVERRIDE.get((ns, key))
+    if t:
+        return t
+    if node and isinstance(node.get("type"), str) and node["type"]:
+        return node["type"]
+    tdef = get_definition_type(ns, key, owner_type="PRODUCT")
+    if tdef:
+        return tdef
+    # Safe fallback (kept minimal to avoid type mismatches)
+    return "single_line_text_field"
+
+def format_value_for_type(desired_value: str, mf_type: str) -> str:
+    if mf_type.startswith("list."):
+        if not desired_value:
+            return "[]"
+        return json.dumps([desired_value])
+    return desired_value or ""
+
+# =========================
 # Availability Logic
 # =========================
 def compute_availability_from_variants(variants: List[Dict[str, Any]]) -> int:
@@ -322,24 +387,6 @@ def desired_state_for_availability(total_avail: int) -> Tuple[str, str, str, str
         return ("ACTIVE", BADGE_READY, DELIVERY_READY, "READY")
     else:
         return ("DRAFT", "", DELIVERY_MTO, "MTO")
-
-# =========================
-# Metafield Type & Formatting
-# =========================
-def resolve_mf_type(ns: str, key: str, node: Optional[Dict[str, Any]]) -> str:
-    t = TYPE_OVERRIDE.get((ns, key))
-    if t:
-        return t
-    if node and isinstance(node.get("type"), str) and node["type"]:
-        return node["type"]
-    return "single_line_text_field"
-
-def format_value_for_type(desired_value: str, mf_type: str) -> str:
-    if mf_type.startswith("list."):
-        if not desired_value:
-            return "[]"
-        return json.dumps([desired_value])
-    return desired_value or ""
 
 # =========================
 # Mutations & Verification
@@ -527,6 +574,10 @@ def process_collection(handle: str, seed_only: bool = False) -> Dict[str, Any]:
     QUERY = QUERY_COLLECTION_PAGE  # already formatted with PER_PAGE & keys
     today = today_ist_str()
 
+    # Pre-fetch store definition types for sales fields (once)
+    sales_total_def_type = get_definition_type(MF_NAMESPACE, KEY_SALES, owner_type="PRODUCT") or "number_integer"
+    sales_dates_def_type = get_definition_type(MF_NAMESPACE, KEY_DATES, owner_type="PRODUCT") or "list.date"
+
     while True:
         page += 1
         if DEBUG_VERBOSE:
@@ -569,26 +620,54 @@ def process_collection(handle: str, seed_only: bool = False) -> Dict[str, Any]:
                     sold = -diff
                     # Update counters
                     sales_counts[pid_num] = int(sales_counts.get(pid_num, 0)) + sold
-                    dates = set(sale_dates.get(pid_num, []))
-                    dates.add(today)
-                    if len(dates) > SALES_DATES_LIMIT:
-                        dates = set(sorted(dates)[-SALES_DATES_LIMIT:])
-                    sale_dates[pid_num] = sorted(dates)
-                    # stage metafields writes for this product
+                    dates_set = set(sale_dates.get(pid_num, []))
+                    dates_set.add(today)
+                    if len(dates_set) > SALES_DATES_LIMIT:
+                        dates_set = set(sorted(dates_set)[-SALES_DATES_LIMIT:])
+                    sale_dates[pid_num] = sorted(dates_set)
+
+                    # Stage metafield writes for this product
+                    # Resolve node types (prefer node → store def → default)
+                    sales_total_node = p.get("salesTotal") or {}
+                    sales_dates_node = p.get("salesDates") or {}
+
+                    st_type = sales_total_node.get("type") or sales_total_def_type or "number_integer"
+                    sd_type = sales_dates_node.get("type") or sales_dates_def_type or "list.date"
+
                     sales_mf_inputs.append({
                         "ownerId": pid_gid,
                         "namespace": MF_NAMESPACE,
                         "key": KEY_SALES,
-                        "type": "number_integer",
+                        "type": st_type,
                         "value": str(int(sales_counts[pid_num])),
                     })
-                    sales_mf_inputs.append({
-                        "ownerId": pid_gid,
-                        "namespace": MF_NAMESPACE,
-                        "key": KEY_DATES,
-                        "type": "list.date",
-                        "value": json.dumps(sale_dates[pid_num]),
-                    })
+
+                    if sd_type == "date":
+                        # Store only the latest date (scalar)
+                        sales_mf_inputs.append({
+                            "ownerId": pid_gid,
+                            "namespace": MF_NAMESPACE,
+                            "key": KEY_DATES,
+                            "type": "date",
+                            "value": today,
+                        })
+                    elif sd_type == "list.date":
+                        sales_mf_inputs.append({
+                            "ownerId": pid_gid,
+                            "namespace": MF_NAMESPACE,
+                            "key": KEY_DATES,
+                            "type": "list.date",
+                            "value": json.dumps(sale_dates[pid_num]),
+                        })
+                    else:
+                        # Fallback: attempt scalar date to be safe
+                        sales_mf_inputs.append({
+                            "ownerId": pid_gid,
+                            "namespace": MF_NAMESPACE,
+                            "key": KEY_DATES,
+                            "type": "date",
+                            "value": today,
+                        })
                 # Always refresh baseline after check
                 avail_baseline[pid_num] = int(avail)
 
@@ -724,17 +803,14 @@ def run_options():
 
 @app.route("/availability/run", methods=["GET", "POST"])
 def run_now():
-    # simple key check
     key = (request.args.get("key") or request.form.get("key") or "").strip()
     if key != PIXEL_SHARED_SECRET:
         return _cors(make_response(("forbidden", 403)))
 
     handle = (request.args.get("handle") or request.form.get("handle") or "").strip()
     if not handle:
-        # default to first configured handle
         handle = COLLECTION_HANDLES[0]
 
-    # allow ad-hoc overrides via query
     global DRY_RUN, CHANGE_STATUS, FORCE_WRITE_METAFIELDS
     if "dry_run" in request.args:
         DRY_RUN = request.args.get("dry_run") in ("1", "true", "True")
@@ -743,7 +819,6 @@ def run_now():
     if "force_write" in request.args:
         FORCE_WRITE_METAFIELDS = request.args.get("force_write") in ("1", "true", "True")
 
-    # prevent concurrent runs
     global is_running
     with run_lock:
         if is_running:
@@ -848,4 +923,4 @@ if __name__ == "__main__":
     print(f"[BOOT] Availability service on {ADMIN_HOST} | API {ADMIN_API_VERSION}", flush=True)
     print(f"[CFG] DRY_RUN={DRY_RUN} CHANGE_STATUS={CHANGE_STATUS} FORCE_WRITE_METAFIELDS={FORCE_WRITE_METAFIELDS} DEBUG_VERBOSE={DEBUG_VERBOSE}", flush=True)
     from werkzeug.serving import run_simple
-    run_simple("0.0.0.0", PORT, app)
+    run_simple("0.0.0.0", int(os.getenv("PORT", "5050")), app)
