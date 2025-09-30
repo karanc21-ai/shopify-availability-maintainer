@@ -3,9 +3,11 @@
 
 """
 Shopify availability → status + metafields updater (collection-scoped)
++ Sales inference (no webhooks): sales_total & sales_dates on availability drops.
+
 Runs as a web service with on-demand endpoints and an optional scheduler.
 
-Behavior (same as your script):
+Behavior:
 - Availability = sum of tracked variants' inventoryQuantity.
 - If availability == 0:
     - (optionally) status → DRAFT        [CHANGE_STATUS]
@@ -16,32 +18,43 @@ Behavior (same as your script):
     - badges → "Ready To Ship" (exact choice)
     - delivery_time → "2-5 Days Across India"
 
+Sales inference:
+- Maintains a per-product availability baseline on disk.
+- On each run, if current_avail - baseline < 0, that negative delta is counted as sales:
+    - custom.sales_total += (-delta)
+    - custom.sales_dates ← add today (IST) once (date list, max size limit)
+- Baseline is then set to current_avail to avoid double counting.
+
 Security:
-- Endpoints require ?key=PIXEL_SHARED_SECRET (env var) for manual triggers.
+- Endpoints require ?key=PIXEL_SHARED_SECRET.
 
 Scheduler:
 - If RUN_EVERY_MIN > 0, a background thread runs all handles in COLLECTION_HANDLES every N minutes.
 
 Env you MUST set (Render → Environment):
 - ADMIN_HOST                e.g. silver-rudradhan.myshopify.com
-- ADMIN_TOKEN               your Admin API access token
-- PIXEL_SHARED_SECRET       same one you use for the pixel service
-- (optional) COLLECTION_HANDLES    comma-separated collection handles (default: pearl-pendant-gold-plated)
-- (optional) RUN_EVERY_MIN         integer minutes (default: 0 = disabled)
-- (optional) CHANGE_STATUS         "1" to enable product status changes (default: "0")
-- (optional) DRY_RUN               "1" to simulate writes (default: "0")
-- (optional) FORCE_WRITE_METAFIELDS "1" to force rewrite on READY↔MTO flips (default: "1")
+- ADMIN_TOKEN               Admin API access token
+- PIXEL_SHARED_SECRET
+- (optional) COLLECTION_HANDLES     comma-separated collection handles
+- (optional) RUN_EVERY_MIN          integer minutes (0 = disabled)
+- (optional) CHANGE_STATUS          "1" to enable product status changes
+- (optional) DRY_RUN                "1" to simulate writes
+- (optional) FORCE_WRITE_METAFIELDS "1" to force rewrite on READY↔MTO flips
 
 Start command (Render):
 /opt/render/project/src/.venv/bin/gunicorn -w 1 -t 600 -b 0.0.0.0:$PORT availability_service:app
 """
 
 import os, time, json, sys, csv, re, warnings, threading
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List, Tuple
 
 import requests
 from flask import Flask, request, jsonify, make_response
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None  # Py<3.9 fallback (will use UTC)
 
 # ---- Optional: silence LibreSSL warning on older Python/urllib3
 try:
@@ -80,6 +93,11 @@ MF_NAMESPACE = "custom"
 MF_BADGES_KEY = "badges"
 MF_DELIVERY_KEY = "delivery_time"
 
+# Sales metafields
+KEY_SALES = os.getenv("KEY_SALES", "sales_total")
+KEY_DATES = os.getenv("KEY_DATES", "sales_dates")
+SALES_DATES_LIMIT = int(os.getenv("SALES_DATES_LIMIT", "365"))
+
 # Exact allowed choice + values
 BADGE_READY    = "Ready To Ship"
 DELIVERY_READY = "2-5 Days Across India"
@@ -94,6 +112,11 @@ TYPE_OVERRIDE = {
 
 LOG_CSV_PATH = "availability_sync_log.csv"
 PORT = int(os.getenv("PORT", "5050"))
+
+# Files for sales/baseline persistence
+AVAIL_BASELINE_JSON = "avail_baseline.json"   # pid(num) -> int
+SALES_JSON          = "sales_counts.json"     # pid(num) -> int
+SALE_DATES_JSON     = "sale_dates.json"       # pid(num) -> [YYYY-MM-DD,...]
 
 # =========================
 # GraphQL Helpers
@@ -193,6 +216,11 @@ mutation MetafieldDelete($input: MetafieldDeleteInput!) {
 def now_iso():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+def today_ist_str():
+    if ZoneInfo:
+        return datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+    return datetime.now(timezone.utc).date().isoformat()
+
 def _json_first_or_str(s: str) -> str:
     try:
         j = json.loads(s)
@@ -259,6 +287,21 @@ def append_log_row(path: str, row: Dict[str, Any]):
             row.get("mutation_errors"),
             row.get("debug_variant_details"),
         ])
+
+def _load_json(path, default):
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return default
+
+def _save_json(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
 
 # =========================
 # Availability Logic
@@ -453,9 +496,24 @@ def set_product_metafields(product_id: str,
     return (len(mutation_errors) == 0, vb, vd, verified_types, "; ".join(mutation_errors))
 
 # =========================
+# Sales/baseline state
+# =========================
+avail_baseline: Dict[str, int] = _load_json(AVAIL_BASELINE_JSON, {})
+sales_counts: Dict[str, int]   = _load_json(SALES_JSON, {})
+sale_dates: Dict[str, List[str]] = _load_json(SALE_DATES_JSON, {})
+
+def _save_sales_state():
+    _save_json(AVAIL_BASELINE_JSON, {k:int(v) for k,v in avail_baseline.items()})
+    _save_json(SALES_JSON,         {k:int(v) for k,v in sales_counts.items()})
+    _save_json(SALE_DATES_JSON,    {k:sorted(set(v)) for k,v in sale_dates.items()})
+
+# =========================
 # Core runner
 # =========================
-def process_collection(handle: str) -> Dict[str, Any]:
+def process_collection(handle: str, seed_only: bool = False) -> Dict[str, Any]:
+    """
+    If seed_only=True, we only set availability baselines (no badge/delivery updates, no sales counting).
+    """
     ensure_log_header(LOG_CSV_PATH)
     run_ts = now_iso()
     cursor = None
@@ -463,7 +521,11 @@ def process_collection(handle: str) -> Dict[str, Any]:
     total_seen = 0
     changed = 0
 
+    # For batching sales metafields
+    sales_mf_inputs: List[Dict[str, Any]] = []
+
     QUERY = QUERY_COLLECTION_PAGE  # already formatted with PER_PAGE & keys
+    today = today_ist_str()
 
     while True:
         page += 1
@@ -483,12 +545,54 @@ def process_collection(handle: str) -> Dict[str, Any]:
 
         for p in prods:
             total_seen += 1
-            pid = p["id"]
+            pid_gid = p["id"]                            # gid://shopify/Product/123...
+            pid_num = pid_gid.split("/")[-1]             # "123..."
             ptitle = p.get("title", "")
             status_before = p.get("status")
             variants = (p.get("variants") or {}).get("nodes", [])
 
             avail = compute_availability_from_variants(variants)
+
+            # --- Seed mode just records baseline and skips everything else ---
+            if seed_only:
+                avail_baseline[pid_num] = int(avail)
+                continue
+
+            # --- Sales inference from baseline ---
+            prev = avail_baseline.get(pid_num)
+            if prev is None:
+                # First time seeing this product -> set baseline, don't count as sale
+                avail_baseline[pid_num] = int(avail)
+            else:
+                diff = int(avail) - int(prev)
+                if diff < 0:
+                    sold = -diff
+                    # Update counters
+                    sales_counts[pid_num] = int(sales_counts.get(pid_num, 0)) + sold
+                    dates = set(sale_dates.get(pid_num, []))
+                    dates.add(today)
+                    if len(dates) > SALES_DATES_LIMIT:
+                        dates = set(sorted(dates)[-SALES_DATES_LIMIT:])
+                    sale_dates[pid_num] = sorted(dates)
+                    # stage metafields writes for this product
+                    sales_mf_inputs.append({
+                        "ownerId": pid_gid,
+                        "namespace": MF_NAMESPACE,
+                        "key": KEY_SALES,
+                        "type": "number_integer",
+                        "value": str(int(sales_counts[pid_num])),
+                    })
+                    sales_mf_inputs.append({
+                        "ownerId": pid_gid,
+                        "namespace": MF_NAMESPACE,
+                        "key": KEY_DATES,
+                        "type": "list.date",
+                        "value": json.dumps(sale_dates[pid_num]),
+                    })
+                # Always refresh baseline after check
+                avail_baseline[pid_num] = int(avail)
+
+            # --- Existing READY/MTO behavior ---
             badges_node = p.get("badges") or None
             dtime_node  = p.get("dtime")  or None
             badges_before = normalize_text_value((badges_node or {}).get("value"))
@@ -497,13 +601,6 @@ def process_collection(handle: str) -> Dict[str, Any]:
             target_status, target_badge, target_delivery, target_mode = desired_state_for_availability(avail)
             current_ready_mode = ("ready" in (badges_before or "").lower()) and ("2-5" in (delivery_before or "").lower())
             desired_ready_mode = (target_mode == "READY")
-
-            if DEBUG_VERBOSE:
-                print(f"[CHECK] {ptitle} | avail={avail} | "
-                      f"mode_now={'READY' if current_ready_mode else 'MTO'} -> {target_mode} | "
-                      f"status={status_before} -> {target_status} | "
-                      f"badges='{badges_before}'→'{target_badge}' | "
-                      f"delivery='{delivery_before}'→'{target_delivery}'", flush=True)
 
             need_status   = (status_before != target_status)
             need_badge    = (canonical(badges_before)  != canonical(target_badge))
@@ -524,13 +621,13 @@ def process_collection(handle: str) -> Dict[str, Any]:
                 changed += 1
                 if need_status:
                     if CHANGE_STATUS:
-                        applied_status = gql_update_product_status(pid, target_status)
+                        applied_status = gql_update_product_status(pid_gid, target_status)
                     else:
                         if DEBUG_VERBOSE:
-                            print(f"[SKIP] change_status=False → not updating status for {pid}", flush=True)
+                            print(f"[SKIP] change_status=False → not updating status for {pid_gid}", flush=True)
                 if need_badge or need_delivery:
                     ok, vb, vd, vtypes, merrs = set_product_metafields(
-                        pid, target_badge, target_delivery, badges_node, dtime_node
+                        pid_gid, target_badge, target_delivery, badges_node, dtime_node
                     )
                     applied_metafields = ok
                     verified_badges = vb or verified_badges
@@ -553,7 +650,7 @@ def process_collection(handle: str) -> Dict[str, Any]:
                 "change_status": CHANGE_STATUS,
                 "force_write_metafields": FORCE_WRITE_METAFIELDS,
                 "collection_handle": handle,
-                "product_id": pid,
+                "product_id": pid_gid,
                 "product_title": ptitle,
                 "availability_before": avail,
                 "status_before": status_before,
@@ -576,11 +673,26 @@ def process_collection(handle: str) -> Dict[str, Any]:
         else:
             break
 
+    # Push any pending sales metafields in batches
+    if sales_mf_inputs and not DRY_RUN:
+        CHUNK = 25
+        print(f"[PUSH] sales metafields -> {len(sales_mf_inputs)} items", flush=True)
+        for i in range(0, len(sales_mf_inputs), CHUNK):
+            chunk = sales_mf_inputs[i:i+CHUNK]
+            ue = _metafields_set_with_retry(chunk)
+            if ue:
+                print(f"[WARN] sales metafieldsSet errors: {ue}", flush=True)
+            time.sleep(MUTATION_SLEEP_SEC)
+
+    # Persist baseline + sales counters/dates
+    _save_sales_state()
+
     summary = {
         "run_timestamp": run_ts,
         "collection_handle": handle,
         "total_products_scanned": total_seen,
         "products_changed": changed,
+        "sales_updates": len(sales_mf_inputs) // 2,  # two entries per product (total + dates)
         "dry_run": DRY_RUN,
         "change_status": CHANGE_STATUS,
         "force_write_metafields": FORCE_WRITE_METAFIELDS,
@@ -638,7 +750,7 @@ def run_now():
             return _cors(make_response(("busy", 409)))
         is_running = True
     try:
-        summary = process_collection(handle)
+        summary = process_collection(handle, seed_only=False)
         return _cors(jsonify(summary)), 200
     except Exception as e:
         return _cors(make_response((f"error: {e}", 500)))
@@ -661,9 +773,37 @@ def run_all():
         is_running = True
     try:
         for h in handles:
-            results.append(process_collection(h))
+            results.append(process_collection(h, seed_only=False))
             time.sleep(0.5)
         return _cors(jsonify({"results": results})), 200
+    except Exception as e:
+        return _cors(make_response((f"error: {e}", 500)))
+    finally:
+        with run_lock:
+            is_running = False
+
+@app.route("/availability/seed_all", methods=["GET", "POST"])
+def seed_all():
+    """
+    One-time: walk all configured collections and set availability baselines only.
+    Use this BEFORE enabling scheduled runs, so we don't back-count historic sales.
+    """
+    key = (request.args.get("key") or request.form.get("key") or "").strip()
+    if key != PIXEL_SHARED_SECRET:
+        return _cors(make_response(("forbidden", 403)))
+
+    results = []
+    global is_running
+    with run_lock:
+        if is_running:
+            return _cors(make_response(("busy", 409)))
+        is_running = True
+    try:
+        for h in COLLECTION_HANDLES:
+            results.append(process_collection(h, seed_only=True))
+            time.sleep(0.2)
+        _save_sales_state()
+        return _cors(jsonify({"seeded": True, "results": results})), 200
     except Exception as e:
         return _cors(make_response((f"error: {e}", 500)))
     finally:
@@ -684,21 +824,25 @@ def scheduler_loop():
                     if is_running:
                         print("[SCHED] Skipping run (another job is active).", flush=True)
                         break
-                    # mark running to avoid overlap
                     globals()["is_running"] = True
                 try:
-                    process_collection(h)
+                    process_collection(h, seed_only=False)
                 finally:
                     with run_lock:
                         globals()["is_running"] = False
                 time.sleep(0.5)
         except Exception as e:
             print(f"[SCHED] Error: {e}", flush=True)
-        # sleep the configured interval
         time.sleep(max(RUN_EVERY_MIN, 1) * 60)
 
 # kick off scheduler (daemon)
 threading.Thread(target=scheduler_loop, daemon=True).start()
+
+# =========================
+# WSGI entrypoint
+# =========================
+availability_service = sys.modules[__name__]
+app = app  # gunicorn expects module:app
 
 if __name__ == "__main__":
     print(f"[BOOT] Availability service on {ADMIN_HOST} | API {ADMIN_API_VERSION}", flush=True)
