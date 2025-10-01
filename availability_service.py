@@ -360,13 +360,12 @@ def format_value_for_type(desired_value: str, mf_type: str) -> str:
     return desired_value or ""
 
 # =========================
-# Availability Logic (single value, clamped)
-# =========================
+# Availability Logic (single value, NOT clamped)
 def compute_availability_from_variants(variants: List[Dict[str, Any]]) -> int:
     """
-    availability = sum of inventoryQuantity for counted variants
+    availability = sum of inventoryQuantity for counted variants (can be negative)
     counted = tracked only (default) OR all (if INCLUDE_UNTRACKED_IN_AVAIL=1)
-    result is clamped at 0; if nothing is counted, return 0
+    If nothing is counted, return 0.
     """
     total = 0
     any_counted = False
@@ -376,9 +375,7 @@ def compute_availability_from_variants(variants: List[Dict[str, Any]]) -> int:
         if INCLUDE_UNTRACKED_IN_AVAIL or tracked:
             any_counted = True
             total += qty
-    if not any_counted:
-        return 0
-    return max(total, 0)
+    return total if any_counted else 0  # NOTE: no max(total, 0) clamp anymore
 
 def desired_state_for_availability(total_avail: int) -> Tuple[str, str, str, str]:
     if total_avail > 0:
