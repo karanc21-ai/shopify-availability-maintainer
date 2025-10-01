@@ -5,13 +5,18 @@
 Shopify availability → status + metafields updater (collection-scoped)
 + Sales inference (no webhooks): sales_total & sales_dates on availability drops.
 
-Polling-only build:
-- Scheduler polls collections every RUN_EVERY_MIN minutes (0 = disabled).
-- Optional no-op webhook routes return 200 to avoid 404 logs; actual webhook logic is disabled by default.
+Design (your spec):
+- Compute a single availability number (sum of variant inventoryQuantity),
+  optionally counting untracked via INCLUDE_UNTRACKED_IN_AVAIL.
+- Clamp availability at 0.
+- If availability decreases between runs, increment sales_total by the drop amount
+  and add today's date (IST) to sales_dates (date or list.date per definition).
+- Use the SAME availability for READY/MTO decisions.
 
-Key hardening:
-- Metafield type auto-detection via metafieldDefinitions (prevents list.date vs date mismatch).
-- Exponential backoff + jitter on GraphQL THROTTLED / HTTP 429.
+Hardening:
+- Metafield definition auto-detection (matches store types; avoids type errors)
+- GraphQL backoff with jitter for THROTTLED/HTTP 429
+- Webhooks disabled by default; /webhook/* returns 200 no-op to avoid 404 noise
 """
 
 import os, time, json, sys, csv, re, warnings, threading, random, base64, hmac, hashlib
@@ -46,7 +51,7 @@ PIXEL_SHARED_SECRET = os.getenv("PIXEL_SHARED_SECRET", "").strip()
 if not PIXEL_SHARED_SECRET:
     raise RuntimeError("PIXEL_SHARED_SECRET env var is required")
 
-# Webhook handling toggle (default OFF). We still mount no-op routes to avoid 404 noise.
+# Webhooks default OFF; stubs still return 200 to keep logs clean
 ENABLE_WEBHOOKS = os.getenv("ENABLE_WEBHOOKS", "0") == "1"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 
@@ -57,6 +62,10 @@ CHANGE_STATUS = os.getenv("CHANGE_STATUS", "0") == "1"
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 DEBUG_VERBOSE = os.getenv("DEBUG_VERBOSE", "1") == "1"
 FORCE_WRITE_METAFIELDS = os.getenv("FORCE_WRITE_METAFIELDS", "1") == "1"
+
+# Availability behavior
+INCLUDE_UNTRACKED_IN_AVAIL = os.getenv("INCLUDE_UNTRACKED_IN_AVAIL", "0") == "1"
+DEBUG_SALES = os.getenv("DEBUG_SALES", "1") == "1"
 
 PER_PAGE = int(os.getenv("PER_PAGE", "50"))
 MUTATION_SLEEP_SEC = float(os.getenv("MUTATION_SLEEP_SEC", "0.35"))
@@ -76,7 +85,7 @@ BADGE_READY    = "Ready To Ship"
 DELIVERY_READY = "2-5 Days Across India"
 DELIVERY_MTO   = "12-15 Days Across India"
 
-# Type override: usually let definitions drive this; uncomment if you KNOW it's a list.
+# Type override: usually let definitions drive this; uncomment if you KNOW it's a list type
 TYPE_OVERRIDE = {
     # (MF_NAMESPACE, MF_BADGES_KEY): "list.single_line_text_field",
 }
@@ -351,18 +360,25 @@ def format_value_for_type(desired_value: str, mf_type: str) -> str:
     return desired_value or ""
 
 # =========================
-# Availability Logic
+# Availability Logic (single value, clamped)
 # =========================
 def compute_availability_from_variants(variants: List[Dict[str, Any]]) -> int:
+    """
+    availability = sum of inventoryQuantity for counted variants
+    counted = tracked only (default) OR all (if INCLUDE_UNTRACKED_IN_AVAIL=1)
+    result is clamped at 0; if nothing is counted, return 0
+    """
     total = 0
-    any_tracked = False
+    any_counted = False
     for v in variants:
         tracked = bool((v.get("inventoryItem") or {}).get("tracked"))
         qty = int(v.get("inventoryQuantity") or 0)
-        if tracked:
-            any_tracked = True
-            total += max(qty, 0)
-    return total if any_tracked else 0
+        if INCLUDE_UNTRACKED_IN_AVAIL or tracked:
+            any_counted = True
+            total += qty
+    if not any_counted:
+        return 0
+    return max(total, 0)
 
 def desired_state_for_availability(total_avail: int) -> Tuple[str, str, str, str]:
     if total_avail > 0:
@@ -584,6 +600,7 @@ def process_collection(handle: str, seed_only: bool = False) -> Dict[str, Any]:
             status_before = p.get("status")
             variants = (p.get("variants") or {}).get("nodes", [])
 
+            # Single availability number (clamped at 0)
             avail = compute_availability_from_variants(variants)
 
             # --- Seed mode just records baseline and skips everything else ---
@@ -591,7 +608,7 @@ def process_collection(handle: str, seed_only: bool = False) -> Dict[str, Any]:
                 avail_baseline[pid_num] = int(avail)
                 continue
 
-            # --- Sales inference from baseline ---
+            # --- Sales inference from SAME availability ---
             prev = avail_baseline.get(pid_num)
             if prev is None:
                 # First time seeing this product -> set baseline, don't count as sale
@@ -601,12 +618,20 @@ def process_collection(handle: str, seed_only: bool = False) -> Dict[str, Any]:
                 if diff < 0:
                     sold = -diff
                     # Update counters
-                    sales_counts[pid_num] = int(sales_counts.get(pid_num, 0)) + sold
+                    before = int(sales_counts.get(pid_num, 0))
+                    sales_counts[pid_num] = before + sold
                     dates = set(sale_dates.get(pid_num, []))
-                    dates.add(today)
+                    dates.add(today)  # once per day
                     if len(dates) > SALES_DATES_LIMIT:
                         dates = set(sorted(dates)[-SALES_DATES_LIMIT:])
                     sale_dates[pid_num] = sorted(dates)
+
+                    if DEBUG_SALES:
+                        print(f"[SALES] handle={handle} product='{ptitle}' ({pid_num}) "
+                              f"baseline={prev} → avail={avail} diff={diff} (sold={sold}) "
+                              f"sales_total: {before}→{sales_counts[pid_num]}",
+                              flush=True)
+
                     # stage metafields writes for this product
                     sales_total_node = p.get("salesTotal") or {}
                     sales_dates_node = p.get("salesDates") or {}
@@ -647,7 +672,7 @@ def process_collection(handle: str, seed_only: bool = False) -> Dict[str, Any]:
                 # Always refresh baseline after check
                 avail_baseline[pid_num] = int(avail)
 
-            # --- READY/MTO behavior ---
+            # --- READY/MTO behavior uses the same availability ---
             badges_node = p.get("badges") or None
             dtime_node  = p.get("dtime")  or None
             badges_before = normalize_text_value((badges_node or {}).get("value"))
@@ -770,7 +795,7 @@ def _cors(resp):
     return resp
 
 def _verify_shopify_hmac(req) -> bool:
-    # Only used if ENABLE_WEBHOOKS=1; for stubs we just 200.
+    # Only relevant if ENABLE_WEBHOOKS=1; stubs below return 200 anyway.
     if not WEBHOOK_SECRET:
         key_q = (req.args.get("key") or "").strip()
         return key_q == PIXEL_SHARED_SECRET
@@ -886,7 +911,6 @@ if ENABLE_WEBHOOKS:
     def webhook_inventory():
         if not _verify_shopify_hmac(request):
             return _cors(make_response(("forbidden", 403)))
-        # If you ever enable real-time, you can trigger runs here.
         return _cors(make_response(("ok", 200)))
 
     @app.route("/webhook/orders_create", methods=["POST"])
@@ -895,7 +919,6 @@ if ENABLE_WEBHOOKS:
             return _cors(make_response(("forbidden", 403)))
         return _cors(make_response(("ok", 200)))
 else:
-    # No-op stubs: always 200 OK; keeps logs clean if something pings the URL.
     @app.route("/webhook/inventory", methods=["POST"])
     def webhook_inventory_noop():
         return _cors(make_response(("ok", 200)))
@@ -940,6 +963,12 @@ app = app  # gunicorn expects module:app
 
 if __name__ == "__main__":
     print(f"[BOOT] Availability service on {ADMIN_HOST} | API {ADMIN_API_VERSION}", flush=True)
-    print(f"[CFG] DRY_RUN={DRY_RUN} CHANGE_STATUS={CHANGE_STATUS} FORCE_WRITE_METAFIELDS={FORCE_WRITE_METAFIELDS} DEBUG_VERBOSE={DEBUG_VERBOSE} RUN_EVERY_MIN={RUN_EVERY_MIN} ENABLE_WEBHOOKS={ENABLE_WEBHOOKS}", flush=True)
+    print(f"[CFG] DRY_RUN={DRY_RUN} CHANGE_STATUS={CHANGE_STATUS} FORCE_WRITE_METAFIELDS={FORCE_WRITE_METAFIELDS} "
+          f"DEBUG_VERBOSE={DEBUG_VERBOSE} RUN_EVERY_MIN={RUN_EVERY_MIN} ENABLE_WEBHOOKS={ENABLE_WEBHOOKS} "
+          f"INCLUDE_UNTRACKED_IN_AVAIL={INCLUDE_UNTRACKED_IN_AVAIL}", flush=True)
+    if DRY_RUN:
+        print("[WARN] DRY_RUN=1 → no writes will be made.", flush=True)
+    if not CHANGE_STATUS:
+        print("[INFO] CHANGE_STATUS=0 → product.status will not be updated (metafields still will).", flush=True)
     from werkzeug.serving import run_simple
     run_simple("0.0.0.0", PORT, app)
