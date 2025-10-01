@@ -6,11 +6,11 @@ Shopify availability → status + metafields updater (collection-scoped)
 + Sales inference (no webhooks): sales_total & sales_dates on availability drops.
 
 Design (your spec):
-- Compute a single availability number (sum of variant inventoryQuantity),
-  optionally counting untracked via INCLUDE_UNTRACKED_IN_AVAIL.
-- Clamp availability at 0.
+- Compute one availability number (sum of variant inventoryQuantity), optionally counting
+  untracked via INCLUDE_UNTRACKED_IN_AVAIL.
+- Availability can be negative (NO clamping).
 - If availability decreases between runs, increment sales_total by the drop amount
-  and add today's date (IST) to sales_dates (date or list.date per definition).
+  and add today's date (IST) to sales_dates (respects 'date' vs 'list.date' definitions).
 - Use the SAME availability for READY/MTO decisions.
 
 Hardening:
@@ -86,17 +86,15 @@ DELIVERY_READY = "2-5 Days Across India"
 DELIVERY_MTO   = "12-15 Days Across India"
 
 # Type override: usually let definitions drive this; uncomment if you KNOW it's a list type
-TYPE_OVERRIDE = {
+TYPE_OVERRIDE: Dict[Tuple[str, str], str] = {
     # (MF_NAMESPACE, MF_BADGES_KEY): "list.single_line_text_field",
 }
 
 LOG_CSV_PATH = "availability_sync_log.csv"
 PORT = int(os.getenv("PORT", "5050"))
 
-# Files for sales/baseline persistence
+# Files for availability baseline persistence (last seen availability for delta detection)
 AVAIL_BASELINE_JSON = "avail_baseline.json"   # pid(num) -> int
-SALES_JSON          = "sales_counts.json"     # pid(num) -> int
-SALE_DATES_JSON     = "sale_dates.json"       # pid(num) -> [YYYY-MM-DD,...]
 
 # =========================
 # GraphQL Helpers (+ backoff)
@@ -361,6 +359,7 @@ def format_value_for_type(desired_value: str, mf_type: str) -> str:
 
 # =========================
 # Availability Logic (single value, NOT clamped)
+# =========================
 def compute_availability_from_variants(variants: List[Dict[str, Any]]) -> int:
     """
     availability = sum of inventoryQuantity for counted variants (can be negative)
@@ -375,7 +374,7 @@ def compute_availability_from_variants(variants: List[Dict[str, Any]]) -> int:
         if INCLUDE_UNTRACKED_IN_AVAIL or tracked:
             any_counted = True
             total += qty
-    return total if any_counted else 0  # NOTE: no max(total, 0) clamp anymore
+    return total if any_counted else 0
 
 def desired_state_for_availability(total_avail: int) -> Tuple[str, str, str, str]:
     if total_avail > 0:
@@ -483,7 +482,7 @@ def set_product_metafields(product_id: str,
             ok, msg = gql_delete_metafield((badges_node or {}).get("id"))
             if not ok and msg:
                 mutation_errors.append(msg)
-        mf_inputs = []
+        mf_inputs: List[Dict[str, Any]] = []
     else:
         mf_inputs = []
         if badges_type.startswith("list."):
@@ -538,16 +537,12 @@ def set_product_metafields(product_id: str,
     return (len(mutation_errors) == 0, vb, vd, verified_types, "; ".join(mutation_errors))
 
 # =========================
-# Sales/baseline state
+# Availability baseline state (only availability baseline is persisted)
 # =========================
 avail_baseline: Dict[str, int] = _load_json(AVAIL_BASELINE_JSON, {})
-sales_counts: Dict[str, int]   = _load_json(SALES_JSON, {})
-sale_dates: Dict[str, List[str]] = _load_json(SALE_DATES_JSON, {})
 
 def _save_sales_state():
     _save_json(AVAIL_BASELINE_JSON, {k:int(v) for k,v in avail_baseline.items()})
-    _save_json(SALES_JSON,         {k:int(v) for k,v in sales_counts.items()})
-    _save_json(SALE_DATES_JSON,    {k:sorted(set(v)) for k,v in sale_dates.items()})
 
 # =========================
 # Core runner
@@ -566,7 +561,7 @@ def process_collection(handle: str, seed_only: bool = False) -> Dict[str, Any]:
     # For batching sales metafields
     sales_mf_inputs: List[Dict[str, Any]] = []
 
-    QUERY = QUERY_COLLECTION_PAGE  # already formatted
+    QUERY = QUERY_COLLECTION_PAGE
     today = today_ist_str()
 
     # Pre-fetch store definition types for sales fields (once)
@@ -597,77 +592,104 @@ def process_collection(handle: str, seed_only: bool = False) -> Dict[str, Any]:
             status_before = p.get("status")
             variants = (p.get("variants") or {}).get("nodes", [])
 
-            # Single availability number (clamped at 0)
+            # Single availability number (can be negative)
             avail = compute_availability_from_variants(variants)
 
-            # --- Seed mode just records baseline and skips everything else ---
-            if seed_only:
-                avail_baseline[pid_num] = int(avail)
-                continue
-
-            # --- Sales inference from SAME availability ---
+            # --- Sales inference uses SAME availability, totals/dates come from metafields ---
             prev = avail_baseline.get(pid_num)
-            if prev is None:
-                # First time seeing this product -> set baseline, don't count as sale
+
+            # Read current metafields as the source of truth
+            sales_total_node = p.get("salesTotal") or {}
+            sales_dates_node = p.get("salesDates") or {}
+
+            # Parse current sales_total from metafield (default 0 if absent)
+            try:
+                current_sales_total = int((sales_total_node.get("value") or "0").strip())
+            except Exception:
+                current_sales_total = 0
+
+            # Parse existing dates from metafield
+            existing_dates: List[str] = []
+            sd_node_val = sales_dates_node.get("value")
+            sd_node_type = (sales_dates_node.get("type") or "").strip()
+            if sd_node_val:
+                try:
+                    if sd_node_type == "list.date":
+                        v = json.loads(sd_node_val) if isinstance(sd_node_val, str) else sd_node_val
+                        if isinstance(v, list):
+                            existing_dates = [str(x) for x in v if x]
+                    elif sd_node_type == "date":
+                        existing_dates = [str(sd_node_val).strip()]
+                except Exception:
+                    existing_dates = []
+
+            if seed_only:
+                # Seed availability baseline only
                 avail_baseline[pid_num] = int(avail)
             else:
-                diff = int(avail) - int(prev)
-                if diff < 0:
-                    sold = -diff
-                    # Update counters
-                    before = int(sales_counts.get(pid_num, 0))
-                    sales_counts[pid_num] = before + sold
-                    dates = set(sale_dates.get(pid_num, []))
-                    dates.add(today)  # once per day
-                    if len(dates) > SALES_DATES_LIMIT:
-                        dates = set(sorted(dates)[-SALES_DATES_LIMIT:])
-                    sale_dates[pid_num] = sorted(dates)
+                if prev is None:
+                    # First time seeing this product -> set availability baseline
+                    avail_baseline[pid_num] = int(avail)
+                else:
+                    diff = int(avail) - int(prev)
+                    if diff < 0:
+                        sold = -diff
+                        new_sales_total = current_sales_total + sold
 
-                    if DEBUG_SALES:
-                        print(f"[SALES] handle={handle} product='{ptitle}' ({pid_num}) "
-                              f"baseline={prev} → avail={avail} diff={diff} (sold={sold}) "
-                              f"sales_total: {before}→{sales_counts[pid_num]}",
-                              flush=True)
+                        if DEBUG_SALES:
+                            print(f"[SALES] handle={handle} product='{ptitle}' ({pid_num}) "
+                                  f"baseline={prev} → avail={avail} diff={diff} (sold={sold}) "
+                                  f"sales_total: {current_sales_total}→{new_sales_total}",
+                                  flush=True)
 
-                    # stage metafields writes for this product
-                    sales_total_node = p.get("salesTotal") or {}
-                    sales_dates_node = p.get("salesDates") or {}
-                    st_type = sales_total_node.get("type") or sales_total_def_type or "number_integer"
-                    sd_type = sales_dates_node.get("type") or sales_dates_def_type or "list.date"
-                    sales_mf_inputs.append({
-                        "ownerId": pid_gid,
-                        "namespace": MF_NAMESPACE,
-                        "key": KEY_SALES,
-                        "type": st_type,
-                        "value": str(int(sales_counts[pid_num])),
-                    })
-                    if sd_type == "date":
+                        # Stage metafield writes using store definition → node type → fallback
+                        st_type = sales_total_node.get("type") or sales_total_def_type or "number_integer"
+                        sd_type = sales_dates_node.get("type") or sales_dates_def_type or "list.date"
+
+                        # Always queue updated sales_total
                         sales_mf_inputs.append({
                             "ownerId": pid_gid,
                             "namespace": MF_NAMESPACE,
-                            "key": KEY_DATES,
-                            "type": "date",
-                            "value": today,
+                            "key": KEY_SALES,
+                            "type": st_type,
+                            "value": str(new_sales_total),
                         })
-                    elif sd_type == "list.date":
-                        sales_mf_inputs.append({
-                            "ownerId": pid_gid,
-                            "namespace": MF_NAMESPACE,
-                            "key": KEY_DATES,
-                            "type": "list.date",
-                            "value": json.dumps(sale_dates[pid_num]),
-                        })
-                    else:
-                        # Safe fallback
-                        sales_mf_inputs.append({
-                            "ownerId": pid_gid,
-                            "namespace": MF_NAMESPACE,
-                            "key": KEY_DATES,
-                            "type": "date",
-                            "value": today,
-                        })
-                # Always refresh baseline after check
-                avail_baseline[pid_num] = int(avail)
+
+                        # Update dates
+                        if sd_type == "date":
+                            # scalar date: always set to today
+                            sales_mf_inputs.append({
+                                "ownerId": pid_gid,
+                                "namespace": MF_NAMESPACE,
+                                "key": KEY_DATES,
+                                "type": "date",
+                                "value": today,
+                            })
+                        elif sd_type == "list.date":
+                            # append today if not present
+                            if today not in existing_dates:
+                                existing_dates.append(today)
+                            # keep only last SALES_DATES_LIMIT values
+                            existing_dates = sorted(set(existing_dates))[-SALES_DATES_LIMIT:]
+                            sales_mf_inputs.append({
+                                "ownerId": pid_gid,
+                                "namespace": MF_NAMESPACE,
+                                "key": KEY_DATES,
+                                "type": "list.date",
+                                "value": json.dumps(existing_dates),
+                            })
+                        else:
+                            # Safe fallback to scalar date
+                            sales_mf_inputs.append({
+                                "ownerId": pid_gid,
+                                "namespace": MF_NAMESPACE,
+                                "key": KEY_DATES,
+                                "type": "date",
+                                "value": today,
+                            })
+
+                    # Always refresh availability baseline after evaluating diff
+                    avail_baseline[pid_num] = int(avail)
 
             # --- READY/MTO behavior uses the same availability ---
             badges_node = p.get("badges") or None
@@ -694,7 +716,7 @@ def process_collection(handle: str, seed_only: bool = False) -> Dict[str, Any]:
             verified_types = f"{(badges_node or {}).get('type')}|{(dtime_node or {}).get('type')}"
             mutation_errors_str = ""
 
-            if need_status or need_badge or need_delivery:
+            if not seed_only and (need_status or need_badge or need_delivery):
                 changed += 1
                 if need_status:
                     if CHANGE_STATUS:
@@ -761,7 +783,7 @@ def process_collection(handle: str, seed_only: bool = False) -> Dict[str, Any]:
                 print(f"[WARN] sales metafieldsSet errors: {ue}", flush=True)
             time.sleep(MUTATION_SLEEP_SEC)
 
-    # Persist baseline + sales counters/dates
+    # Persist availability baseline
     _save_sales_state()
 
     summary = {
@@ -821,7 +843,6 @@ def run_now():
 
     handle = (request.args.get("handle") or request.form.get("handle") or "").strip()
     if not handle:
-        # default to first configured handle
         handle = COLLECTION_HANDLES[0]
 
     # allow ad-hoc overrides via query
