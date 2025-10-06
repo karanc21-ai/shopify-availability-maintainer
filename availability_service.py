@@ -4,11 +4,11 @@
 """
 Dual-site availability sync — Render-friendly (no seeding needed)
 
-- First full cycle is auto READ-ONLY (learn baselines; no writes).
+- First time we see an item (per product/variant): learn-only (no deltas applied for that item).
 - India (IN) scan:
    * Compute availability per product from variants (tracked only by default).
    * On availability drop vs last_seen: bump sales_total & sales_dates.
-   * Always set metafields (badges/delivery) after first cycle.
+   * Update metafields (badges/delivery) on subsequent cycles.
    * SPECIAL status rule (symmetric) for one collection:
        - avail < 1 & status=ACTIVE  → DRAFT
        - avail ≥ 1 & status=DRAFT   → ACTIVE
@@ -19,7 +19,7 @@ Dual-site availability sync — Render-friendly (no seeding needed)
 Render tweaks:
 - DATA_DIR for state/logs; attach a Persistent Disk at /data and set DATA_DIR=/data.
 - LOG_TO_STDOUT=1 prints a pipe-delimited line for every log row to Render Logs.
-- Prefer triggering via a Render Cron (POST /run?key=...); or set ENABLE_SCHEDULER=1.
+- Prefer a Background Worker with HEADLESS=1 (or Cron calling /run with FIRE_AND_FORGET_RUN=1).
 
 Sleep units:
 - *_MS are milliseconds. MUTATION_SLEEP_SEC is seconds.
@@ -30,6 +30,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request, jsonify, make_response
+from threading import Thread, Lock
 
 # ---------- Config & pacing ----------
 API_VERSION = os.getenv("API_VERSION", "2024-10").strip()
@@ -81,12 +82,16 @@ DATA_DIR = os.getenv("DATA_DIR", ".").rstrip("/")
 os.makedirs(DATA_DIR, exist_ok=True)
 LOG_TO_STDOUT = os.getenv("LOG_TO_STDOUT", "1") == "1"
 
+# Headless worker mode and fire-and-forget run
+HEADLESS = os.getenv("HEADLESS", "0") == "1"
+FIRE_AND_FORGET_RUN = os.getenv("FIRE_AND_FORGET_RUN", "1") == "1"
+
 def p(*parts):  # path helper within DATA_DIR
     return os.path.join(DATA_DIR, *parts)
 
 PORT = int(os.getenv("PORT", os.getenv("PORT", "10000")))  # Render injects PORT
 
-# Last-seen persistence (no seeding)
+# Last-seen persistence (no global seeding)
 IN_LAST_SEEN  = p("in_last_seen.json")   # product_id(num) -> last_seen_availability
 US_LAST_SEEN  = p("us_last_seen.json")   # variant_id(num)  -> last_seen_qty
 STATE_PATH    = p("dual_state.json")     # {"initialized": bool}
@@ -129,25 +134,6 @@ def rest_adjust_inventory(domain: str, token: str, inventory_item_id: int, locat
 # ---------- Utils ----------
 def now_ist():
     return datetime.now(timezone(timedelta(hours=5, minutes=30)))
-def summarize_product_skus(variants: List[dict], include_untracked: bool) -> str:
-    """
-    Returns a compact, human-readable SKU summary for a product.
-    - Counts only the variants that contribute to availability (mirrors compute_product_availability logic).
-    - Shows up to 5 distinct non-empty SKUs, ';' separated; appends '…(+N)' if more.
-    """
-    seen: List[str] = []
-    for v in variants or []:
-        tracked = bool(((v.get("inventoryItem") or {}).get("tracked")))
-        if include_untracked or tracked:
-            raw = (v.get("sku") or "").strip()
-            if raw and raw not in seen:
-                seen.append(raw)
-    if not seen:
-        return ""
-    if len(seen) <= 5:
-        return ";".join(seen)
-    return ";".join(seen[:5]) + f";…(+{len(seen)-5})"
-
 
 def now_ist_str():
     return now_ist().strftime("%Y-%m-%d %H:%M:%S %z")
@@ -208,6 +194,22 @@ def _as_int_or_none(v):
     except Exception:
         return None
 
+def summarize_product_skus(variants: List[dict], include_untracked: bool) -> str:
+    """
+    Returns a compact, human-readable SKU summary for a product (India logs).
+    Counts only variants that contribute to availability. Shows up to 5 distinct SKUs.
+    """
+    seen: List[str] = []
+    for v in variants or []:
+        tracked = bool(((v.get("inventoryItem") or {}).get("tracked")))
+        if include_untracked or tracked:
+            raw = (v.get("sku") or "").strip()
+            if raw and raw not in seen:
+                seen.append(raw)
+    if not seen:
+        return ""
+    return ";".join(seen[:5]) + (f";…(+{len(seen)-5})" if len(seen) > 5 else "")
+
 # ---------- State (first-cycle flag) ----------
 def load_state():
     try:
@@ -226,7 +228,7 @@ def save_state(obj):
 QUERY_COLLECTION_PAGE_IN = """
 query ($handle:String!, $cursor:String) {
   collectionByHandle(handle:$handle){
-    products(first: 60, after:$cursor){
+    products(first: 40, after:$cursor){
       pageInfo{ hasNextPage endCursor }
       nodes{
         id title status
@@ -251,7 +253,7 @@ query ($handle:String!, $cursor:String) {
 QUERY_COLLECTION_PAGE_US = """
 query ($handle:String!, $cursor:String) {
   collectionByHandle(handle:$handle){
-    products(first: 60, after:$cursor){
+    products(first: 40, after:$cursor){
       pageInfo{ hasNextPage endCursor }
       nodes{
         id title
@@ -309,7 +311,7 @@ def update_product_status(domain: str, token: str, product_gid: str, target_stat
     data = gql(domain, token, MUTATION_PRODUCT_UPDATE, {"input": {"id": product_gid, "status": target_status}})
     errs = ((data.get("productUpdate") or {}).get("userErrors") or [])
     if errs:
-        log_row("IN", "IN", "WARN_STATUS", product_id=gid_num(product_gid), message=str(errs))
+        log_row("IN", "IN", "WARN_STATUS", product_id=gid_num(product_gid), sku="", message=str(errs))
         return False
     time.sleep(MUTATION_SLEEP_SEC)
     return True
@@ -340,7 +342,7 @@ def set_product_metafields_in(domain:str, token:str, product_gid:str, badges_nod
         data = gql(domain, token, mutation, {"metafields": mf})
         errs = ((data.get("metafieldsSet") or {}).get("userErrors") or [])
         if errs:
-            log_row("IN", "IN", "WARN", message=f"metafieldsSet errors: {errs}")
+            log_row("IN", "IN", "WARN", product_id=gid_num(product_gid), sku="", message=f"metafieldsSet errors: {errs}")
 
 def bump_sales_in(domain:str, token:str, product_gid:str, sales_total_node:dict, sales_dates_node:dict, sold:int, today:str):
     st_type = (sales_total_node or {}).get("type") or "number_integer"
@@ -372,7 +374,7 @@ def bump_sales_in(domain:str, token:str, product_gid:str, sales_total_node:dict,
     data = gql(domain, token, m, {"mfs": mf_inputs})
     errs = ((data.get("metafieldsSet") or {}).get("userErrors") or [])
     if errs:
-        log_row("IN", "IN", "WARN", message=f"sales metafieldsSet errors: {errs}")
+        log_row("IN", "IN", "WARN", product_id=gid_num(product_gid), sku="", message=f"sales metafieldsSet errors: {errs}")
 
 def scan_india_and_update(read_only: bool = False):
     last_seen: Dict[str,int] = load_json(IN_LAST_SEEN, {})
@@ -384,7 +386,7 @@ def scan_india_and_update(read_only: bool = False):
             data = gql(IN_DOMAIN, IN_TOKEN, QUERY_COLLECTION_PAGE_IN, {"handle": handle, "cursor": cursor})
             coll = data.get("collectionByHandle")
             if not coll:
-                log_row("IN", "IN", "WARN", message=f"Collection not found: {handle}")
+                log_row("IN", "IN", "WARN", sku="", message=f"Collection not found: {handle}")
                 break
             prods = ((coll.get("products") or {}).get("nodes") or [])
             pageInfo = ((coll.get("products") or {}).get("pageInfo") or {})
@@ -392,17 +394,18 @@ def scan_india_and_update(read_only: bool = False):
                 pid = gid_num(p["id"])
                 variants = ((p.get("variants") or {}).get("nodes") or [])
                 avail = compute_product_availability(variants, IN_INCLUDE_UNTRACKED)
+                sku_summary = summarize_product_skus(variants, IN_INCLUDE_UNTRACKED)
 
                 prev = _as_int_or_none(last_seen.get(pid))
                 if prev is None:
                     # new product (or legacy '-') → learn & move on
                     last_seen[pid] = int(avail)
-                    log_row("IN", "IN", "FIRST_SEEN", product_id=pid, delta="", message=f"avail={avail}")
+                    log_row("IN", "IN", "FIRST_SEEN", product_id=pid, sku=sku_summary, delta="", message=f"avail={avail}")
                 else:
                     diff = int(avail) - int(prev)
                     if not read_only and diff < 0:
                         bump_sales_in(IN_DOMAIN, IN_TOKEN, p["id"], p.get("salesTotal") or {}, p.get("salesDates") or {}, -diff, today)
-                        log_row("IN", "IN", "SALES_BUMP", product_id=pid, delta=diff, message=f"avail {prev}->{avail} (sold={-diff})")
+                        log_row("IN", "IN", "SALES_BUMP", product_id=pid, sku=sku_summary, delta=diff, message=f"avail {prev}->{avail} (sold={-diff})")
                     last_seen[pid] = int(avail)
 
                 # badges/delivery every time UNLESS first global cycle (read_only)
@@ -416,11 +419,11 @@ def scan_india_and_update(read_only: bool = False):
                     if avail < 1 and current_status == "ACTIVE":
                         ok = update_product_status(IN_DOMAIN, IN_TOKEN, p["id"], "DRAFT")
                         log_row("IN", "IN", "STATUS_TO_DRAFT" if ok else "STATUS_TO_DRAFT_FAILED",
-                                product_id=pid, delta=avail, message=f"handle={handle}")
+                                product_id=pid, sku=sku_summary, delta=avail, message=f"handle={handle}")
                     elif avail >= 1 and current_status == "DRAFT":
                         ok = update_product_status(IN_DOMAIN, IN_TOKEN, p["id"], "ACTIVE")
                         log_row("IN", "IN", "STATUS_TO_ACTIVE" if ok else "STATUS_TO_ACTIVE_FAILED",
-                                product_id=pid, delta=avail, message=f"handle={handle}")
+                                product_id=pid, sku=sku_summary, delta=avail, message=f"handle={handle}")
 
                 sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
             save_json(IN_LAST_SEEN, {k:int(v) for k,v in last_seen.items()})
@@ -452,7 +455,7 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
             data = gql(US_DOMAIN, US_TOKEN, QUERY_COLLECTION_PAGE_US, {"handle": handle, "cursor": cursor})
             coll = data.get("collectionByHandle")
             if not coll:
-                log_row("US", "US", "WARN", message=f"Collection not found: {handle}")
+                log_row("US", "US", "WARN", sku="", message=f"Collection not found: {handle}")
                 break
             prods = ((coll.get("products") or {}).get("nodes") or [])
             pageInfo = ((coll.get("products") or {}).get("pageInfo") or {})
@@ -460,7 +463,7 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
                 for v in ((p.get("variants") or {}).get("nodes") or []):
                     vgid = v.get("id")
                     vid = gid_num(vgid)
-                    raw_sku = v.get("sku") or ""
+                    raw_sku = (v.get("sku") or "").strip()
                     sku_norm = normalize_sku(raw_sku)
                     qty = int(v.get("inventoryQuantity") or 0)
 
@@ -478,21 +481,25 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
                                         message="US variant changed qty but has no SKU; cannot mirror to India")
                             else:
                                 if read_only:
-                                    log_row("US→IN", "IN", "FIRST_CYCLE_SKIP", variant_id=vid, sku=raw_sku, delta=delta,
+                                    log_row("US→IN", "IN", "FIRST_CYCLE_SKIP",
+                                            variant_id=vid, sku=raw_sku, delta=delta,
                                             message="Global first cycle is read-only; no adjust applied")
                                 else:
                                     in_inv_item_id = find_india_inventory_item_id_by_sku(sku_norm)
                                     if in_inv_item_id is None:
-                                        log_row("US→IN", "US", "**WARN_SKU_NOT_FOUND_IN_INDIA**", variant_id=vid, sku=raw_sku, delta=delta,
+                                        log_row("US→IN", "US", "**WARN_SKU_NOT_FOUND_IN_INDIA**",
+                                                variant_id=vid, sku=raw_sku, delta=delta,
                                                 message=f"US change {delta}; no matching SKU in India")
                                     else:
                                         try:
                                             rest_adjust_inventory(IN_DOMAIN, IN_TOKEN, in_inv_item_id, int(IN_LOCATION_ID), delta)
-                                            log_row("US→IN", "IN", "APPLIED_DELTA", variant_id=vid, sku=raw_sku, delta=delta,
+                                            log_row("US→IN", "IN", "APPLIED_DELTA",
+                                                    variant_id=vid, sku=raw_sku, delta=delta,
                                                     message=f"Adjusted IN inventory_item_id={in_inv_item_id} by {delta}")
                                             time.sleep(MUTATION_SLEEP_SEC)
                                         except Exception as e:
-                                            log_row("US→IN", "IN", "ERROR_APPLYING_DELTA", variant_id=vid, sku=raw_sku, delta=delta, message=str(e))
+                                            log_row("US→IN", "IN", "ERROR_APPLYING_DELTA",
+                                                    variant_id=vid, sku=raw_sku, delta=delta, message=str(e))
                             last_seen[vid] = qty
 
                     sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
@@ -503,8 +510,7 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
             else:
                 break
 
-# ---------- Scheduler loop ----------
-from threading import Thread, Lock
+# ---------- Scheduler loop & run orchestration ----------
 run_lock = Lock()
 is_running = False
 
@@ -521,23 +527,33 @@ def run_cycle():
         us_seen = load_json(US_LAST_SEEN, {})
         first_cycle = (not state.get("initialized", False)) and (len(in_seen) == 0 and len(us_seen) == 0)
 
-        # India first (metafields + sales) — skip writes if first cycle
+        # India first
         scan_india_and_update(read_only=first_cycle)
         sleep_ms(SLEEP_BETWEEN_SHOPS_MS)
 
-        # USA second (mirror variant deltas → IN) — skip adjust if first cycle
+        # USA second
         scan_usa_and_mirror_to_india(read_only=first_cycle)
 
         # Mark initialized after the first full cycle completes
         if first_cycle:
             state["initialized"] = True
             save_state(state)
-            log_row("SCHED", "BOTH", "FIRST_CYCLE_DONE", message="Baselines learned; future cycles will apply deltas")
+            log_row("SCHED", "BOTH", "FIRST_CYCLE_DONE", sku="", message="Baselines learned; future cycles will apply deltas")
 
         return "ok"
     finally:
         with run_lock:
             is_running = False
+
+def scheduler_loop():
+    if RUN_EVERY_MIN <= 0:
+        return
+    while True:
+        try:
+            run_cycle()
+        except Exception as e:
+            log_row("SCHED", "BOTH", "ERROR", sku="", message=str(e))
+        time.sleep(max(1, RUN_EVERY_MIN) * 60)
 
 # ---------- Flask ----------
 app = Flask(__name__)
@@ -548,33 +564,66 @@ def _cors(resp):
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return resp
 
+@app.route("/", methods=["GET"])
+def root():
+    return "ok", 200
+
 @app.route("/health", methods=["GET"])
 def health():
     return "ok", 200
 
-@app.route("/run", methods=["POST"])
+@app.route("/diag", methods=["GET"])
+def diag():
+    info = {
+        "api_version": API_VERSION,
+        "in_domain": IN_DOMAIN,
+        "us_domain": US_DOMAIN,
+        "in_collections": IN_COLLECTIONS,
+        "us_collections": US_COLLECTIONS,
+        "data_dir": DATA_DIR,
+        "scheduler_enabled": ENABLE_SCHEDULER,
+        "run_every_min": RUN_EVERY_MIN,
+        "in_last_seen_count": len(load_json(IN_LAST_SEEN, {})),
+        "us_last_seen_count": len(load_json(US_LAST_SEEN, {})),
+    }
+    return _cors(jsonify(info)), 200
+
+@app.route("/run", methods=["GET","POST"])
 def run_now():
     key = (request.args.get("key") or request.form.get("key") or "").strip()
     if key != PIXEL_SHARED_SECRET:
         return _cors(make_response(("forbidden", 403)))
-    status = run_cycle()
-    return _cors(jsonify({"status": status})), 200 if status == "ok" else 409
+    if FIRE_AND_FORGET_RUN:
+        Thread(target=run_cycle, daemon=True).start()
+        return _cors(jsonify({"status": "started"})), 202
+    else:
+        status = run_cycle()
+        return _cors(jsonify({"status": status})), 200 if status == "ok" else 409
 
-def scheduler_loop():
-    if RUN_EVERY_MIN <= 0:
-        return
-    while True:
-        try:
-            run_cycle()
-        except Exception as e:
-            log_row("SCHED", "BOTH", "ERROR", message=str(e))
-        time.sleep(max(1, RUN_EVERY_MIN) * 60)
-
+# Start internal scheduler if enabled and not headless-worker mode
 if ENABLE_SCHEDULER:
     Thread(target=scheduler_loop, daemon=True).start()
 
+# ---------- Entrypoint ----------
 if __name__ == "__main__":
-    from werkzeug.serving import run_simple
-    print(f"[BOOT] Dual sync on port {PORT} | API {API_VERSION}")
-    print(f"[CFG] IN={IN_DOMAIN} (loc {IN_LOCATION_ID}) | US={US_DOMAIN} (loc {US_LOCATION_ID}) | DATA_DIR={DATA_DIR}")
-    run_simple("0.0.0.0", PORT, app)
+    if HEADLESS:
+        # Pure worker: no HTTP, just scheduler loop (or single run if RUN_EVERY_MIN<=0)
+        print(f"[BOOT] Headless worker | API {API_VERSION}")
+        print(f"[CFG] IN={IN_DOMAIN} (loc {IN_LOCATION_ID}) | US={US_DOMAIN} (loc {US_LOCATION_ID}) | DATA_DIR={DATA_DIR}")
+        try:
+            if ENABLE_SCHEDULER and RUN_EVERY_MIN > 0:
+                while True:
+                    try:
+                        run_cycle()
+                    except Exception as e:
+                        log_row("SCHED", "BOTH", "ERROR", sku="", message=str(e))
+                    time.sleep(max(1, RUN_EVERY_MIN) * 60)
+            else:
+                run_cycle()
+        except KeyboardInterrupt:
+            pass
+    else:
+        from werkzeug.serving import run_simple
+        print(f"[BOOT] Dual sync on port {PORT} | API {API_VERSION}")
+        print(f"[CFG] IN={IN_DOMAIN} (loc {IN_LOCATION_ID}) | US={US_DOMAIN} (loc {US_LOCATION_ID}) | DATA_DIR={DATA_DIR}")
+        run_simple("0.0.0.0", PORT, app)
