@@ -2,27 +2,24 @@
 # -*- coding: utf-8 -*-
 
 """
-Dual-site availability sync — Render-friendly (no seeding needed)
+Dual-site availability sync — Render-friendly (no global seeding needed)
 
-- First time we see an item (per product/variant): learn-only (no deltas applied for that item).
+- Per-item first sighting is learn-only (no deltas or sales bumps for that specific item).
 - India (IN) scan:
-   * Compute availability per product from variants (tracked only by default).
+   * Product availability from variants (tracked only by default unless IN_INCLUDE_UNTRACKED=1).
    * On availability drop vs last_seen: bump sales_total & sales_dates.
-   * Update metafields (badges/delivery) on subsequent cycles.
-   * SPECIAL status rule (symmetric) for one collection:
+   * Update metafields (badges/delivery) after first sighting.
+   * SPECIAL status rule for one collection (symmetric):
        - avail < 1 & status=ACTIVE  → DRAFT
        - avail ≥ 1 & status=DRAFT   → ACTIVE
 - USA (US) scan:
    * Track per-variant qty; mirror delta to India by SKU (inventory_levels/adjust).
-   * Warn if SKU missing or not found in India.
+   * Warn if SKU missing or not found in India (with robust match attempts).
 
-Render tweaks:
-- DATA_DIR for state/logs; attach a Persistent Disk at /data and set DATA_DIR=/data.
-- LOG_TO_STDOUT=1 prints a pipe-delimited line for every log row to Render Logs.
-- Prefer a Background Worker with HEADLESS=1 (or Cron calling /run with FIRE_AND_FORGET_RUN=1).
-
-Sleep units:
-- *_MS are milliseconds. MUTATION_SLEEP_SEC is seconds.
+Render tips:
+- Use a Persistent Disk mounted at /data and set DATA_DIR=/data (otherwise you’ll re-learn on each restart).
+- Prefer a Background Worker (HEADLESS=1, ENABLE_SCHEDULER=1). Keep a tiny Web Service for /run and /diag.
+- Sleep envs are in milliseconds; MUTATION_SLEEP_SEC is seconds.
 """
 
 import os, sys, time, json, csv, random
@@ -101,31 +98,36 @@ LOG_CSV       = p("dual_sync_log.csv")   # CSV + stdout
 def hdr(token: str) -> Dict[str, str]:
     return {"X-Shopify-Access-Token": token, "Content-Type": "application/json", "Accept": "application/json"}
 
+def _backoff_sleep(attempt: int) -> None:
+    time.sleep(min(10.0, 0.4 * (2 ** (attempt-1))) + random.uniform(0, 0.25))
+
 def gql(domain: str, token: str, query: str, variables: dict = None) -> dict:
     url = f"https://{domain}/admin/api/{API_VERSION}/graphql.json"
-    for attempt in range(1, 8):
+    for attempt in range(1, 9):
         r = requests.post(url, headers=hdr(token), json={"query": query, "variables": variables or {}}, timeout=60)
-        if r.status_code == 429:
-            time.sleep(min(10.0, 0.4 * (2 ** (attempt-1))) + random.uniform(0, 0.25))
+        # Retry on throttles and transient 5xx from Shopify/CDN
+        if r.status_code in (429, 500, 502, 503, 504):
+            _backoff_sleep(attempt)
             continue
         if r.status_code != 200:
             raise RuntimeError(f"GraphQL HTTP {r.status_code}: {r.text}")
         data = r.json()
         if data.get("errors"):
+            # Retries on explicit THROTTLED errors
             if any(((e.get("extensions") or {}).get("code","").upper() == "THROTTLED") for e in data["errors"]):
-                time.sleep(min(10.0, 0.4 * (2 ** (attempt-1))) + random.uniform(0, 0.25))
+                _backoff_sleep(attempt)
                 continue
             raise RuntimeError(f"GraphQL errors: {data['errors']}")
         return data["data"]
-    raise RuntimeError("GraphQL throttled repeatedly")
+    raise RuntimeError("GraphQL throttled/5xx repeatedly")
 
 def rest_adjust_inventory(domain: str, token: str, inventory_item_id: int, location_id: int, delta: int) -> None:
     url = f"https://{domain}/admin/api/{API_VERSION}/inventory_levels/adjust.json"
     payload = {"inventory_item_id": int(inventory_item_id), "location_id": int(location_id), "available_adjustment": int(delta)}
     for attempt in range(1, 6):
         r = requests.post(url, headers=hdr(token), json=payload, timeout=30)
-        if r.status_code == 429:
-            time.sleep(min(8.0, 0.3 * (2 ** (attempt-1))) + random.uniform(0, 0.25))
+        if r.status_code in (429, 500, 502, 503, 504):
+            _backoff_sleep(attempt)
             continue
         if r.status_code >= 400:
             raise RuntimeError(f"REST adjust {r.status_code}: {r.text}")
@@ -382,6 +384,7 @@ def scan_india_and_update(read_only: bool = False):
 
     for handle in IN_COLLECTIONS:
         cursor = None
+        visited_products = set()  # per-cycle de-dupe
         while True:
             data = gql(IN_DOMAIN, IN_TOKEN, QUERY_COLLECTION_PAGE_IN, {"handle": handle, "cursor": cursor})
             coll = data.get("collectionByHandle")
@@ -392,13 +395,16 @@ def scan_india_and_update(read_only: bool = False):
             pageInfo = ((coll.get("products") or {}).get("pageInfo") or {})
             for p in prods:
                 pid = gid_num(p["id"])
+                if pid in visited_products:
+                    continue
+                visited_products.add(pid)
+
                 variants = ((p.get("variants") or {}).get("nodes") or [])
                 avail = compute_product_availability(variants, IN_INCLUDE_UNTRACKED)
                 sku_summary = summarize_product_skus(variants, IN_INCLUDE_UNTRACKED)
 
                 prev = _as_int_or_none(last_seen.get(pid))
                 if prev is None:
-                    # new product (or legacy '-') → learn & move on
                     last_seen[pid] = int(avail)
                     log_row("IN", "IN", "FIRST_SEEN", product_id=pid, sku=sku_summary, delta="", message=f"avail={avail}")
                 else:
@@ -413,7 +419,7 @@ def scan_india_and_update(read_only: bool = False):
                 if not read_only:
                     set_product_metafields_in(IN_DOMAIN, IN_TOKEN, p["id"], p.get("badges") or {}, p.get("dtime") or {}, target_badge, target_delivery)
 
-                # SPECIAL STATUS RULE (symmetric) for the special collection
+                # SPECIAL STATUS RULE for the special collection
                 if (not read_only) and IN_CHANGE_STATUS and (handle == SPECIAL_STATUS_HANDLE):
                     current_status = (p.get("status") or "").upper()
                     if avail < 1 and current_status == "ACTIVE":
@@ -434,16 +440,33 @@ def scan_india_and_update(read_only: bool = False):
                 break
 
 # ----- USA behavior (variant-level deltas → adjust India) -----
-def find_india_inventory_item_id_by_sku(sku_norm: str) -> Optional[int]:
-    # returns inventory_item_id (numeric) or None
-    q = f"sku:'{sku_norm}'"
-    data = gql(IN_DOMAIN, IN_TOKEN, QUERY_FIND_IN_VARIANT_BY_SKU, {"q": q})
-    nodes = ((data.get("productVariants") or {}).get("nodes") or [])
-    for n in nodes:
-        if normalize_sku(n.get("sku")) == sku_norm:
-            inv_item_gid = ((n.get("inventoryItem") or {}).get("id") or "")
-            inv_item_id = int(gid_num(inv_item_gid) or "0")
-            return inv_item_id if inv_item_id > 0 else None
+def find_india_inventory_item_id_by_sku(sku_norm: str, raw_sku: Optional[str] = None) -> Optional[int]:
+    """
+    Try multiple forms to locate the India inventory_item_id by SKU.
+    We accept a match only if normalize_sku(candidate) == sku_norm, ensuring robust but precise mapping.
+    """
+    candidates: List[str] = []
+    if raw_sku:
+        candidates += [raw_sku.strip(), raw_sku.strip().lower()]
+    s = sku_norm
+    # try hyphen/space/compact forms
+    candidates += [s, s.replace("-", " "), s.replace("-", ""), s.upper(), s.title()]
+    tried = set()
+    for c in candidates:
+        c = (c or "").strip()
+        if not c or c in tried:
+            continue
+        tried.add(c)
+        for q in (f"sku:'{c}'", f"sku:{c}"):
+            data = gql(IN_DOMAIN, IN_TOKEN, QUERY_FIND_IN_VARIANT_BY_SKU, {"q": q})
+            nodes = ((data.get("productVariants") or {}).get("nodes") or [])
+            for n in nodes:
+                nsku = (n.get("sku") or "").strip()
+                if normalize_sku(nsku) == sku_norm:
+                    inv_item_gid = ((n.get("inventoryItem") or {}).get("id") or "")
+                    inv_item_id = int(gid_num(inv_item_gid) or "0")
+                    if inv_item_id > 0:
+                        return inv_item_id
     return None
 
 def scan_usa_and_mirror_to_india(read_only: bool = False):
@@ -451,6 +474,7 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
 
     for handle in US_COLLECTIONS:
         cursor = None
+        visited_variants = set()  # per-cycle de-dupe
         while True:
             data = gql(US_DOMAIN, US_TOKEN, QUERY_COLLECTION_PAGE_US, {"handle": handle, "cursor": cursor})
             coll = data.get("collectionByHandle")
@@ -463,6 +487,10 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
                 for v in ((p.get("variants") or {}).get("nodes") or []):
                     vgid = v.get("id")
                     vid = gid_num(vgid)
+                    if vid in visited_variants:
+                        continue
+                    visited_variants.add(vid)
+
                     raw_sku = (v.get("sku") or "").strip()
                     sku_norm = normalize_sku(raw_sku)
                     qty = int(v.get("inventoryQuantity") or 0)
@@ -485,7 +513,7 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
                                             variant_id=vid, sku=raw_sku, delta=delta,
                                             message="Global first cycle is read-only; no adjust applied")
                                 else:
-                                    in_inv_item_id = find_india_inventory_item_id_by_sku(sku_norm)
+                                    in_inv_item_id = find_india_inventory_item_id_by_sku(sku_norm, raw_sku)
                                     if in_inv_item_id is None:
                                         log_row("US→IN", "US", "**WARN_SKU_NOT_FOUND_IN_INDIA**",
                                                 variant_id=vid, sku=raw_sku, delta=delta,
@@ -600,7 +628,7 @@ def run_now():
         status = run_cycle()
         return _cors(jsonify({"status": status})), 200 if status == "ok" else 409
 
-# Start internal scheduler if enabled and not headless-worker mode
+# Start internal scheduler if enabled
 if ENABLE_SCHEDULER:
     Thread(target=scheduler_loop, daemon=True).start()
 
