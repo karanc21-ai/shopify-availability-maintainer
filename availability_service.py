@@ -129,6 +129,25 @@ def rest_adjust_inventory(domain: str, token: str, inventory_item_id: int, locat
 # ---------- Utils ----------
 def now_ist():
     return datetime.now(timezone(timedelta(hours=5, minutes=30)))
+def summarize_product_skus(variants: List[dict], include_untracked: bool) -> str:
+    """
+    Returns a compact, human-readable SKU summary for a product.
+    - Counts only the variants that contribute to availability (mirrors compute_product_availability logic).
+    - Shows up to 5 distinct non-empty SKUs, ';' separated; appends '…(+N)' if more.
+    """
+    seen: List[str] = []
+    for v in variants or []:
+        tracked = bool(((v.get("inventoryItem") or {}).get("tracked")))
+        if include_untracked or tracked:
+            raw = (v.get("sku") or "").strip()
+            if raw and raw not in seen:
+                seen.append(raw)
+    if not seen:
+        return ""
+    if len(seen) <= 5:
+        return ";".join(seen)
+    return ";".join(seen[:5]) + f";…(+{len(seen)-5})"
+
 
 def now_ist_str():
     return now_ist().strftime("%Y-%m-%d %H:%M:%S %z")
