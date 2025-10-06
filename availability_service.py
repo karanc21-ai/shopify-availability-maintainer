@@ -320,8 +320,9 @@ def update_product_status(domain: str, token: str, product_gid: str, target_stat
 
 def set_product_metafields_in(domain:str, token:str, product_gid:str, badges_node:dict, dtime_node:dict,
                               target_badge:str, target_delivery:str) -> None:
-    btype = (badges_node or {}).get("type") or "single_line_text_field"
-    dtype = (dtime_node or {}).get("type") or "single_line_text_field"
+    # 🔧 allow forcing metafield types via env
+    btype = os.getenv("BADGES_FORCE_TYPE")   or (badges_node or {}).get("type") or "list.single_line_text_field"
+    dtype = os.getenv("DELIVERY_FORCE_TYPE") or (dtime_node  or {}).get("type")  or "single_line_text_field"
 
     mutation = """
     mutation($metafields:[MetafieldsSetInput!]!){
@@ -347,13 +348,16 @@ def set_product_metafields_in(domain:str, token:str, product_gid:str, badges_nod
             log_row("IN", "IN", "WARN", product_id=gid_num(product_gid), sku="", message=f"metafieldsSet errors: {errs}")
 
 def bump_sales_in(domain:str, token:str, product_gid:str, sales_total_node:dict, sales_dates_node:dict, sold:int, today:str):
+    # 🔧 force types / fix NameError
+    st_type = (sales_total_node or {}).get("type") or "number_integer"
     sd_type = os.getenv("SALES_DATES_FORCE_TYPE") or (sales_dates_node or {}).get("type") or "date"
-    sd_type = (sales_dates_node or {}).get("type") or "list.date"
+
     try:
         current = int((sales_total_node or {}).get("value") or "0")
     except Exception:
         current = 0
     new_total = current + int(sold)
+
     if sd_type == "list.date":
         existing = []
         raw = (sales_dates_node or {}).get("value")
@@ -449,7 +453,7 @@ def find_india_inventory_item_id_by_sku(sku_norm: str, raw_sku: Optional[str] = 
     if raw_sku:
         candidates += [raw_sku.strip(), raw_sku.strip().lower()]
     s = sku_norm
-    # try hyphen/space/compact forms
+    # try hyphen/space/compact/case variants
     candidates += [s, s.replace("-", " "), s.replace("-", ""), s.upper(), s.title()]
     tried = set()
     for c in candidates:
@@ -655,3 +659,4 @@ if __name__ == "__main__":
         print(f"[BOOT] Dual sync on port {PORT} | API {API_VERSION}")
         print(f"[CFG] IN={IN_DOMAIN} (loc {IN_LOCATION_ID}) | US={US_DOMAIN} (loc {US_LOCATION_ID}) | DATA_DIR={DATA_DIR}")
         run_simple("0.0.0.0", PORT, app)
+
