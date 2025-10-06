@@ -9,17 +9,20 @@ Cycle (every RUN_EVERY_MIN):
      - Update custom.badges + custom.delivery_time based on availability (>0 = READY, else MTO)
      - Infer sales: ONLY if availability < last_seen → bump sales_total and sales_dates
      - If product never seen before OR this is the first global cycle → record last_seen, NO writes
-     - SPECIAL COLLECTION RULE: for handle=SPECIAL_STATUS_HANDLE, if availability < 1 and status=ACTIVE → set status=DRAFT
-       (applies only after the first read-only cycle and only if IN_CHANGE_STATUS=1)
+     - SPECIAL COLLECTION RULE (symmetric): for handle=SPECIAL_STATUS_HANDLE
+         * availability < 1  and status=ACTIVE → set status=DRAFT
+         * availability ≥ 1 and status=DRAFT  → set status=ACTIVE
+         (applies only after the first read-only cycle and only if IN_CHANGE_STATUS=1)
   2) USA scan (collection-scoped, variant-level):
      - For each variant with quantity != last_seen:
          * delta = qty - last_seen
          * If SKU maps to an India variant → REST inventory_levels/adjust on India by delta
          * If no map → log **WARN_SKU_NOT_FOUND_IN_INDIA**
+         * If SKU missing → log **WARN_NO_SKU_US**
      - If variant never seen before OR this is the first global cycle → record last_seen, NO adjust
 
 The FIRST full cycle is AUTO read-only (no metafield writes, no sales bumps, no inventory adjust, no status flips).
-Subsequent cycles apply diffs normally. Everything is paced with sleeps to keep Shopify Admin responsive.
+Subsequent cycles apply diffs normally. Sleeps are in ms, mutation sleep is in seconds.
 """
 
 import os, sys, time, json, csv, random
@@ -66,7 +69,7 @@ BADGE_READY    = "Ready To Ship"
 DELIVERY_READY = "2-5 Days Across India"
 DELIVERY_MTO   = "12-15 Days Across India"
 
-# Special collection where low availability should force DRAFT
+# Special collection where availability should control status
 SPECIAL_STATUS_HANDLE = os.getenv(
     "SPECIAL_STATUS_HANDLE",
     "budget-gold-plated-jewelry-premium-jadau-ornaments-on-mix-metal-base"
@@ -165,6 +168,19 @@ def log_row(phase: str, shop: str, note: str, product_id="", variant_id="", sku=
     with open(LOG_CSV, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow([now_ist_str(), phase, shop, note, product_id, variant_id, sku, delta, message])
+
+def _as_int_or_none(v):
+    try:
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            return int(v)
+        s = str(v).strip()
+        if s == "" or s == "-":
+            return None
+        return int(s)
+    except Exception:
+        return None
 
 # ---------- State (first-cycle flag) ----------
 def load_state():
@@ -351,8 +367,9 @@ def scan_india_and_update(read_only: bool = False):
                 variants = ((p.get("variants") or {}).get("nodes") or [])
                 avail = compute_product_availability(variants, IN_INCLUDE_UNTRACKED)
 
-                prev = last_seen.get(pid)
+                prev = _as_int_or_none(last_seen.get(pid))
                 if prev is None:
+                    # new product (or legacy '-') → learn & move on
                     last_seen[pid] = int(avail)
                     log_row("IN", "IN", "FIRST_SEEN", product_id=pid, delta="", message=f"avail={avail}")
                 else:
@@ -367,12 +384,16 @@ def scan_india_and_update(read_only: bool = False):
                 if not read_only:
                     set_product_metafields_in(IN_DOMAIN, IN_TOKEN, p["id"], p.get("badges") or {}, p.get("dtime") or {}, target_badge, target_delivery)
 
-                # SPECIAL STATUS RULE: only for the special collection handle, after first cycle, and only if IN_CHANGE_STATUS=1
+                # SPECIAL STATUS RULE (symmetric) for the special collection
                 if (not read_only) and IN_CHANGE_STATUS and (handle == SPECIAL_STATUS_HANDLE):
                     current_status = (p.get("status") or "").upper()
                     if avail < 1 and current_status == "ACTIVE":
                         ok = update_product_status(IN_DOMAIN, IN_TOKEN, p["id"], "DRAFT")
                         log_row("IN", "IN", "STATUS_TO_DRAFT" if ok else "STATUS_TO_DRAFT_FAILED",
+                                product_id=pid, delta=avail, message=f"handle={handle}")
+                    elif avail >= 1 and current_status == "DRAFT":
+                        ok = update_product_status(IN_DOMAIN, IN_TOKEN, p["id"], "ACTIVE")
+                        log_row("IN", "IN", "STATUS_TO_ACTIVE" if ok else "STATUS_TO_ACTIVE_FAILED",
                                 product_id=pid, delta=avail, message=f"handle={handle}")
 
                 sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
@@ -416,30 +437,38 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
                     raw_sku = v.get("sku") or ""
                     sku_norm = normalize_sku(raw_sku)
                     qty = int(v.get("inventoryQuantity") or 0)
-                    prev = last_seen.get(vid)
+
+                    prev = _as_int_or_none(last_seen.get(vid))
                     if prev is None:
+                        # first time (or '-') → learn & move on
                         last_seen[vid] = qty
                         log_row("US", "US", "FIRST_SEEN", variant_id=vid, sku=raw_sku, delta="", message=f"qty={qty}")
                     else:
                         delta = qty - int(prev)
-                        if delta != 0 and sku_norm:
-                            if read_only:
-                                log_row("US→IN", "IN", "FIRST_CYCLE_SKIP", variant_id=vid, sku=raw_sku, delta=delta,
-                                        message="Global first cycle is read-only; no adjust applied")
+                        if delta != 0:
+                            if not sku_norm:
+                                log_row("US→IN", "US", "**WARN_NO_SKU_US**",
+                                        variant_id=vid, sku=raw_sku, delta=delta,
+                                        message="US variant changed qty but has no SKU; cannot mirror to India")
                             else:
-                                in_inv_item_id = find_india_inventory_item_id_by_sku(sku_norm)
-                                if in_inv_item_id is None:
-                                    log_row("US→IN", "US", "**WARN_SKU_NOT_FOUND_IN_INDIA**", variant_id=vid, sku=raw_sku, delta=delta,
-                                            message=f"US change {delta}; no matching SKU in India")
+                                if read_only:
+                                    log_row("US→IN", "IN", "FIRST_CYCLE_SKIP", variant_id=vid, sku=raw_sku, delta=delta,
+                                            message="Global first cycle is read-only; no adjust applied")
                                 else:
-                                    try:
-                                        rest_adjust_inventory(IN_DOMAIN, IN_TOKEN, in_inv_item_id, int(IN_LOCATION_ID), delta)
-                                        log_row("US→IN", "IN", "APPLIED_DELTA", variant_id=vid, sku=raw_sku, delta=delta,
-                                                message=f"Adjusted IN inventory_item_id={in_inv_item_id} by {delta}")
-                                        time.sleep(MUTATION_SLEEP_SEC)
-                                    except Exception as e:
-                                        log_row("US→IN", "IN", "ERROR_APPLYING_DELTA", variant_id=vid, sku=raw_sku, delta=delta, message=str(e))
+                                    in_inv_item_id = find_india_inventory_item_id_by_sku(sku_norm)
+                                    if in_inv_item_id is None:
+                                        log_row("US→IN", "US", "**WARN_SKU_NOT_FOUND_IN_INDIA**", variant_id=vid, sku=raw_sku, delta=delta,
+                                                message=f"US change {delta}; no matching SKU in India")
+                                    else:
+                                        try:
+                                            rest_adjust_inventory(IN_DOMAIN, IN_TOKEN, in_inv_item_id, int(IN_LOCATION_ID), delta)
+                                            log_row("US→IN", "IN", "APPLIED_DELTA", variant_id=vid, sku=raw_sku, delta=delta,
+                                                    message=f"Adjusted IN inventory_item_id={in_inv_item_id} by {delta}")
+                                            time.sleep(MUTATION_SLEEP_SEC)
+                                        except Exception as e:
+                                            log_row("US→IN", "IN", "ERROR_APPLYING_DELTA", variant_id=vid, sku=raw_sku, delta=delta, message=str(e))
                             last_seen[vid] = qty
+
                     sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
             save_json(US_LAST_SEEN, {k:int(v) for k,v in last_seen.items()})
             sleep_ms(SLEEP_BETWEEN_PAGES_MS)
