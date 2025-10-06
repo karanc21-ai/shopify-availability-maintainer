@@ -2,27 +2,27 @@
 # -*- coding: utf-8 -*-
 
 """
-Dual-site availability sync — NO SEEDING REQUIRED
+Dual-site availability sync — Render-friendly (no seeding needed)
 
-Cycle (every RUN_EVERY_MIN):
-  1) INDIA scan (collection-scoped, product-level availability):
-     - Update custom.badges + custom.delivery_time based on availability (>0 = READY, else MTO)
-     - Infer sales: ONLY if availability < last_seen → bump sales_total and sales_dates
-     - If product never seen before OR this is the first global cycle → record last_seen, NO writes
-     - SPECIAL COLLECTION RULE (symmetric): for handle=SPECIAL_STATUS_HANDLE
-         * availability < 1  and status=ACTIVE → set status=DRAFT
-         * availability ≥ 1 and status=DRAFT  → set status=ACTIVE
-         (applies only after the first read-only cycle and only if IN_CHANGE_STATUS=1)
-  2) USA scan (collection-scoped, variant-level):
-     - For each variant with quantity != last_seen:
-         * delta = qty - last_seen
-         * If SKU maps to an India variant → REST inventory_levels/adjust on India by delta
-         * If no map → log **WARN_SKU_NOT_FOUND_IN_INDIA**
-         * If SKU missing → log **WARN_NO_SKU_US**
-     - If variant never seen before OR this is the first global cycle → record last_seen, NO adjust
+- First full cycle is auto READ-ONLY (learn baselines; no writes).
+- India (IN) scan:
+   * Compute availability per product from variants (tracked only by default).
+   * On availability drop vs last_seen: bump sales_total & sales_dates.
+   * Always set metafields (badges/delivery) after first cycle.
+   * SPECIAL status rule (symmetric) for one collection:
+       - avail < 1 & status=ACTIVE  → DRAFT
+       - avail ≥ 1 & status=DRAFT   → ACTIVE
+- USA (US) scan:
+   * Track per-variant qty; mirror delta to India by SKU (inventory_levels/adjust).
+   * Warn if SKU missing or not found in India.
 
-The FIRST full cycle is AUTO read-only (no metafield writes, no sales bumps, no inventory adjust, no status flips).
-Subsequent cycles apply diffs normally. Sleeps are in ms, mutation sleep is in seconds.
+Render tweaks:
+- DATA_DIR for state/logs; attach a Persistent Disk at /data and set DATA_DIR=/data.
+- LOG_TO_STDOUT=1 prints a pipe-delimited line for every log row to Render Logs.
+- Prefer triggering via a Render Cron (POST /run?key=...); or set ENABLE_SCHEDULER=1.
+
+Sleep units:
+- *_MS are milliseconds. MUTATION_SLEEP_SEC is seconds.
 """
 
 import os, sys, time, json, csv, random
@@ -38,6 +38,8 @@ if not PIXEL_SHARED_SECRET:
     raise SystemExit("PIXEL_SHARED_SECRET required")
 
 RUN_EVERY_MIN = int(os.getenv("RUN_EVERY_MIN", "5"))
+ENABLE_SCHEDULER = os.getenv("ENABLE_SCHEDULER", "0") == "1"
+
 SLEEP_BETWEEN_PRODUCTS_MS = int(os.getenv("SLEEP_BETWEEN_PRODUCTS_MS", "120"))
 SLEEP_BETWEEN_PAGES_MS = int(os.getenv("SLEEP_BETWEEN_PAGES_MS", "400"))
 SLEEP_BETWEEN_SHOPS_MS = int(os.getenv("SLEEP_BETWEEN_SHOPS_MS", "800"))
@@ -49,8 +51,7 @@ IN_TOKEN  = os.getenv("IN_TOKEN", "").strip()
 IN_LOCATION_ID = os.getenv("IN_LOCATION_ID", "").strip()
 IN_COLLECTIONS = [x.strip() for x in os.getenv("IN_COLLECTION_HANDLES","").split(",") if x.strip()]
 IN_INCLUDE_UNTRACKED = os.getenv("IN_INCLUDE_UNTRACKED", "0") == "1"
-# Enable status changes (must be 1 to flip product.status)
-IN_CHANGE_STATUS = os.getenv("IN_CHANGE_STATUS", "0") == "1"
+IN_CHANGE_STATUS = os.getenv("IN_CHANGE_STATUS", "0") == "1"  # must be 1 to flip status
 
 # USA (source of variant-level deltas)
 US_DOMAIN = os.getenv("US_DOMAIN", "").strip()
@@ -69,21 +70,27 @@ BADGE_READY    = "Ready To Ship"
 DELIVERY_READY = "2-5 Days Across India"
 DELIVERY_MTO   = "12-15 Days Across India"
 
-# Special collection where availability should control status
+# Special collection where availability controls status (symmetric rule)
 SPECIAL_STATUS_HANDLE = os.getenv(
     "SPECIAL_STATUS_HANDLE",
     "budget-gold-plated-jewelry-premium-jadau-ornaments-on-mix-metal-base"
 ).strip()
 
-PORT = int(os.getenv("PORT", "5051"))
+# Render / persistence
+DATA_DIR = os.getenv("DATA_DIR", ".").rstrip("/")
+os.makedirs(DATA_DIR, exist_ok=True)
+LOG_TO_STDOUT = os.getenv("LOG_TO_STDOUT", "1") == "1"
 
-# Last-seen persistence (no “seeding” step)
-IN_LAST_SEEN  = "in_last_seen.json"   # product_id(num) -> last_seen_availability
-US_LAST_SEEN  = "us_last_seen.json"   # variant_id(num) -> last_seen_qty
-STATE_PATH    = "dual_state.json"     # {"initialized": bool}
+def p(*parts):  # path helper within DATA_DIR
+    return os.path.join(DATA_DIR, *parts)
 
-# Logs
-LOG_CSV = "dual_sync_log.csv"
+PORT = int(os.getenv("PORT", os.getenv("PORT", "10000")))  # Render injects PORT
+
+# Last-seen persistence (no seeding)
+IN_LAST_SEEN  = p("in_last_seen.json")   # product_id(num) -> last_seen_availability
+US_LAST_SEEN  = p("us_last_seen.json")   # variant_id(num)  -> last_seen_qty
+STATE_PATH    = p("dual_state.json")     # {"initialized": bool}
+LOG_CSV       = p("dual_sync_log.csv")   # CSV + stdout
 
 # ---------- HTTP helpers ----------
 def hdr(token: str) -> Dict[str, str]:
@@ -159,15 +166,15 @@ def ensure_log_header():
     if need:
         with open(LOG_CSV, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow([
-                "ts","phase","shop","note","product_id","variant_id","sku","delta","message"
-            ])
+            w.writerow(["ts","phase","shop","note","product_id","variant_id","sku","delta","message"])
 
 def log_row(phase: str, shop: str, note: str, product_id="", variant_id="", sku="", delta="", message=""):
     ensure_log_header()
+    row = [now_ist_str(), phase, shop, note, product_id, variant_id, sku, delta, message]
+    if LOG_TO_STDOUT:
+        print("|".join(str(x) for x in row), flush=True)
     with open(LOG_CSV, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow([now_ist_str(), phase, shop, note, product_id, variant_id, sku, delta, message])
+        csv.writer(f).writerow(row)
 
 def _as_int_or_none(v):
     try:
@@ -534,7 +541,6 @@ def run_now():
     status = run_cycle()
     return _cors(jsonify({"status": status})), 200 if status == "ok" else 409
 
-# scheduler
 def scheduler_loop():
     if RUN_EVERY_MIN <= 0:
         return
@@ -545,10 +551,11 @@ def scheduler_loop():
             log_row("SCHED", "BOTH", "ERROR", message=str(e))
         time.sleep(max(1, RUN_EVERY_MIN) * 60)
 
-Thread(target=scheduler_loop, daemon=True).start()
+if ENABLE_SCHEDULER:
+    Thread(target=scheduler_loop, daemon=True).start()
 
 if __name__ == "__main__":
     from werkzeug.serving import run_simple
     print(f"[BOOT] Dual sync on port {PORT} | API {API_VERSION}")
-    print(f"[CFG] IN={IN_DOMAIN} (loc {IN_LOCATION_ID}) | US={US_DOMAIN} (loc {US_LOCATION_ID})")
+    print(f"[CFG] IN={IN_DOMAIN} (loc {IN_LOCATION_ID}) | US={US_DOMAIN} (loc {US_LOCATION_ID}) | DATA_DIR={DATA_DIR}")
     run_simple("0.0.0.0", PORT, app)
