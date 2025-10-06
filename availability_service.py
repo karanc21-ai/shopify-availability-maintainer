@@ -347,7 +347,7 @@ def set_product_metafields_in(domain:str, token:str, product_gid:str, badges_nod
             log_row("IN", "IN", "WARN", product_id=gid_num(product_gid), sku="", message=f"metafieldsSet errors: {errs}")
 
 def bump_sales_in(domain:str, token:str, product_gid:str, sales_total_node:dict, sales_dates_node:dict, sold:int, today:str):
-    st_type = (sales_total_node or {}).get("type") or "number_integer"
+    sd_type = os.getenv("SALES_DATES_FORCE_TYPE") or (sales_dates_node or {}).get("type") or "date"
     sd_type = (sales_dates_node or {}).get("type") or "list.date"
     try:
         current = int((sales_total_node or {}).get("value") or "0")
