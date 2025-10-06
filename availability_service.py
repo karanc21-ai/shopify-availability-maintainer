@@ -2,6 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
+TO INITIALIZE THE INVENTORY LEVELS COPY PASTE THE BELOW IN THE LAPTOP TERMINAL
+
+curl -X POST "https://shopify-availability-maintainer.onrender.com/run?key=replace-with-strong-random-string"
+
 Dual-site availability sync — Render-friendly (no global seeding needed)
 
 - Per-item first sighting is learn-only (no deltas or sales bumps for that specific item).
