@@ -4,17 +4,18 @@
 """
 Dual-site availability sync — EXACT product.custom.sku mapping + Snapshots to disk
 
-What this app does
+Key behaviors
 - India scan:
   * Recompute availability (sum of tracked variants by default)
-  * Bump sales_total & sales_dates on availability drops
-  * Update badges/delivery based on availability
-  * SPECIAL_STATUS_HANDLE: auto ACTIVE<->DRAFT + strike_rate (sales_total / active_hours_total)
+  * Bump sales_total & sales_dates on availability drops only
+  * Update badges/delivery based on availability (>0 → READY; <=0 → MTO)
+  * SPECIAL_STATUS_HANDLE: auto ACTIVE<->DRAFT + strike_rate timers
   * Rebuild exact index: /data/in_sku_index.json  (trim+lower product.custom.sku -> product + first tracked inv_item_id)
 - USA scan:
   * Detect per-variant qty deltas
-  * Read **US product** custom.sku once
+  * Read US product custom.sku once
   * Mirror delta to India using ONLY the local exact index (no Shopify search)
+  * NEW: US increases (+delta) are IGNORED by default
 - Snapshots (CSV + JSONL to /data):
   * /export_csv?key=...   → in_products.csv/jsonl & us_products.csv/jsonl
 
@@ -78,6 +79,9 @@ CUSTOM_SKU_NAMESPACE = os.getenv("CUSTOM_SKU_NAMESPACE", "custom").strip()
 CUSTOM_SKU_KEY = os.getenv("CUSTOM_SKU_KEY", "sku").strip()
 USE_PRODUCT_CUSTOM_SKU = os.getenv("USE_PRODUCT_CUSTOM_SKU", "1") == "1"
 ONLY_ACTIVE_FOR_MAPPING = os.getenv("ONLY_ACTIVE_FOR_MAPPING", "1") == "1"  # index includes ACTIVE only if True
+
+# US increases handling
+MIRROR_US_INCREASES = os.getenv("MIRROR_US_INCREASES", "0") == "1"  # default: ignore increases
 
 # Strike-rate keys & optional type forcing
 STRIKE_RATE_KEY = os.getenv("STRIKE_RATE_KEY", "strike_rate")
@@ -563,6 +567,9 @@ def scan_india_and_update(read_only: bool = False):
                     if not read_only and diff < 0:
                         bump_sales_in(IN_DOMAIN, IN_TOKEN, p["id"], p.get("salesTotal") or {}, p.get("salesDates") or {}, -diff, today)
                         log_row("IN", "IN", "SALES_BUMP", product_id=pid, sku=sku_summary, delta=diff, message=f"avail {prev}->{avail} (sold={-diff})")
+                    elif not read_only and diff > 0:
+                        # Optional: explicit restock log line (no sales bump on increases)
+                        log_row("IN", "IN", "RESTOCK", product_id=pid, sku=sku_summary, delta=diff, message=f"avail {prev}->{avail} (+{diff})")
                     last_seen[pid] = int(avail)
 
                 # badges/delivery each time (post first cycle)
@@ -640,36 +647,42 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
                                         variant_id=vid, sku=(raw_prod_sku or ""), delta=delta,
                                         message="Global first cycle is read-only; no adjust applied")
                             else:
-                                if not USE_PRODUCT_CUSTOM_SKU:
-                                    log_row("US→IN", "US", "SKIPPED", variant_id=vid, delta=delta,
-                                            message="USE_PRODUCT_CUSTOM_SKU=0; no mirroring performed")
+                                # NEW: ignore positive deltas from US unless MIRROR_US_INCREASES=1
+                                if delta > 0 and not MIRROR_US_INCREASES:
+                                    log_row("US→IN", "US", "IGNORED_INCREASE",
+                                            variant_id=vid, sku=(raw_prod_sku or ""), delta=delta,
+                                            message="US qty increase; mirroring disabled")
                                 else:
-                                    if not norm_prod_sku:
-                                        log_row("US→IN", "US", "**WARN_NO_PRODUCT_CUSTOM_SKU_US**",
-                                                variant_id=vid, sku=(raw_prod_sku or ""), delta=delta,
-                                                message="US product has no custom.sku; cannot mirror to India")
+                                    if not USE_PRODUCT_CUSTOM_SKU:
+                                        log_row("US→IN", "US", "SKIPPED", variant_id=vid, delta=delta,
+                                                message="USE_PRODUCT_CUSTOM_SKU=0; no mirroring performed")
                                     else:
-                                        target = sku_index.get(norm_prod_sku)
-                                        if not target:
-                                            log_row("US→IN", "IN", "**SKU_NOT_IN_INDEX**",
+                                        if not norm_prod_sku:
+                                            log_row("US→IN", "US", "**WARN_NO_PRODUCT_CUSTOM_SKU_US**",
                                                     variant_id=vid, sku=(raw_prod_sku or ""), delta=delta,
-                                                    message="No exact match in India index (wait for next IN scan)")
+                                                    message="US product has no custom.sku; cannot mirror to India")
                                         else:
-                                            inv_item_id = int(target.get("inventory_item_id") or 0)
-                                            if inv_item_id <= 0:
-                                                log_row("US→IN", "IN", "**WARN_NO_TRACKED_VARIANT_IN_INDIA**",
+                                            target = sku_index.get(norm_prod_sku)
+                                            if not target:
+                                                log_row("US→IN", "IN", "**SKU_NOT_IN_INDEX**",
                                                         variant_id=vid, sku=(raw_prod_sku or ""), delta=delta,
-                                                        message=f"India product has no tracked variant | pid={target.get('product_id')}")
+                                                        message="No exact match in India index (wait for next IN scan)")
                                             else:
-                                                try:
-                                                    rest_adjust_inventory(IN_DOMAIN, IN_TOKEN, inv_item_id, int(IN_LOCATION_ID), delta)
-                                                    log_row("US→IN", "IN", "APPLIED_DELTA",
+                                                inv_item_id = int(target.get("inventory_item_id") or 0)
+                                                if inv_item_id <= 0:
+                                                    log_row("US→IN", "IN", "**WARN_NO_TRACKED_VARIANT_IN_INDIA**",
                                                             variant_id=vid, sku=(raw_prod_sku or ""), delta=delta,
-                                                            message=f"Adjusted IN inventory_item_id={inv_item_id} by {delta} (via EXACT index)")
-                                                    time.sleep(MUTATION_SLEEP_SEC)
-                                                except Exception as e:
-                                                    log_row("US→IN", "IN", "ERROR_APPLYING_DELTA",
-                                                            variant_id=vid, sku=(raw_prod_sku or ""), delta=delta, message=str(e))
+                                                            message=f"India product has no tracked variant | pid={target.get('product_id')}")
+                                                else:
+                                                    try:
+                                                        rest_adjust_inventory(IN_DOMAIN, IN_TOKEN, inv_item_id, int(IN_LOCATION_ID), delta)
+                                                        log_row("US→IN", "IN", "APPLIED_DELTA",
+                                                                variant_id=vid, sku=(raw_prod_sku or ""), delta=delta,
+                                                                message=f"Adjusted IN inventory_item_id={inv_item_id} by {delta} (via EXACT index)")
+                                                        time.sleep(MUTATION_SLEEP_SEC)
+                                                    except Exception as e:
+                                                        log_row("US→IN", "IN", "ERROR_APPLYING_DELTA",
+                                                                variant_id=vid, sku=(raw_prod_sku or ""), delta=delta, message=str(e))
                             last_seen[vid] = qty
 
                     sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
@@ -868,6 +881,7 @@ def diag():
         "run_every_min": RUN_EVERY_MIN,
         "use_product_custom_sku": USE_PRODUCT_CUSTOM_SKU,
         "only_active_for_mapping": ONLY_ACTIVE_FOR_MAPPING,
+        "mirror_us_increases": MIRROR_US_INCREASES,
         "in_last_seen_count": len(load_json(IN_LAST_SEEN, {})),
         "us_last_seen_count": len(load_json(US_LAST_SEEN, {})),
         "index_entries": len(load_json(IN_SKU_INDEX, {}))
