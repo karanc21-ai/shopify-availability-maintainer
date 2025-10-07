@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
+""""
 Dual-site availability sync — EXACT product.custom.sku mapping + Snapshots + Clamp-to-zero
 
 Key behaviors
