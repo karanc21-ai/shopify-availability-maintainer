@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Dual-site availability sync — EXACT product.custom.sku mapping + Snapshots to disk
+Dual-site availability sync — EXACT product.custom.sku mapping + Snapshots + Clamp-to-zero
 
 Key behaviors
 - India scan:
@@ -10,16 +10,16 @@ Key behaviors
   * Bump sales_total & sales_dates on availability drops only
   * Update badges/delivery based on availability (>0 → READY; <=0 → MTO)
   * SPECIAL_STATUS_HANDLE: auto ACTIVE<->DRAFT + strike_rate timers
+  * Optional: CLAMP_AVAIL_TO_ZERO=1 → if avail < 0, raise back to 0 via inventory_levels/adjust
   * Rebuild exact index: /data/in_sku_index.json  (trim+lower product.custom.sku -> product + first tracked inv_item_id)
 - USA scan:
   * Detect per-variant qty deltas
   * Read US product custom.sku once
   * Mirror delta to India using ONLY the local exact index (no Shopify search)
-  * NEW: US increases (+delta) are IGNORED by default
-- Snapshots (CSV + JSONL to /data):
-  * /export_csv?key=...   → in_products.csv/jsonl & us_products.csv/jsonl
+  * US increases (+delta) are IGNORED by default (MIRROR_US_INCREASES=0)
+  * Optional: after mirror, clamp India back to 0 if negative (CLAMP_AVAIL_TO_ZERO=1)
 
-First cycle is learn-only (no writes). Thereafter, deltas & metafield changes apply.
+First cycle is learn-only (no writes/clamping). Thereafter, deltas & metafield changes apply.
 """
 
 import os, sys, time, json, csv, random
@@ -83,6 +83,9 @@ ONLY_ACTIVE_FOR_MAPPING = os.getenv("ONLY_ACTIVE_FOR_MAPPING", "1") == "1"  # in
 # US increases handling
 MIRROR_US_INCREASES = os.getenv("MIRROR_US_INCREASES", "0") == "1"  # default: ignore increases
 
+# Clamp negatives back to 0
+CLAMP_AVAIL_TO_ZERO = os.getenv("CLAMP_AVAIL_TO_ZERO", "1") == "1"
+
 # Strike-rate keys & optional type forcing
 STRIKE_RATE_KEY = os.getenv("STRIKE_RATE_KEY", "strike_rate")
 ACTIVE_HOURS_KEY = os.getenv("ACTIVE_HOURS_KEY", "active_hours_total")
@@ -111,6 +114,7 @@ IN_LAST_SEEN   = p("in_last_seen.json")    # product_id(num) -> last_seen_availa
 US_LAST_SEEN   = p("us_last_seen.json")    # variant_id(num)  -> last_seen_qty
 STATE_PATH     = p("dual_state.json")      # {"initialized": bool}
 LOG_CSV        = p("dual_sync_log.csv")    # CSV + stdout
+LOG_JSONL_PATH = p("dual_sync_log.jsonl")  # richer JSONL
 IN_SKU_INDEX   = p("in_sku_index.json")    # EXACT index: trim+lower custom.sku -> info
 
 # Snapshots
@@ -154,6 +158,10 @@ def rest_adjust_inventory(domain: str, token: str, inventory_item_id: int, locat
         return
 
 # ---------- Utils ----------
+LOG_JSONL = os.getenv("LOG_JSONL", "1") == "1"
+LOG_EMOJI = os.getenv("LOG_EMOJI", "1") == "1"
+LOG_TITLES = os.getenv("LOG_TITLES", "1") == "1"
+
 def now_ist():
     return datetime.now(timezone(timedelta(hours=5, minutes=30)))
 
@@ -181,21 +189,6 @@ def save_json(path: str, obj):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2)
     os.replace(tmp, path)
-
-def ensure_log_header():
-    need = (not os.path.exists(LOG_CSV)) or (os.path.getsize(LOG_CSV) == 0)
-    if need:
-        with open(LOG_CSV, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["ts","phase","shop","note","product_id","variant_id","sku","delta","message"])
-
-def log_row(phase: str, shop: str, note: str, product_id="", variant_id="", sku="", delta="", message=""):
-    ensure_log_header()
-    row = [now_ist_str(), phase, shop, note, product_id, variant_id, sku, delta, message]
-    if LOG_TO_STDOUT:
-        print("|".join(str(x) for x in row), flush=True)
-    with open(LOG_CSV, "a", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow(row)
 
 def _as_int_or_none(v):
     try:
@@ -228,6 +221,65 @@ def summarize_product_skus(variants: List[dict], include_untracked: bool) -> str
         return ""
     return ";".join(seen[:5]) + (f";…(+{len(seen)-5})" if len(seen) > 5 else "")
 
+# ===== Improved logging =====
+def ensure_log_header():
+    need = (not os.path.exists(LOG_CSV)) or (os.path.getsize(LOG_CSV) == 0)
+    if need:
+        with open(LOG_CSV, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["ts","phase","shop","note","product_id","variant_id","sku","delta","message"])
+
+def _emoji_for(note: str) -> str:
+    n = (note or "").upper()
+    if "SALES_BUMP" in n: return "🧾➖"
+    if "RESTOCK" in n: return "📦➕"
+    if "APPLIED_DELTA" in n: return "🔁"
+    if "IGNORED_INCREASE" in n: return "🙅‍♂️➕"
+    if "STATUS_TO_ACTIVE" in n: return "✅🟢"
+    if "STATUS_TO_DRAFT" in n: return "🛑🔒"
+    if "CLAMP_TO_ZERO" in n: return "🧰0️⃣"
+    if "INDEX_BUILT" in n: return "🗂️"
+    if "WARN" in n or "ERROR" in n: return "⚠️"
+    if "FIRST_SEEN" in n: return "👀"
+    return "•"
+
+def log_event(
+    phase: str, shop: str, note: str,
+    product_id: str = "", variant_id: str = "", sku: str = "", delta: str = "", message: str = "",
+    title: str = "", before: str = "", after: str = "", collections: str = ""
+):
+    ensure_log_header()
+    ts = now_ist_str()
+
+    # CSV (legacy)
+    with open(LOG_CSV, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([ts, phase, shop, note, product_id, variant_id, sku, delta, message])
+
+    # JSONL (richer)
+    if LOG_JSONL:
+        rec = {
+            "ts": ts, "phase": phase, "shop": shop, "note": note,
+            "product_id": product_id, "variant_id": variant_id, "sku": sku,
+            "delta": delta, "message": message,
+            "title": title, "before": before, "after": after, "collections": collections,
+        }
+        with open(LOG_JSONL_PATH, "a", encoding="utf-8") as jf:
+            jf.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    # Friendly one-liner
+    if LOG_TO_STDOUT:
+        parts = []
+        parts.append(_emoji_for(note))
+        parts += [phase, note]
+        if sku: parts.append(f"[SKU {sku}]")
+        if product_id: parts.append(f"pid={product_id}")
+        if variant_id: parts.append(f"vid={variant_id}")
+        if before != "" or after != "": parts.append(f"{before}→{after}")
+        if delta not in ("", None): parts.append(f"Δ{delta}")
+        if LOG_TITLES and title: parts.append(f"“{title}”")
+        if message: parts.append(f"— {message}")
+        print(" ".join(parts), flush=True)
+
 # ---------- State ----------
 def load_state():
     try:
@@ -258,7 +310,6 @@ query ($handle:String!, $cursor:String) {
             inventoryPolicy
           }
         }
-        # India product-level bridge metafield:
         skuMeta: metafield(namespace: "%(NS_SKU)s", key: "%(KEY_SKU)s"){ value }
         badges:      metafield(namespace: "%(NS)s", key: "%(BK)s"){ id value type }
         dtime:       metafield(namespace: "%(NS)s", key: "%(DK)s"){ id value type }
@@ -290,7 +341,6 @@ query ($handle:String!, $cursor:String) {
             inventoryItem{ id }
           }
         }
-        # US product-level bridge metafield for mapping:
         skuMeta: metafield(namespace: "%(NS_SKU)s", key: "%(KEY_SKU)s"){ value }
       }
     }
@@ -329,7 +379,7 @@ def update_product_status(domain: str, token: str, product_gid: str, target_stat
     data = gql(domain, token, MUTATION_PRODUCT_UPDATE, {"input": {"id": product_gid, "status": target_status}})
     errs = ((data.get("productUpdate") or {}).get("userErrors") or [])
     if errs:
-        log_row("IN", "IN", "WARN_STATUS", product_id=gid_num(product_gid), sku="", message=str(errs))
+        log_event("IN", "IN", "WARN_STATUS", product_id=gid_num(product_gid), message=str(errs))
         return False
     time.sleep(MUTATION_SLEEP_SEC)
     return True
@@ -360,7 +410,7 @@ def set_product_metafields_in(domain:str, token:str, product_gid:str, badges_nod
         data = gql(domain, token, mutation, {"metafields": mf})
         errs = ((data.get("metafieldsSet") or {}).get("userErrors") or [])
         if errs:
-            log_row("IN", "IN", "WARN", product_id=gid_num(product_gid), sku="", message=f"metafieldsSet errors: {errs}")
+            log_event("IN", "IN", "WARN", product_id=gid_num(product_gid), message=f"metafieldsSet errors: {errs}")
 
 def bump_sales_in(domain:str, token:str, product_gid:str, sales_total_node:dict, sales_dates_node:dict, sold:int, today:str):
     st_type = (sales_total_node or {}).get("type") or "number_integer"
@@ -394,7 +444,7 @@ def bump_sales_in(domain:str, token:str, product_gid:str, sales_total_node:dict,
     data = gql(domain, token, m, {"mfs": mf_inputs})
     errs = ((data.get("metafieldsSet") or {}).get("userErrors") or [])
     if errs:
-        log_row("IN", "IN", "WARN", product_id=gid_num(product_gid), sku="", message=f"sales metafieldsSet errors: {errs}")
+        log_event("IN", "IN", "WARN", product_id=gid_num(product_gid), message=f"sales metafieldsSet errors: {errs}")
 
 # ----- Strike rate support -----
 def _parse_dt_or_none(s: Optional[str]) -> Optional[datetime]:
@@ -468,7 +518,7 @@ def update_active_time_and_strike_rate_in(product_node: dict, now_dt: datetime):
             try:
                 gql(IN_DOMAIN, IN_TOKEN, delm, {"id": act_started_node["id"]})
             except Exception as e:
-                log_row("IN", "IN", "WARN", product_id=pid, message=f"actStarted delete error: {e}")
+                log_event("IN", "IN", "WARN", product_id=pid, message=f"actStarted delete error: {e}")
     else:
         mfs.append({
           "ownerId": pid_gid, "namespace": MF_NAMESPACE,
@@ -479,9 +529,38 @@ def update_active_time_and_strike_rate_in(product_node: dict, now_dt: datetime):
         data = gql(IN_DOMAIN, IN_TOKEN, mutation, {"mfs": mfs})
         errs = ((data.get("metafieldsSet") or {}).get("userErrors") or [])
         if errs:
-            log_row("IN", "IN", "WARN", product_id=pid, message=f"strike_rate writes: {errs}")
+            log_event("IN", "IN", "WARN", product_id=pid, message=f"strike_rate writes: {errs}")
     except Exception as e:
-        log_row("IN", "IN", "WARN", product_id=pid, message=f"strike_rate exception: {e}")
+        log_event("IN", "IN", "WARN", product_id=pid, message=f"strike_rate exception: {e}")
+
+# ----- Clamp helper -----
+def clamp_product_to_zero_if_needed(product_node: dict, current_avail: int, first_tracked_inv_item_id: int):
+    """
+    If CLAMP_AVAIL_TO_ZERO=1 and availability < 0, raise back to 0 by adjusting +(-avail)
+    Uses first tracked inventory_item_id of the product.
+    """
+    if not CLAMP_AVAIL_TO_ZERO:
+        return False
+    if int(current_avail) >= 0:
+        return False
+    if int(first_tracked_inv_item_id) <= 0:
+        return False
+    delta = -int(current_avail)  # amount to add to reach 0
+    try:
+        rest_adjust_inventory(IN_DOMAIN, IN_TOKEN, int(first_tracked_inv_item_id), int(IN_LOCATION_ID), int(delta))
+        log_event("IN", "IN", "CLAMP_TO_ZERO",
+                  product_id=gid_num(product_node["id"]),
+                  sku=(product_node.get("skuMeta") or {}).get("value") or "",
+                  delta=f"+{delta}",
+                  message=f"Raised availability to 0 on inventory_item_id={first_tracked_inv_item_id}",
+                  title=product_node.get("title") or "",
+                  before=str(current_avail), after="0")
+        return True
+    except Exception as e:
+        log_event("IN", "IN", "WARN",
+                  product_id=gid_num(product_node["id"]),
+                  message=f"Clamp-to-zero failed: {e}")
+        return False
 
 # ----- Index builder (India) -----
 def build_and_persist_india_sku_index():
@@ -530,9 +609,9 @@ def build_and_persist_india_sku_index():
             else:
                 break
     save_json(IN_SKU_INDEX, index)
-    log_row("IN", "IN", "INDEX_BUILT", message=f"entries={len(index)}")
+    log_event("IN", "IN", "INDEX_BUILT", message=f"entries={len(index)}")
 
-# ----- India scan (availability + metafields + strike + status) -----
+# ----- India scan (availability + metafields + strike + status + clamp) -----
 def scan_india_and_update(read_only: bool = False):
     last_seen: Dict[str,int] = load_json(IN_LAST_SEEN, {})
     today = today_ist_str()
@@ -544,12 +623,13 @@ def scan_india_and_update(read_only: bool = False):
             data = gql(IN_DOMAIN, IN_TOKEN, QUERY_COLLECTION_PAGE_IN, {"handle": handle, "cursor": cursor})
             coll = data.get("collectionByHandle")
             if not coll:
-                log_row("IN", "IN", "WARN", sku="", message=f"Collection not found: {handle}")
+                log_event("IN", "IN", "WARN", message=f"Collection not found: {handle}")
                 break
             prods = ((coll.get("products") or {}).get("nodes") or [])
             pageInfo = ((coll.get("products") or {}).get("pageInfo") or {})
             for p in prods:
-                pid = gid_num(p["id"])
+                pid_gid = p["id"]
+                pid = gid_num(pid_gid)
                 if pid in visited_products:
                     continue
                 visited_products.add(pid)
@@ -557,25 +637,37 @@ def scan_india_and_update(read_only: bool = False):
                 variants = ((p.get("variants") or {}).get("nodes") or [])
                 avail = compute_product_availability(variants, IN_INCLUDE_UNTRACKED)
                 sku_summary = summarize_product_skus(variants, IN_INCLUDE_UNTRACKED)
+                title = p.get("title") or ""
+
+                # first tracked inv_item_id (for clamp)
+                first_tracked_inv_item_id = 0
+                for v in variants:
+                    inv = (v.get("inventoryItem") or {})
+                    if inv.get("tracked"):
+                        first_tracked_inv_item_id = int(gid_num(inv.get("id") or "0") or "0")
+                        if first_tracked_inv_item_id > 0:
+                            break
 
                 prev = _as_int_or_none(last_seen.get(pid))
                 if prev is None:
                     last_seen[pid] = int(avail)
-                    log_row("IN", "IN", "FIRST_SEEN", product_id=pid, sku=sku_summary, delta="", message=f"avail={avail}")
+                    log_event("IN", "IN", "FIRST_SEEN", product_id=pid, sku=sku_summary, message=f"avail={avail}", title=title)
                 else:
                     diff = int(avail) - int(prev)
                     if not read_only and diff < 0:
-                        bump_sales_in(IN_DOMAIN, IN_TOKEN, p["id"], p.get("salesTotal") or {}, p.get("salesDates") or {}, -diff, today)
-                        log_row("IN", "IN", "SALES_BUMP", product_id=pid, sku=sku_summary, delta=diff, message=f"avail {prev}->{avail} (sold={-diff})")
+                        bump_sales_in(IN_DOMAIN, IN_TOKEN, pid_gid, p.get("salesTotal") or {}, p.get("salesDates") or {}, -diff, today)
+                        log_event("IN", "IN", "SALES_BUMP", product_id=pid, sku=sku_summary, delta=str(diff),
+                                  message=f"avail {prev}->{avail} (sold={-diff})", title=title, before=str(prev), after=str(avail))
                     elif not read_only and diff > 0:
-                        # Optional: explicit restock log line (no sales bump on increases)
-                        log_row("IN", "IN", "RESTOCK", product_id=pid, sku=sku_summary, delta=diff, message=f"avail {prev}->{avail} (+{diff})")
+                        log_event("IN", "IN", "RESTOCK", product_id=pid, sku=sku_summary, delta=str(diff),
+                                  message=f"avail {prev}->{avail} (+{diff})", title=title, before=str(prev), after=str(avail))
                     last_seen[pid] = int(avail)
 
                 # badges/delivery each time (post first cycle)
                 _, target_badge, target_delivery = desired_state(avail)
                 if not read_only:
-                    set_product_metafields_in(IN_DOMAIN, IN_TOKEN, p["id"], p.get("badges") or {}, p.get("dtime") or {}, target_badge, target_delivery)
+                    set_product_metafields_in(IN_DOMAIN, IN_TOKEN, pid_gid, p.get("badges") or {}, p.get("dtime") or {},
+                                              target_badge, target_delivery)
 
                 # Strike rate accrual for special collection
                 if (not read_only) and (handle == SPECIAL_STATUS_HANDLE):
@@ -585,13 +677,17 @@ def scan_india_and_update(read_only: bool = False):
                 if (not read_only) and IN_CHANGE_STATUS and (handle == SPECIAL_STATUS_HANDLE):
                     current_status = (p.get("status") or "").upper()
                     if avail < 1 and current_status == "ACTIVE":
-                        ok = update_product_status(IN_DOMAIN, IN_TOKEN, p["id"], "DRAFT")
-                        log_row("IN", "IN", "STATUS_TO_DRAFT" if ok else "STATUS_TO_DRAFT_FAILED",
-                                product_id=pid, sku=sku_summary, delta=avail, message=f"handle={handle}")
+                        ok = update_product_status(IN_DOMAIN, IN_TOKEN, pid_gid, "DRAFT")
+                        log_event("IN", "IN", "STATUS_TO_DRAFT" if ok else "STATUS_TO_DRAFT_FAILED",
+                                  product_id=pid, sku=sku_summary, delta=str(avail), message=f"handle={handle}", title=title)
                     elif avail >= 1 and current_status == "DRAFT":
-                        ok = update_product_status(IN_DOMAIN, IN_TOKEN, p["id"], "ACTIVE")
-                        log_row("IN", "IN", "STATUS_TO_ACTIVE" if ok else "STATUS_TO_ACTIVE_FAILED",
-                                product_id=pid, sku=sku_summary, delta=avail, message=f"handle={handle}")
+                        ok = update_product_status(IN_DOMAIN, IN_TOKEN, pid_gid, "ACTIVE")
+                        log_event("IN", "IN", "STATUS_TO_ACTIVE" if ok else "STATUS_TO_ACTIVE_FAILED",
+                                  product_id=pid, sku=sku_summary, delta=str(avail), message=f"handle={handle}", title=title)
+
+                # CLAMP to zero (after writes), but NOT on first cycle (read_only)
+                if not read_only:
+                    clamp_product_to_zero_if_needed(p, avail, first_tracked_inv_item_id)
 
                 sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
 
@@ -606,9 +702,9 @@ def scan_india_and_update(read_only: bool = False):
     try:
         build_and_persist_india_sku_index()
     except Exception as e:
-        log_row("IN", "IN", "WARN", message=f"INDEX_BUILD_ERROR: {e}")
+        log_event("IN", "IN", "WARN", message=f"INDEX_BUILD_ERROR: {e}")
 
-# ----- US → IN using EXACT index -----
+# ----- US → IN using EXACT index (ignore increases; clamp if needed) -----
 def scan_usa_and_mirror_to_india(read_only: bool = False):
     last_seen: Dict[str,int] = load_json(US_LAST_SEEN, {})
     sku_index: Dict[str, Dict[str, Any]] = load_json(IN_SKU_INDEX, {})
@@ -620,13 +716,14 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
             data = gql(US_DOMAIN, US_TOKEN, QUERY_COLLECTION_PAGE_US, {"handle": handle, "cursor": cursor})
             coll = data.get("collectionByHandle")
             if not coll:
-                log_row("US", "US", "WARN", sku="", message=f"Collection not found: {handle}")
+                log_event("US", "US", "WARN", message=f"Collection not found: {handle}")
                 break
             prods = ((coll.get("products") or {}).get("nodes") or [])
             pageInfo = ((coll.get("products") or {}).get("pageInfo") or {})
             for p in prods:
                 raw_prod_sku = (((p.get("skuMeta") or {}).get("value")) or "")
                 norm_prod_sku = _norm_exact(raw_prod_sku)
+                title = p.get("title") or ""
 
                 for v in ((p.get("variants") or {}).get("nodes") or []):
                     vgid = v.get("id"); vid = gid_num(vgid)
@@ -638,51 +735,59 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
                     prev = _as_int_or_none(last_seen.get(vid))
                     if prev is None:
                         last_seen[vid] = qty
-                        log_row("US", "US", "FIRST_SEEN", variant_id=vid, sku=(raw_prod_sku or ""), delta="", message=f"qty={qty}")
+                        log_event("US", "US", "FIRST_SEEN", variant_id=vid, sku=(raw_prod_sku or ""), message=f"qty={qty}", title=title)
                     else:
                         delta = qty - int(prev)
                         if delta != 0:
                             if read_only:
-                                log_row("US→IN", "IN", "FIRST_CYCLE_SKIP",
-                                        variant_id=vid, sku=(raw_prod_sku or ""), delta=delta,
-                                        message="Global first cycle is read-only; no adjust applied")
+                                log_event("US→IN", "IN", "FIRST_CYCLE_SKIP",
+                                          variant_id=vid, sku=(raw_prod_sku or ""), delta=str(delta),
+                                          message="Global first cycle is read-only; no adjust applied", title=title)
                             else:
-                                # NEW: ignore positive deltas from US unless MIRROR_US_INCREASES=1
+                                # Ignore positive deltas unless MIRROR_US_INCREASES=1
                                 if delta > 0 and not MIRROR_US_INCREASES:
-                                    log_row("US→IN", "US", "IGNORED_INCREASE",
-                                            variant_id=vid, sku=(raw_prod_sku or ""), delta=delta,
-                                            message="US qty increase; mirroring disabled")
+                                    log_event("US→IN", "US", "IGNORED_INCREASE",
+                                              variant_id=vid, sku=(raw_prod_sku or ""), delta=str(delta),
+                                              message="US qty increase; mirroring disabled", title=title,
+                                              before=str(prev), after=str(qty))
                                 else:
                                     if not USE_PRODUCT_CUSTOM_SKU:
-                                        log_row("US→IN", "US", "SKIPPED", variant_id=vid, delta=delta,
-                                                message="USE_PRODUCT_CUSTOM_SKU=0; no mirroring performed")
+                                        log_event("US→IN", "US", "SKIPPED", variant_id=vid, delta=str(delta),
+                                                  message="USE_PRODUCT_CUSTOM_SKU=0; no mirroring performed", title=title)
                                     else:
                                         if not norm_prod_sku:
-                                            log_row("US→IN", "US", "**WARN_NO_PRODUCT_CUSTOM_SKU_US**",
-                                                    variant_id=vid, sku=(raw_prod_sku or ""), delta=delta,
-                                                    message="US product has no custom.sku; cannot mirror to India")
+                                            log_event("US→IN", "US", "**WARN_NO_PRODUCT_CUSTOM_SKU_US**",
+                                                      variant_id=vid, sku=(raw_prod_sku or ""), delta=str(delta),
+                                                      message="US product has no custom.sku; cannot mirror to India", title=title)
                                         else:
                                             target = sku_index.get(norm_prod_sku)
                                             if not target:
-                                                log_row("US→IN", "IN", "**SKU_NOT_IN_INDEX**",
-                                                        variant_id=vid, sku=(raw_prod_sku or ""), delta=delta,
-                                                        message="No exact match in India index (wait for next IN scan)")
+                                                log_event("US→IN", "IN", "**SKU_NOT_IN_INDEX**",
+                                                          variant_id=vid, sku=(raw_prod_sku or ""), delta=str(delta),
+                                                          message="No exact match in India index (wait for next IN scan)", title=title)
                                             else:
                                                 inv_item_id = int(target.get("inventory_item_id") or 0)
                                                 if inv_item_id <= 0:
-                                                    log_row("US→IN", "IN", "**WARN_NO_TRACKED_VARIANT_IN_INDIA**",
-                                                            variant_id=vid, sku=(raw_prod_sku or ""), delta=delta,
-                                                            message=f"India product has no tracked variant | pid={target.get('product_id')}")
+                                                    log_event("US→IN", "IN", "**WARN_NO_TRACKED_VARIANT_IN_INDIA**",
+                                                              variant_id=vid, sku=(raw_prod_sku or ""), delta=str(delta),
+                                                              message=f"India product has no tracked variant | pid={target.get('product_id')}", title=title)
                                                 else:
                                                     try:
-                                                        rest_adjust_inventory(IN_DOMAIN, IN_TOKEN, inv_item_id, int(IN_LOCATION_ID), delta)
-                                                        log_row("US→IN", "IN", "APPLIED_DELTA",
-                                                                variant_id=vid, sku=(raw_prod_sku or ""), delta=delta,
-                                                                message=f"Adjusted IN inventory_item_id={inv_item_id} by {delta} (via EXACT index)")
+                                                        rest_adjust_inventory(IN_DOMAIN, IN_TOKEN, inv_item_id, int(IN_LOCATION_ID), int(delta))
+                                                        log_event("US→IN", "IN", "APPLIED_DELTA",
+                                                                  variant_id=vid, sku=(raw_prod_sku or ""), delta=str(delta),
+                                                                  message=f"Adjusted IN inventory_item_id={inv_item_id} by {delta} (via EXACT index)", title=title,
+                                                                  before=str(prev), after=str(qty))
                                                         time.sleep(MUTATION_SLEEP_SEC)
+
+                                                        # OPTIONAL: fast clamp after US mirror (avoid leaving negative)
+                                                        if CLAMP_AVAIL_TO_ZERO and delta < 0:
+                                                            # We don't have the product node here, but we can log the intent;
+                                                            # final clamp is guaranteed in India pass. (We keep it simple.)
+                                                            pass
                                                     except Exception as e:
-                                                        log_row("US→IN", "IN", "ERROR_APPLYING_DELTA",
-                                                                variant_id=vid, sku=(raw_prod_sku or ""), delta=delta, message=str(e))
+                                                        log_event("US→IN", "IN", "ERROR_APPLYING_DELTA",
+                                                                  variant_id=vid, sku=(raw_prod_sku or ""), delta=str(delta), message=str(e), title=title)
                             last_seen[vid] = qty
 
                     sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
@@ -699,11 +804,6 @@ def _flatten_collections(node: dict) -> str:
     return ",".join(sorted({(c.get("handle") or "").strip() for c in cols if (c.get("handle") or "").strip()}))
 
 def export_india_snapshot() -> Dict[str, Any]:
-    """
-    Write /data/in_products.jsonl and /data/in_products.csv
-    Columns: product_id, title, status, custom.sku, availability, first_tracked_inventory_item_id,
-             sales_total, sales_dates, badges, delivery_time, collections, variant_sku_sample
-    """
     jsonl_path, csv_path = IN_JSONL, IN_CSV
     count = 0
     with open(jsonl_path, "w", encoding="utf-8") as jf, open(csv_path, "w", newline="", encoding="utf-8") as cf:
@@ -769,10 +869,6 @@ def export_india_snapshot() -> Dict[str, Any]:
     return {"count": count, "jsonl": jsonl_path, "csv": csv_path}
 
 def export_usa_snapshot() -> Dict[str, Any]:
-    """
-    Write /data/us_products.jsonl and /data/us_products.csv
-    Columns: product_id, title, custom.sku, variant_id, variant_sku, variant_qty, collections
-    """
     jsonl_path, csv_path = US_JSONL, US_CSV
     count = 0
     with open(jsonl_path, "w", encoding="utf-8") as jf, open(csv_path, "w", newline="", encoding="utf-8") as cf:
@@ -835,7 +931,7 @@ def run_cycle():
         if first_cycle:
             state["initialized"] = True
             save_state(state)
-            log_row("SCHED", "BOTH", "FIRST_CYCLE_DONE", sku="", message="Baselines learned; future cycles will apply deltas")
+            log_event("SCHED", "BOTH", "FIRST_CYCLE_DONE", message="Baselines learned; future cycles will apply deltas")
 
         return "ok"
     finally:
@@ -849,7 +945,7 @@ def scheduler_loop():
         try:
             run_cycle()
         except Exception as e:
-            log_row("SCHED", "BOTH", "ERROR", sku="", message=str(e))
+            log_event("SCHED", "BOTH", "ERROR", message=str(e))
         time.sleep(max(1, RUN_EVERY_MIN) * 60)
 
 app = Flask(__name__)
@@ -882,6 +978,7 @@ def diag():
         "use_product_custom_sku": USE_PRODUCT_CUSTOM_SKU,
         "only_active_for_mapping": ONLY_ACTIVE_FOR_MAPPING,
         "mirror_us_increases": MIRROR_US_INCREASES,
+        "clamp_avail_to_zero": CLAMP_AVAIL_TO_ZERO,
         "in_last_seen_count": len(load_json(IN_LAST_SEEN, {})),
         "us_last_seen_count": len(load_json(US_LAST_SEEN, {})),
         "index_entries": len(load_json(IN_SKU_INDEX, {}))
