@@ -2,28 +2,28 @@
 # -*- coding: utf-8 -*-
 
 """
-Dual-site availability sync (IN <— US decreases) with product-level SKU mapping
-- Uses product metafield custom.sku as the ONLY mapping key (exact after trim+upper).
-- India (IN) scan:
-    * Compute availability per product (sum of variants; tracked-only unless told).
-    * If availability drops vs last_seen → bump sales_total & sales_dates.
-    * Update metafields: custom.badges + custom.delivery_time based on availability.
-    * SPECIAL collection: auto flip ACTIVE<->DRAFT when avail <1 / >=1.
-    * If avail < 0 and CLAMP_AVAIL_TO_ZERO=1 → raise variant inventories back to 0 (per-variant),
-      then set last_seen to 0 (so next diffs are correct).
-- USA (US) scan:
-    * Track variant quantities; on DECREASE only, find matching IN product by product.custom.sku
-      and adjust IN inventory_item_id by the same delta (negative). Increases are ignored.
-- Metafields writes use DEFINITION types (no scalar/list mismatch).
+Dual-site availability sync — exact product.custom.sku mapping, clamp-to-zero, robust metafields.
 
-Endpoints:
-  GET /health         → "ok"
-  GET /diag           → JSON with config and counters
-  POST /run?key=...   → run one full cycle (IN then US)
+What it does (high level):
+- First-ever full cycle is READ-ONLY (learn last_seen; no writes).
+- India scan (per collection handle):
+    * Compute product availability = sum(variant.inventoryQuantity of counted variants).
+    * If availability < 0 → count sales (delta vs last_seen), then clamp to 0 (adjust inventory up),
+      set last_seen = 0.
+    * If availability dropped (but still >=0) → bump sales_total by the drop.
+    * If availability increased → log RESTOCK and set last_seen = new.
+    * Update badges/delivery metafields each cycle.
+    * SPECIAL collection: if avail < 1 → DRAFT; if avail >= 1 → ACTIVE.
+- USA scan (per collection handle):
+    * Look at variant qty deltas. For delta<0 → find INDIA product by exact product.custom.sku,
+      adjust India inventory by that negative delta (mirror sale). For delta>0 → IGNORED unless MIRROR_US_INCREASES=1.
+- India SKU Index:
+    * Exact map of normalized custom.sku -> {inventory_item_id (first counted variant), product info}.
+      Rebuilt each India scan to stay fresh. Used by US→IN mirroring & clamp-to-zero.
 
-Run modes:
-  ENABLE_SCHEDULER=1 → background loop every RUN_EVERY_MIN minutes
-  Otherwise trigger with POST /run?key=...
+Notes:
+- Sleeps are in ms (except MUTATION_SLEEP_SEC).
+- Types for metafields are resolved from definitions; tolerant fallback avoids crashes.
 """
 
 import os, sys, time, json, csv, random
@@ -31,9 +31,10 @@ from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request, jsonify, make_response
-from threading import Thread, Lock
 
-# ========= Config (env) =========
+# =========================
+# Config & pacing
+# =========================
 API_VERSION = os.getenv("API_VERSION", "2024-10").strip()
 PIXEL_SHARED_SECRET = os.getenv("PIXEL_SHARED_SECRET", "").strip()
 if not PIXEL_SHARED_SECRET:
@@ -42,127 +43,137 @@ if not PIXEL_SHARED_SECRET:
 RUN_EVERY_MIN = int(os.getenv("RUN_EVERY_MIN", "5"))
 ENABLE_SCHEDULER = os.getenv("ENABLE_SCHEDULER", "0") == "1"
 
-SLEEP_BETWEEN_PRODUCTS_MS = int(os.getenv("SLEEP_BETWEEN_PRODUCTS_MS", "120"))
-SLEEP_BETWEEN_PAGES_MS    = int(os.getenv("SLEEP_BETWEEN_PAGES_MS", "400"))
-SLEEP_BETWEEN_SHOPS_MS    = int(os.getenv("SLEEP_BETWEEN_SHOPS_MS", "800"))
-MUTATION_SLEEP_SEC        = float(os.getenv("MUTATION_SLEEP_SEC", "0.35"))
+SLEEP_BETWEEN_PRODUCTS_MS = int(os.getenv("SLEEP_BETWEEN_PRODUCTS_MS", "80"))
+SLEEP_BETWEEN_PAGES_MS    = int(os.getenv("SLEEP_BETWEEN_PAGES_MS", "250"))
+SLEEP_BETWEEN_SHOPS_MS    = int(os.getenv("SLEEP_BETWEEN_SHOPS_MS", "500"))
+MUTATION_SLEEP_SEC        = float(os.getenv("MUTATION_SLEEP_SEC", "0.25"))
 
 # India (metafields + receives inventory deltas)
 IN_DOMAIN = os.getenv("IN_DOMAIN", "").strip()
 IN_TOKEN  = os.getenv("IN_TOKEN", "").strip()
-IN_LOCATION_ID = int(os.getenv("IN_LOCATION_ID", "0"))
+IN_LOCATION_ID = os.getenv("IN_LOCATION_ID", "").strip()
 IN_COLLECTIONS = [x.strip() for x in os.getenv("IN_COLLECTION_HANDLES","").split(",") if x.strip()]
 IN_INCLUDE_UNTRACKED = os.getenv("IN_INCLUDE_UNTRACKED", "0") == "1"
-IN_CHANGE_STATUS = os.getenv("IN_CHANGE_STATUS", "1") == "1"  # allow special status flips
+IN_CHANGE_STATUS = os.getenv("IN_CHANGE_STATUS", "1") == "1"  # allow status flip for special collection
 
 # USA (source of deltas)
 US_DOMAIN = os.getenv("US_DOMAIN", "").strip()
 US_TOKEN  = os.getenv("US_TOKEN", "").strip()
-US_LOCATION_ID = int(os.getenv("US_LOCATION_ID", "0"))
+US_LOCATION_ID = os.getenv("US_LOCATION_ID", "").strip()  # not directly used, kept for symmetry
 US_COLLECTIONS = [x.strip() for x in os.getenv("US_COLLECTION_HANDLES","").split(",") if x.strip()]
 
-# Mapping & behavior
-USE_PRODUCT_CUSTOM_SKU = os.getenv("USE_PRODUCT_CUSTOM_SKU", "1") == "1"
-ONLY_ACTIVE_FOR_MAPPING = os.getenv("ONLY_ACTIVE_FOR_MAPPING", "1") == "1"
-MIRROR_US_INCREASES = os.getenv("MIRROR_US_INCREASES", "0") == "1"  # default off
-CLAMP_AVAIL_TO_ZERO = os.getenv("CLAMP_AVAIL_TO_ZERO", "1") == "1"
+# Behavior flags
+USE_PRODUCT_CUSTOM_SKU = os.getenv("USE_PRODUCT_CUSTOM_SKU", "1") == "1"  # exact mapping by product metafield custom.sku
+ONLY_ACTIVE_FOR_MAPPING = os.getenv("ONLY_ACTIVE_FOR_MAPPING", "1") == "1" # when building index, only active products count
+MIRROR_US_INCREASES = os.getenv("MIRROR_US_INCREASES", "0") == "1"        # default: ignore +ve changes on US
+CLAMP_AVAILABILITY_TO_ZERO = os.getenv("CLAMP_AVAILABILITY_TO_ZERO", "1") == "1"
 
-# Special collection where availability controls status (symmetric rule)
+# Metafields (India)
+MF_NAMESPACE = os.getenv("MF_NAMESPACE", "custom")
+MF_BADGES_KEY = os.getenv("MF_BADGES_KEY", "badges")
+MF_DELIVERY_KEY = os.getenv("MF_DELIVERY_KEY", "delivery_time")
+KEY_SALES = os.getenv("KEY_SALES", "sales_total")
+KEY_DATES = os.getenv("KEY_DATES", "sales_dates")
+
+# Badges/Delivery labels
+BADGE_READY    = os.getenv("BADGE_READY", "Ready To Ship")
+DELIVERY_READY = os.getenv("DELIVERY_READY", "2-5 Days Across India")
+DELIVERY_MTO   = os.getenv("DELIVERY_MTO", "12-15 Days Across India")
+
+# Special collection (status flip)
 SPECIAL_STATUS_HANDLE = os.getenv(
     "SPECIAL_STATUS_HANDLE",
     "budget-gold-plated-jewelry-premium-jadau-ornaments-on-mix-metal-base"
 ).strip()
 
-# Metafields (India)
-MF_NAMESPACE    = os.getenv("MF_NAMESPACE", "custom")
-MF_BADGES_KEY   = os.getenv("MF_BADGES_KEY", "badges")
-MF_DELIVERY_KEY = os.getenv("MF_DELIVERY_KEY", "delivery_time")
-KEY_SALES       = os.getenv("KEY_SALES", "sales_total")
-KEY_DATES       = os.getenv("KEY_DATES", "sales_dates")
-
-BADGE_READY    = "Ready To Ship"
-DELIVERY_READY = "2-5 Days Across India"
-DELIVERY_MTO   = "12-15 Days Across India"
-
 # Render / persistence
-DATA_DIR = os.getenv("DATA_DIR", ".").rstrip("/") or "."
+DATA_DIR = os.getenv("DATA_DIR", ".").rstrip("/")
 os.makedirs(DATA_DIR, exist_ok=True)
-PORT = int(os.getenv("PORT", "10000"))
+LOG_TO_STDOUT = os.getenv("LOG_TO_STDOUT", "1") == "1"
 
-def p(*parts): return os.path.join(DATA_DIR, *parts)
+def p(*parts):  # path helper
+    return os.path.join(DATA_DIR, *parts)
 
-IN_LAST_SEEN   = p("in_last_seen.json")   # product_id(num) -> non-negative int
-US_LAST_SEEN   = p("us_last_seen.json")   # variant_id(num) -> int
-IN_SKU_INDEX   = p("in_sku_index.json")   # SKU_KEY -> {product_id, inv_item_id, title, status}
-LOG_CSV        = p("dual_sync_log.csv")
-LOG_JSONL      = p("dual_sync_log.jsonl")
-STATE_PATH     = p("dual_state.json")
+PORT = int(os.getenv("PORT", os.getenv("PORT", "10000")))
 
-# ========= HTTP helpers =========
+# State
+IN_LAST_SEEN  = p("in_last_seen.json")   # product_id(num) -> last_seen_availability (clamped >=0)
+US_LAST_SEEN  = p("us_last_seen.json")   # variant_id(num)  -> last_seen_qty
+STATE_PATH    = p("dual_state.json")     # {"initialized": bool}
+LOG_CSV       = p("dual_sync_log.csv")
+LOG_JSONL     = p("dual_sync_log.jsonl")
+IN_SKU_INDEX  = p("in_sku_index.json")   # sku_norm -> {inv_item_id, pid_num, product_gid, title}
+
+# =========================
+# HTTP helpers
+# =========================
 def hdr(token: str) -> Dict[str, str]:
     return {"X-Shopify-Access-Token": token, "Content-Type": "application/json", "Accept": "application/json"}
 
-def _sleep_backoff(attempt: int, base: float = 0.4, cap: float = 10.0):
-    time.sleep(min(cap, base * (2 ** (attempt-1))) + random.uniform(0, 0.25))
+_last_query_payload: Optional[dict] = None
 
 def gql(domain: str, token: str, query: str, variables: dict = None) -> dict:
+    global _last_query_payload
     url = f"https://{domain}/admin/api/{API_VERSION}/graphql.json"
-    last_err = None
+    payload = {"query": query, "variables": (variables or {})}
+    _last_query_payload = payload
     for attempt in range(1, 8):
-        r = None
         try:
-            r = requests.post(url, headers=hdr(token),
-                              json={"query": query, "variables": variables or {}}, timeout=60)
-            if r.status_code in (502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 527, 529, 430, 429):
-                last_err = f"HTTP {r.status_code}"
-                _sleep_backoff(attempt)
-                continue
-            if r.status_code != 200:
-                raise RuntimeError(f"GraphQL HTTP {r.status_code}: {r.text}")
-            data = r.json()
-            if data.get("errors"):
-                # throttle retry
-                if any(((e.get("extensions") or {}).get("code","").upper() == "THROTTLED") for e in data["errors"]):
-                    last_err = "THROTTLED"
-                    _sleep_backoff(attempt)
-                    continue
-                # surface other errors
-                print(f"⚠️ GQL ERRORS {json.dumps(data['errors'])}", flush=True)
-                print(f"⚙️ GQL LAST_QUERY {json.dumps({'query': query[:600]})}", flush=True)
-                raise RuntimeError(f"GraphQL errors: {data['errors']}")
-            return data["data"]
+            r = requests.post(url, headers=hdr(token), json=payload, timeout=60)
         except Exception as e:
-            last_err = str(e)
-            _sleep_backoff(attempt)
-    raise RuntimeError(f"GraphQL throttled/5xx repeatedly: {last_err}")
+            time.sleep(min(10.0, 0.4 * (2 ** (attempt-1))) + random.uniform(0, 0.25))
+            if attempt >= 7: raise
+            continue
+        if r.status_code in (502, 503, 504, 520, 522, 524, 429):
+            time.sleep(min(10.0, 0.4 * (2 ** (attempt-1))) + random.uniform(0, 0.25))
+            continue
+        if r.status_code != 200:
+            raise RuntimeError(f"GraphQL HTTP {r.status_code}: {r.text}")
+        data = r.json()
+        if data.get("errors"):
+            # throttle/5xx or syntax → backoff; otherwise raise
+            if any(((e.get("extensions") or {}).get("code","").upper() == "THROTTLED") for e in data["errors"]):
+                time.sleep(min(10.0, 0.4 * (2 ** (attempt-1))) + random.uniform(0, 0.25))
+                continue
+            # surface query & vars for debugging
+            log_row("⚠️","GQL","ERR","",message=json.dumps(data["errors"]))
+            log_row("⚙️","GQL","LAST_QUERY","",message=json.dumps(payload))
+            raise RuntimeError(f"GraphQL errors: {data['errors']}")
+        return data["data"]
+    raise RuntimeError("GraphQL throttled/5xx repeatedly")
 
 def rest_adjust_inventory(domain: str, token: str, inventory_item_id: int, location_id: int, delta: int) -> None:
     url = f"https://{domain}/admin/api/{API_VERSION}/inventory_levels/adjust.json"
-    payload = {"inventory_item_id": int(inventory_item_id),
-               "location_id": int(location_id),
-               "available_adjustment": int(delta)}
-    last = None
+    payload = {"inventory_item_id": int(inventory_item_id), "location_id": int(location_id), "available_adjustment": int(delta)}
     for attempt in range(1, 6):
         r = requests.post(url, headers=hdr(token), json=payload, timeout=30)
-        if r.status_code in (429, 430, 502, 503, 504):
-            last = f"HTTP {r.status_code}"
-            _sleep_backoff(attempt, base=0.3, cap=8.0)
+        if r.status_code in (429, 502, 503, 504, 520, 522, 524):
+            time.sleep(min(8.0, 0.3 * (2 ** (attempt-1))) + random.uniform(0, 0.25))
             continue
         if r.status_code >= 400:
             raise RuntimeError(f"REST adjust {r.status_code}: {r.text}")
         return
-    raise RuntimeError(f"REST adjust failed: {last}")
 
-# ========= Utils & logging =========
-def now_ist(): return datetime.now(timezone(timedelta(hours=5, minutes=30)))
-def now_ist_str(): return now_ist().strftime("%Y-%m-%d %H:%M:%S %z")
-def today_ist_str(): return now_ist().date().isoformat()
-def sleep_ms(ms: int): time.sleep(max(0, ms) / 1000.0)
-def gid_num(gid: str) -> str: return (gid or "").split("/")[-1]
+# =========================
+# Utils & logging
+# =========================
+def now_ist():
+    return datetime.now(timezone(timedelta(hours=5, minutes=30)))
 
-def sku_key(s: str) -> str:
-    # exact semantics except case/leading/trailing spaces
-    return (s or "").strip().upper()
+def now_ist_str():
+    return now_ist().strftime("%Y-%m-%d %H:%M:%S %z")
+
+def today_ist_str():
+    return now_ist().date().isoformat()
+
+def sleep_ms(ms: int):
+    time.sleep(max(0, ms) / 1000.0)
+
+def normalize_sku(s: str) -> str:
+    return (s or "").strip().lower()
+
+def gid_num(gid: str) -> str:
+    return (gid or "").split("/")[-1]
 
 def load_json(path: str, default):
     try:
@@ -177,70 +188,43 @@ def save_json(path: str, obj):
         json.dump(obj, f, indent=2)
     os.replace(tmp, path)
 
-def ensure_log_headers():
-    if (not os.path.exists(LOG_CSV)) or (os.path.getsize(LOG_CSV) == 0):
+def ensure_log_header():
+    need = (not os.path.exists(LOG_CSV)) or (os.path.getsize(LOG_CSV) == 0)
+    if need:
         with open(LOG_CSV, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(["ts","phase","shop","note","product_id","variant_id","sku","delta","message"])
-    if (not os.path.exists(LOG_JSONL)) or (os.path.getsize(LOG_JSONL) == 0):
-        open(LOG_JSONL, "a", encoding="utf-8").close()
+            w = csv.writer(f)
+            w.writerow(["ts","phase","shop","note","product_id","variant_id","sku","delta","message"])
 
-def log_row(note_emoji: str, phase: str, shop: str, note: str,
-            product_id="", variant_id="", sku="", delta="", message="", title="",
-            before="", after="", collections=""):
-    ensure_log_headers()
-    ts = now_ist_str()
-    line_csv = [ts, phase, shop, note, product_id, variant_id, sku, delta, message]
-    print(f"{note_emoji} {phase} {note} [SKU {sku}] pid={product_id} vid={variant_id} {before}→{after} Δ{delta} “{title}” — {message}",
-          flush=True)
+def log_row(phase: str, shop: str, note: str, product_id="", variant_id="", sku="", delta="", message="", title=""):
+    ensure_log_header()
+    row = [now_ist_str(), phase, shop, note, product_id, variant_id, sku, delta, message]
+    if LOG_TO_STDOUT:
+        # emoji prefix for readability (phase often contains an emoji already)
+        pretty = f"{' '}{phase} {shop} {note} [SKU {sku}] pid={product_id} vid={variant_id} {delta} “{title}” — {message}".strip()
+        print(pretty, flush=True)
     with open(LOG_CSV, "a", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow(line_csv)
+        csv.writer(f).writerow(row)
     with open(LOG_JSONL, "a", encoding="utf-8") as f:
         f.write(json.dumps({
-            "ts": ts, "phase": phase, "shop": shop, "note": note,
-            "product_id": product_id, "variant_id": variant_id, "sku": sku, "delta": str(delta),
-            "message": message, "title": title, "before": str(before), "after": str(after),
-            "collections": collections
-        }, ensure_ascii=False) + "\n")
+            "ts": row[0], "phase": phase, "shop": shop, "note": note,
+            "product_id": str(product_id or ""), "variant_id": str(variant_id or ""),
+            "sku": str(sku or ""), "delta": str(delta or ""), "message": str(message or ""),
+            "title": title
+        })+"\n")
 
-def safe_int(v, default=0):
+def _as_int_or_none(v):
     try:
-        if isinstance(v, (int, float)): return int(v)
-        if v is None: return default
-        s = str(v).strip()
-        # allow "-5" or "+3"
-        return int(s) if (s and (s.lstrip("+-").isdigit())) else default
+        if v is None or v == "":
+            return None
+        if isinstance(v, (int, float)):
+            return int(v)
+        return int(str(v).strip())
     except Exception:
-        return default
+        return None
 
-# ========= GQL: metafield definition (cache) =========
-QUERY_MF_DEFINITION = """
-query ($ownerType: MetafieldOwnerType!, $namespace: String!, $key: String!) {
-  metafieldDefinitions(first: 1, ownerType: $ownerType, namespace: $namespace, key: $key) {
-    edges { node { id name type { name } } }
-  }
-}
-"""
-
-_MF_DEF_CACHE: Dict[Tuple[str,str,str], str] = {}
-def get_mf_def_type(domain: str, token: str, owner_type: str, ns: str, key: str) -> str:
-    ck = (owner_type, ns, key)
-    if ck in _MF_DEF_CACHE: return _MF_DEF_CACHE[ck]
-    data = gql(domain, token, QUERY_MF_DEFINITION, {
-        "ownerType": owner_type, "namespace": ns, "key": key
-    })
-    edges = (((data.get("metafieldDefinitions") or {}).get("edges")) or [])
-    tname = ((((edges[0] or {}).get("node") or {}).get("type") or {}).get("name")) if edges else None
-    tname = (tname or "single_line_text_field").strip()
-    _MF_DEF_CACHE[ck] = tname
-    return tname
-
-def format_for_type(value: str, tname: str) -> str:
-    if tname.startswith("list."):
-        return json.dumps([value]) if value else "[]"
-    return value or ""
-
-# ========= Queries =========
-# (No 'query:' arg on products inside collectionByHandle; we filter active in code)
+# =========================
+# GQL queries (NO 'query:' argument on products)
+# =========================
 QUERY_COLLECTION_PAGE_IN = """
 query ($handle:String!, $cursor:String) {
   collectionByHandle(handle:$handle){
@@ -273,6 +257,7 @@ query ($handle:String!, $cursor:String) {
       pageInfo{ hasNextPage endCursor }
       nodes{
         id title
+        skuMeta: metafield(namespace: "custom", key: "sku"){ value }
         variants(first: 100){
           nodes{
             id sku inventoryQuantity
@@ -285,73 +270,119 @@ query ($handle:String!, $cursor:String) {
 }
 """
 
-# ========= Availability + metafields helpers =========
+# =========================
+# Metafield definition resolver (tolerant wrapper)
+# =========================
+QUERY_MF_DEFINITION = """
+query ($ownerType: MetafieldOwnerType!, $namespace: String!, $key: String!) {
+  metafieldDefinitions(first: 1, ownerType: $ownerType, namespace: $namespace, key: $key) {
+    edges { node { id name type { name } } }
+  }
+}
+"""
+
+_MF_DEF_CACHE: Dict[Tuple[str,str,str], str] = {}
+
+def _get_mf_def_type(domain: str, token: str, owner_type: str, ns: str, key: str) -> str:
+    ck = (owner_type, ns, key)
+    if ck in _MF_DEF_CACHE:
+        return _MF_DEF_CACHE[ck]
+    data = gql(domain, token, QUERY_MF_DEFINITION, {
+        "ownerType": owner_type, "namespace": ns, "key": key
+    })
+    edges = (((data.get("metafieldDefinitions") or {}).get("edges")) or [])
+    tname = ((((edges[0] or {}).get("node") or {}).get("type") or {}).get("name")) if edges else None
+    tname = (tname or "single_line_text_field").strip()
+    _MF_DEF_CACHE[ck] = tname
+    return tname
+
+def get_mf_def_type(*args):
+    """
+    Preferred: get_mf_def_type(domain, token, owner_type, namespace, key)
+    If called without key (legacy), default to badges key in our namespace & log a warning.
+    """
+    if len(args) == 5:
+        return _get_mf_def_type(*args)
+    elif len(args) == 4:
+        domain, token, owner_type, ns = args
+        assumed_key = MF_BADGES_KEY if ns == MF_NAMESPACE else MF_BADGES_KEY
+        log_row("⚠️","SCHED","BOTH","WARN",message=f"get_mf_def_type called without key; default ns={ns} key={assumed_key}")
+        return _get_mf_def_type(domain, token, owner_type, ns, assumed_key)
+    else:
+        log_row("⚠️","SCHED","BOTH","WARN",message=f"get_mf_def_type bad arity={len(args)}; returning single_line_text_field")
+        return "single_line_text_field"
+
+# =========================
+# Helpers: availability, metafields, status
+# =========================
 def compute_product_availability(variants: List[dict], include_untracked: bool) -> int:
     total = 0
     counted = False
+    first_counted_inv_item_id = None
     for v in variants:
         tracked = bool(((v.get("inventoryItem") or {}).get("tracked")))
-        qty = safe_int(v.get("inventoryQuantity"), 0)
+        qty = int(v.get("inventoryQuantity") or 0)
         if include_untracked or tracked:
             counted = True
             total += qty
-    return total if counted else 0
+            if first_counted_inv_item_id is None:
+                inv_item_gid = ((v.get("inventoryItem") or {}).get("id") or "")
+                try:
+                    first_counted_inv_item_id = int(gid_num(inv_item_gid))
+                except Exception:
+                    first_counted_inv_item_id = None
+    return (total if counted else 0), first_counted_inv_item_id
 
-def desired_state(avail: int) -> Tuple[str, str, str]:
-    if avail > 0:
+def effective_labels(avail_nonneg: int) -> Tuple[str,str,str]:
+    if avail_nonneg > 0:
         return ("ACTIVE", BADGE_READY, DELIVERY_READY)
     else:
         return ("DRAFT", "", DELIVERY_MTO)
 
+MUTATION_PRODUCT_UPDATE = """
+mutation ProductUpdate($input: ProductInput!) {
+  productUpdate(input: $input) {
+    product { id status }
+    userErrors { field message }
+  }
+}
+"""
+
 def update_product_status(domain: str, token: str, product_gid: str, target_status: str) -> bool:
-    MUTATION_PRODUCT_UPDATE = """
-    mutation ProductUpdate($input: ProductInput!) {
-      productUpdate(input: $input) {
-        product { id status }
-        userErrors { field message }
-      }
-    }"""
     data = gql(domain, token, MUTATION_PRODUCT_UPDATE, {"input": {"id": product_gid, "status": target_status}})
     errs = ((data.get("productUpdate") or {}).get("userErrors") or [])
-    return not bool(errs)
+    if errs:
+        log_row("⚠️","IN","WARN",product_id=gid_num(product_gid),message=str(errs))
+        return False
+    time.sleep(MUTATION_SLEEP_SEC)
+    return True
 
-def set_product_metafields_in(domain:str, token:str, product_gid:str, badges_node:dict, dtime_node:dict,
-                              target_badge:str, target_delivery:str) -> None:
-    # Always use STORE DEFINITION types
-    btype = get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, MF_BADGES_KEY)
-    dtype = get_mf_def_type(domain, token, "PRODUCT", MF_DELIVERY_KEY)
-    mutation = """
-    mutation($metafields:[MetafieldsSetInput!]!){
-      metafieldsSet(metafields:$metafields){
-        userErrors{ field message }
-      }
-    }"""
-    mf = []
-    # badges
+def set_product_metafields(domain:str, token:str, product_gid:str,
+                           badges_node:dict, dtime_node:dict,
+                           target_badge:str, target_delivery:str):
+    # Resolve types from definitions (tolerant)
+    badges_type = (badges_node or {}).get("type") or get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, MF_BADGES_KEY)
+    delivery_type= (dtime_node  or {}).get("type") or get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, MF_DELIVERY_KEY)
+
+    # Force scalar if store expects scalar (your store has badges as single_line_text_field)
+    mf_inputs = []
     if target_badge:
-        mf.append({
-            "ownerId": product_gid, "namespace": MF_NAMESPACE, "key": MF_BADGES_KEY,
-            "type": btype, "value": format_for_type(target_badge, btype)
-        })
+        mf_inputs.append({"ownerId": product_gid,"namespace":MF_NAMESPACE,"key":MF_BADGES_KEY,"type":badges_type,"value":target_badge})
     else:
-        # delete when empty desired
+        # delete badge if present
         if (badges_node or {}).get("id"):
             delm = "mutation($id:ID!){ metafieldDelete(input:{id:$id}){ userErrors{message} } }"
-            try: gql(domain, token, delm, {"id": badges_node["id"]})
-            except Exception as e:
-                log_row("⚠️", "IN", "IN", "WARN", message=f"badges delete error: {e}")
-    # delivery
-    mf.append({
-        "ownerId": product_gid, "namespace": MF_NAMESPACE, "key": MF_DELIVERY_KEY,
-        "type": dtype, "value": format_for_type(target_delivery, dtype)
-    })
-    if mf:
-        data = gql(domain, token, mutation, {"metafields": mf})
-        errs = ((data.get("metafieldsSet") or {}).get("userErrors") or [])
-        if errs:
-            log_row("⚠️", "IN", "IN", "WARN", message=f"metafieldsSet errors: {errs} (btype={btype}, dtype={dtype})")
+            gql(domain, token, delm, {"id": badges_node["id"]})
 
-def bump_sales_in(domain:str, token:str, product_gid:str, sales_total_node:dict, sales_dates_node:dict, sold:int, today:str):
+    mf_inputs.append({"ownerId": product_gid,"namespace":MF_NAMESPACE,"key":MF_DELIVERY_KEY,"type":delivery_type,"value":target_delivery})
+
+    mutation = "mutation($mfs:[MetafieldsSetInput!]!){ metafieldsSet(metafields:$mfs){ userErrors{ field message } } }"
+    data = gql(domain, token, mutation, {"mfs": mf_inputs})
+    errs = ((data.get("metafieldsSet") or {}).get("userErrors") or [])
+    if errs:
+        log_row("⚠️","IN","WARN",product_id=gid_num(product_gid),message=f"metafieldsSet errors: {errs}")
+
+def bump_sales(domain:str, token:str, product_gid:str, sales_total_node:dict, sales_dates_node:dict, sold:int, today:str):
     st_type = (sales_total_node or {}).get("type") or get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, KEY_SALES) or "number_integer"
     sd_type = (sales_dates_node or {}).get("type") or get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, KEY_DATES) or "list.date"
     try:
@@ -364,8 +395,7 @@ def bump_sales_in(domain:str, token:str, product_gid:str, sales_total_node:dict,
         existing = []
         raw = (sales_dates_node or {}).get("value")
         try:
-            if isinstance(raw, str) and raw.startswith("["):
-                existing = [str(x) for x in json.loads(raw)]
+            existing = json.loads(raw) if isinstance(raw,str) and raw.startswith("[") else []
         except Exception:
             existing = []
         if today not in existing:
@@ -383,232 +413,230 @@ def bump_sales_in(domain:str, token:str, product_gid:str, sales_total_node:dict,
     data = gql(domain, token, m, {"mfs": mf_inputs})
     errs = ((data.get("metafieldsSet") or {}).get("userErrors") or [])
     if errs:
-        log_row("⚠️", "IN", "IN", "WARN", message=f"sales metafieldsSet errors: {errs}")
+        log_row("⚠️","IN","WARN",product_id=gid_num(product_gid),message=f"sales metafieldsSet errors: {errs}")
 
-# ========= Build IN SKU index =========
-def build_in_sku_index() -> Dict[str, dict]:
+# =========================
+# India: Build SKU index (exact product.custom.sku) & Scan
+# =========================
+def build_india_sku_index() -> Dict[str, dict]:
     index: Dict[str, dict] = {}
     for handle in IN_COLLECTIONS:
         cursor = None
         while True:
             data = gql(IN_DOMAIN, IN_TOKEN, QUERY_COLLECTION_PAGE_IN, {"handle": handle, "cursor": cursor})
             coll = data.get("collectionByHandle")
-            if not coll: break
+            if not coll:
+                break
             prods = ((coll.get("products") or {}).get("nodes") or [])
             pageInfo = ((coll.get("products") or {}).get("pageInfo") or {})
             for p in prods:
                 status = (p.get("status") or "").upper()
                 if ONLY_ACTIVE_FOR_MAPPING and status != "ACTIVE":
                     continue
-                # product-level SKU metafield
                 sku_val = ((p.get("skuMeta") or {}).get("value") or "").strip()
                 if not sku_val:
                     continue
-                key = sku_key(sku_val)
-                # Choose the FIRST variant’s inventory_item_id as representative for clamps/adjusts
-                first_variant = (((p.get("variants") or {}).get("nodes")) or [{}])[0]
-                inv_item_id = safe_int(gid_num(((first_variant.get("inventoryItem") or {}).get("id") or "0")), 0)
-                index[key] = {
-                    "product_id": gid_num(p["id"]),
-                    "product_gid": p["id"],
-                    "title": p.get("title",""),
-                    "status": status,
-                    "inv_item_id": inv_item_id
-                }
+                sku_norm = normalize_sku(sku_val)
+                variants = ((p.get("variants") or {}).get("nodes") or [])
+                avail, first_inv_item_id = compute_product_availability(variants, IN_INCLUDE_UNTRACKED)
+                if first_inv_item_id:
+                    index[sku_norm] = {
+                        "inv_item_id": first_inv_item_id,
+                        "product_gid": p["id"],
+                        "pid_num": gid_num(p["id"]),
+                        "title": p.get("title",""),
+                        "handle": handle,
+                        "avail": avail
+                    }
             if pageInfo.get("hasNextPage"):
                 cursor = pageInfo.get("endCursor")
-                sleep_ms(SLEEP_BETWEEN_PAGES_MS)
             else:
                 break
     save_json(IN_SKU_INDEX, index)
-    log_row("🗂️", "IN", "IN", "INDEX_BUILT", message=f"entries={len(index)}")
+    log_row("🗂️","IN","INDEX_BUILT", message=f"entries={len(index)}")
     return index
 
-# ========= IN scan =========
-def scan_india_and_update(read_only: bool, sku_index: Dict[str,dict]):
+def scan_india_and_update(read_only: bool = False):
     last_seen: Dict[str,int] = load_json(IN_LAST_SEEN, {})
     today = today_ist_str()
+    index = build_india_sku_index()  # fresh each pass
 
     for handle in IN_COLLECTIONS:
         cursor = None
         while True:
             data = gql(IN_DOMAIN, IN_TOKEN, QUERY_COLLECTION_PAGE_IN, {"handle": handle, "cursor": cursor})
             coll = data.get("collectionByHandle")
-            if not coll: break
+            if not coll:
+                break
             prods = ((coll.get("products") or {}).get("nodes") or [])
             pageInfo = ((coll.get("products") or {}).get("pageInfo") or {})
             for p in prods:
                 pid = gid_num(p["id"])
                 title = p.get("title","")
                 variants = ((p.get("variants") or {}).get("nodes") or [])
-                status = (p.get("status") or "").upper()
+                avail_raw, any_inv_item_id = compute_product_availability(variants, IN_INCLUDE_UNTRACKED)
                 sku_val = ((p.get("skuMeta") or {}).get("value") or "").strip()
-                sku = sku_val
-                key = sku_key(sku_val)
+                sku_norm = normalize_sku(sku_val)
 
-                avail = compute_product_availability(variants, IN_INCLUDE_UNTRACKED)
-                prev = safe_int(last_seen.get(pid), 0)  # never negative
-
-                # Compute desired delivery/badge/state (based on RAW avail, not yet clamped)
-                target_status, target_badge, target_delivery = desired_state(avail)
-
-                # Diff & sales bump
-                if not read_only:
-                    diff = avail - prev
-                    if diff < 0:
-                        bump_sales_in(IN_DOMAIN, IN_TOKEN, p["id"], p.get("salesTotal") or {}, p.get("salesDates") or {}, -diff, today)
-                        log_row("🧾➖", "IN", "IN", "SALES_BUMP", product_id=pid, sku=sku, delta=diff,
-                                message=f"avail {prev}->{avail} (sold={-diff})", title=title, before=str(prev), after=str(avail))
-
-                # Metafields (badge/delivery) — always apply (uses definition types)
-                if not read_only:
-                    set_product_metafields_in(IN_DOMAIN, IN_TOKEN, p["id"], p.get("badges") or {}, p.get("dtime") or {},
-                                              target_badge, target_delivery)
-
-                # SPECIAL STATUS flip on the special collection only
-                if (not read_only) and IN_CHANGE_STATUS and (handle == SPECIAL_STATUS_HANDLE):
-                    if avail < 1 and status == "ACTIVE":
-                        ok = update_product_status(IN_DOMAIN, IN_TOKEN, p["id"], "DRAFT")
-                        log_row("🛑", "IN", "IN", "STATUS_TO_DRAFT" if ok else "STATUS_TO_DRAFT_FAILED",
-                                product_id=pid, sku=sku, delta=str(avail), message=f"handle={handle}", title=title)
-                    elif avail >= 1 and status == "DRAFT":
-                        ok = update_product_status(IN_DOMAIN, IN_TOKEN, p["id"], "ACTIVE")
-                        log_row("✅", "IN", "IN", "STATUS_TO_ACTIVE" if ok else "STATUS_TO_ACTIVE_FAILED",
-                                product_id=pid, sku=sku, delta=str(avail), message=f"handle={handle}", title=title)
-
-                # Clamp negatives → 0 (per-variant raise)
-                if (not read_only) and CLAMP_AVAIL_TO_ZERO and avail < 0:
-                    to_raise = -avail  # how much total to add to reach 0
-                    # Distribute over variants that are counted; raise negatives first
-                    counted = []
-                    for v in variants:
-                        tracked = bool(((v.get("inventoryItem") or {}).get("tracked")))
-                        if (IN_INCLUDE_UNTRACKED or tracked):
-                            counted.append(v)
-                    # First, neutralize negative variants
-                    for v in counted:
-                        qty = safe_int(v.get("inventoryQuantity"), 0)
-                        if qty < 0 and to_raise > 0:
-                            need = min(-qty, to_raise)
-                            inv_item_id = safe_int(gid_num(((v.get("inventoryItem") or {}).get("id") or "0")), 0)
+                prev = _as_int_or_none(last_seen.get(pid))
+                if prev is None:
+                    # first time → learn non-negative last_seen baseline
+                    last_seen[pid] = max(0, int(avail_raw))
+                    log_row("📝","IN","FIRST_SEEN", product_id=pid, sku=sku_val, message=f"avail={avail_raw}", title=title)
+                    # still proceed to write metafields (unless global first cycle)
+                else:
+                    # compare vs last_seen (which we keep non-negative only)
+                    new_avail = int(avail_raw)
+                    if new_avail < 0:
+                        # sales happened beyond on-hand
+                        sold = (-new_avail) + prev if prev == 0 else (prev - new_avail)
+                        # normalize: if prev>=0 and new<0: sold = prev - new_avail (e.g., 0 -> -3 => 3)
+                        sold = prev - new_avail
+                        if not read_only and sold > 0:
+                            bump_sales(IN_DOMAIN, IN_TOKEN, p["id"], p.get("salesTotal") or {}, p.get("salesDates") or {}, sold, today)
+                            log_row("🧾➖","IN","SALES_BUMP", product_id=pid, sku=sku_val, delta=f"-{sold}", message=f"avail {prev}->{new_avail} (sold={sold})", title=title)
+                        # clamp to zero in Shopify (raise stock up by +abs(new))
+                        if CLAMP_AVAILABILITY_TO_ZERO and not read_only and any_inv_item_id:
                             try:
-                                rest_adjust_inventory(IN_DOMAIN, IN_TOKEN, inv_item_id, IN_LOCATION_ID, need)
-                                to_raise -= need
+                                rest_adjust_inventory(IN_DOMAIN, IN_TOKEN, any_inv_item_id, int(IN_LOCATION_ID), abs(new_avail))
+                                log_row("🧰0️⃣","IN","CLAMP_TO_ZERO", product_id=pid, sku=sku_val, delta=f"+{abs(new_avail)}",
+                                        message=f"Raised availability to 0 on inventory_item_id={any_inv_item_id}", title=title)
                             except Exception as e:
-                                log_row("⚠️", "IN", "IN", "WARN", product_id=pid, sku=sku, message=f"clamp raise error: {e}", title=title)
-                            time.sleep(MUTATION_SLEEP_SEC)
-                    # If still not zero, raise smallest-qty variants
-                    if to_raise > 0 and counted:
-                        for v in sorted(counted, key=lambda x: safe_int(x.get("inventoryQuantity"), 0)):
-                            if to_raise <= 0: break
-                            inv_item_id = safe_int(gid_num(((v.get("inventoryItem") or {}).get("id") or "0")), 0)
-                            add = to_raise
-                            try:
-                                rest_adjust_inventory(IN_DOMAIN, IN_TOKEN, inv_item_id, IN_LOCATION_ID, add)
-                                to_raise -= add
-                            except Exception as e:
-                                log_row("⚠️", "IN", "IN", "WARN", product_id=pid, sku=sku, message=f"clamp raise residual error: {e}", title=title)
-                            time.sleep(MUTATION_SLEEP_SEC)
-                    log_row("🧰0️⃣", "IN", "IN", "CLAMP_TO_ZERO", product_id=pid, sku=sku, delta=f"+{-avail}",
-                            message="Raised availability to 0 (per-variant)", title=title, before=str(avail), after="0")
-                    avail = 0  # reflect clamped state
+                                log_row("⚠️","IN","WARN", product_id=pid, sku=sku_val, message=str(e), title=title)
+                        # last_seen becomes 0
+                        last_seen[pid] = 0
+                        # for metafields/status decisions treat as 0 now
+                        new_avail = 0
+                    elif new_avail < prev:
+                        sold = prev - new_avail
+                        if not read_only and sold > 0:
+                            bump_sales(IN_DOMAIN, IN_TOKEN, p["id"], p.get("salesTotal") or {}, p.get("salesDates") or {}, sold, today)
+                            log_row("🧾➖","IN","SALES_BUMP", product_id=pid, sku=sku_val, delta=f"-{sold}", message=f"avail {prev}->{new_avail} (sold={sold})", title=title)
+                        last_seen[pid] = max(0, new_avail)
+                    elif new_avail > prev:
+                        # RESTOCK
+                        last_seen[pid] = new_avail
+                        log_row("📦➕","IN","RESTOCK", product_id=pid, sku=sku_val, delta=f"{new_avail - prev}", message=f"avail {prev}->{new_avail} (+{new_avail - prev})", title=title)
+                    else:
+                        # unchanged
+                        pass
 
-                # Update last_seen (NEVER store negative)
-                last_seen[pid] = max(0, int(avail))
+                # Compute effective non-negative availability for labels/status
+                effective_avail = max(0, int(avail_raw))
+                target_status, target_badge, target_delivery = effective_labels(effective_avail)
+
+                if not read_only:
+                    # metafields
+                    set_product_metafields(IN_DOMAIN, IN_TOKEN, p["id"], p.get("badges") or {}, p.get("dtime") or {}, target_badge, target_delivery)
+
+                    # SPECIAL STATUS RULE
+                    if IN_CHANGE_STATUS and (handle == SPECIAL_STATUS_HANDLE):
+                        current_status = (p.get("status") or "").upper()
+                        if effective_avail < 1 and current_status == "ACTIVE":
+                            ok = update_product_status(IN_DOMAIN, IN_TOKEN, p["id"], "DRAFT")
+                            log_row("🛑","IN","STATUS_TO_DRAFT" if ok else "STATUS_TO_DRAFT_FAILED",
+                                    product_id=pid, sku=sku_val, delta=str(effective_avail), message=f"handle={handle}", title=title)
+                        elif effective_avail >= 1 and current_status == "DRAFT":
+                            ok = update_product_status(IN_DOMAIN, IN_TOKEN, p["id"], "ACTIVE")
+                            log_row("✅","IN","STATUS_TO_ACTIVE" if ok else "STATUS_TO_ACTIVE_FAILED",
+                                    product_id=pid, sku=sku_val, delta=str(effective_avail), message=f"handle={handle}", title=title)
 
                 sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
 
-            save_json(IN_LAST_SEEN, {k: safe_int(v, 0) for k, v in last_seen.items()})
+            save_json(IN_LAST_SEEN, {k:int(v) for k,v in last_seen.items()})
+            sleep_ms(SLEEP_BETWEEN_PAGES_MS)
             if pageInfo.get("hasNextPage"):
                 cursor = pageInfo.get("endCursor")
-                sleep_ms(SLEEP_BETWEEN_PAGES_MS)
             else:
                 break
 
-# ========= US scan (mirror decreases only) =========
-def scan_usa_and_mirror_to_india(read_only: bool, sku_index: Dict[str,dict]):
+# =========================
+# USA scan → mirror negative deltas to India by EXACT index
+# =========================
+def scan_usa_and_mirror_to_india(read_only: bool = False):
     last_seen: Dict[str,int] = load_json(US_LAST_SEEN, {})
+    index: Dict[str, dict] = load_json(IN_SKU_INDEX, {})  # use built index
 
     for handle in US_COLLECTIONS:
         cursor = None
         while True:
             data = gql(US_DOMAIN, US_TOKEN, QUERY_COLLECTION_PAGE_US, {"handle": handle, "cursor": cursor})
             coll = data.get("collectionByHandle")
-            if not coll: break
+            if not coll:
+                break
             prods = ((coll.get("products") or {}).get("nodes") or [])
             pageInfo = ((coll.get("products") or {}).get("pageInfo") or {})
             for p in prods:
-                ptitle = p.get("title","")
+                title = p.get("title","")
+                sku_val = ((p.get("skuMeta") or {}).get("value") or "").strip()
+                sku_norm = normalize_sku(sku_val)
                 for v in ((p.get("variants") or {}).get("nodes") or []):
-                    vid = gid_num(v.get("id") or "")
-                    raw_sku = (v.get("sku") or "").strip()
-                    qty = safe_int(v.get("inventoryQuantity"), 0)
+                    vgid = v.get("id"); vid = gid_num(vgid)
+                    qty = int(v.get("inventoryQuantity") or 0)
 
-                    prev = safe_int(last_seen.get(vid), qty)
-                    delta = qty - prev
-                    # learn if not seen before
-                    if vid not in last_seen:
+                    prev = _as_int_or_none(last_seen.get(vid))
+                    if prev is None:
                         last_seen[vid] = qty
-                        log_row("🧭", "US", "US", "FIRST_SEEN", variant_id=vid, sku=raw_sku, delta="", message=f"qty={qty}", title=ptitle)
-                        sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
-                        continue
-
-                    if delta == 0:
+                        log_row("📝","US","FIRST_SEEN", variant_id=vid, sku=sku_val, message=f"qty={qty}", title=title)
+                    else:
+                        delta = qty - int(prev)
+                        if delta == 0:
+                            pass
+                        elif delta > 0:
+                            # Qty increase on US
+                            if MIRROR_US_INCREASES and not read_only and sku_norm in index:
+                                inv_item_id = index[sku_norm]["inv_item_id"]
+                                try:
+                                    rest_adjust_inventory(IN_DOMAIN, IN_TOKEN, inv_item_id, int(IN_LOCATION_ID), delta)
+                                    log_row("🔁","US→IN","APPLIED_DELTA", variant_id=vid, sku=sku_val, delta=str(delta),
+                                            message=f"Adjusted IN inventory_item_id={inv_item_id} by {delta} (via EXACT index)", title=title)
+                                except Exception as e:
+                                    log_row("⚠️","US→IN","ERROR_APPLYING_DELTA", variant_id=vid, sku=sku_val, delta=str(delta), message=str(e), title=title)
+                            else:
+                                log_row("🙅‍♂️➕","US→IN","IGNORED_INCREASE", variant_id=vid, sku=sku_val, delta=str(delta),
+                                        message="US qty increase; mirroring disabled", title=title)
+                        else:
+                            # delta < 0 → mirror to India if exact SKU found
+                            if not read_only and sku_norm in index:
+                                inv_item_id = index[sku_norm]["inv_item_id"]
+                                try:
+                                    rest_adjust_inventory(IN_DOMAIN, IN_TOKEN, inv_item_id, int(IN_LOCATION_ID), delta)
+                                    log_row("🔁","US→IN","APPLIED_DELTA", variant_id=vid, sku=sku_val, delta=str(delta),
+                                            message=f"Adjusted IN inventory_item_id={inv_item_id} by {delta} (via EXACT index)", title=title)
+                                except Exception as e:
+                                    log_row("⚠️","US→IN","ERROR_APPLYING_DELTA", variant_id=vid, sku=sku_val, delta=str(delta), message=str(e), title=title)
+                            else:
+                                log_row("⚠️","US→IN","WARN_SKU_NOT_FOUND_IN_INDIA", variant_id=vid, sku=sku_val, delta=str(delta),
+                                        message="US change; no matching product.custom.sku in India index", title=title)
                         last_seen[vid] = qty
-                        sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
-                        continue
-
-                    if delta > 0:
-                        # US increase → usually ignore
-                        if not MIRROR_US_INCREASES:
-                            log_row("🙅‍♂️➕", "US→IN", "US", "IGNORED_INCREASE", variant_id=vid, sku=raw_sku, delta=str(delta),
-                                    message="US qty increase; mirroring disabled", title=ptitle, before=str(prev), after=str(qty))
-                            last_seen[vid] = qty
-                            sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
-                            continue
-
-                    # delta < 0 (or mirroring increases on)
-                    if read_only:
-                        log_row("🛑", "US→IN", "IN", "FIRST_CYCLE_SKIP", variant_id=vid, sku=raw_sku, delta=str(delta),
-                                message="First global cycle is read-only; no adjust", title=ptitle, before=str(prev), after=str(qty))
-                        last_seen[vid] = qty
-                        sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
-                        continue
-
-                    key = sku_key(raw_sku)
-                    if not key or key not in sku_index:
-                        log_row("⚠️", "US→IN", "US", "**WARN_SKU_NOT_FOUND_IN_INDIA**",
-                                variant_id=vid, sku=raw_sku, delta=str(delta),
-                                message=f"US change {delta}; no matching IN product.custom.sku", title=ptitle,
-                                before=str(prev), after=str(qty))
-                        last_seen[vid] = qty
-                        sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
-                        continue
-
-                    inv_item_id = safe_int(sku_index[key].get("inv_item_id"), 0)
-                    try:
-                        rest_adjust_inventory(IN_DOMAIN, IN_TOKEN, inv_item_id, IN_LOCATION_ID, delta)
-                        log_row("🔁", "US→IN", "IN", "APPLIED_DELTA",
-                                variant_id=vid, sku=raw_sku, delta=str(delta),
-                                message=f"Adjusted IN inventory_item_id={inv_item_id} by {delta} (via EXACT index)",
-                                title=ptitle, before=str(prev), after=str(qty))
-                    except Exception as e:
-                        log_row("⚠️", "US→IN", "IN", "ERROR_APPLYING_DELTA",
-                                variant_id=vid, sku=raw_sku, delta=str(delta), message=str(e), title=ptitle)
-
-                    last_seen[vid] = qty
                     sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
 
-            save_json(US_LAST_SEEN, {k: safe_int(v, 0) for k, v in last_seen.items()})
+            save_json(US_LAST_SEEN, {k:int(v) for k,v in last_seen.items()})
+            sleep_ms(SLEEP_BETWEEN_PAGES_MS)
             if pageInfo.get("hasNextPage"):
                 cursor = pageInfo.get("endCursor")
-                sleep_ms(SLEEP_BETWEEN_PAGES_MS)
             else:
                 break
 
-# ========= Scheduler loop & HTTP =========
+# =========================
+# First-cycle guard & scheduler
+# =========================
+from threading import Thread, Lock
 run_lock = Lock()
 is_running = False
+
+def load_state():
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"initialized": False}
+
+def save_state(obj):
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
+    os.replace(tmp, STATE_PATH)
 
 def run_cycle():
     global is_running
@@ -617,31 +645,45 @@ def run_cycle():
             return "busy"
         is_running = True
     try:
-        # Build fresh IN SKU index (ACTIVE-only if configured)
-        index = build_in_sku_index()
-        # Decide first cycle read-only: if no last_seen files at all
+        # first-ever cycle detection
+        state = load_state()
         in_seen = load_json(IN_LAST_SEEN, {})
         us_seen = load_json(US_LAST_SEEN, {})
-        first_cycle = (len(in_seen) == 0 and len(us_seen) == 0)
+        first_cycle = (not state.get("initialized", False)) and (len(in_seen) == 0 and len(us_seen) == 0)
 
-        # IN then US
-        scan_india_and_update(read_only=first_cycle, sku_index=index)
+        # India first
+        scan_india_and_update(read_only=first_cycle)
         sleep_ms(SLEEP_BETWEEN_SHOPS_MS)
-        scan_usa_and_mirror_to_india(read_only=first_cycle, sku_index=index)
+
+        # USA second
+        scan_usa_and_mirror_to_india(read_only=first_cycle)
 
         if first_cycle:
-            # mark a state file just for visibility; logic already relies on last_seen length
-            save_json(STATE_PATH, {"initialized": True})
-            log_row("🧭", "SCHED", "BOTH", "FIRST_CYCLE_DONE", message="Baselines learned; future cycles will apply deltas")
+            state["initialized"] = True
+            save_state(state)
+            log_row("🧭","SCHED","FIRST_CYCLE_DONE", message="Baselines learned; future cycles will apply deltas")
+
         return "ok"
     except Exception as e:
-        log_row("⚠️", "SCHED", "BOTH", "WARN", message=str(e))
+        log_row("⚠️","SCHED","WARN", message=str(e))
         return "error"
     finally:
         with run_lock:
             is_running = False
 
+def scheduler_loop():
+    if RUN_EVERY_MIN <= 0:
+        return
+    while True:
+        try:
+            run_cycle()
+        except Exception as e:
+            log_row("⚠️","SCHED","ERROR", message=str(e))
+        time.sleep(max(1, RUN_EVERY_MIN) * 60)
+
+# =========================
 # Flask app
+# =========================
 app = Flask(__name__)
 
 def _cors(resp):
@@ -651,11 +693,12 @@ def _cors(resp):
     return resp
 
 @app.route("/health", methods=["GET"])
-def health(): return "ok", 200
+def health():
+    return "ok", 200
 
 @app.route("/diag", methods=["GET"])
 def diag():
-    d = {
+    return jsonify({
         "api_version": API_VERSION,
         "data_dir": DATA_DIR,
         "in_domain": IN_DOMAIN,
@@ -664,15 +707,14 @@ def diag():
         "us_collections": US_COLLECTIONS,
         "run_every_min": RUN_EVERY_MIN,
         "scheduler_enabled": ENABLE_SCHEDULER,
+        "only_active_for_mapping": ONLY_ACTIVE_FOR_MAPPING,
+        "use_product_custom_sku": USE_PRODUCT_CUSTOM_SKU,
+        "mirror_us_increases": MIRROR_US_INCREASES,
+        "clamp_avail_to_zero": CLAMP_AVAILABILITY_TO_ZERO,
         "in_last_seen_count": len(load_json(IN_LAST_SEEN, {})),
         "us_last_seen_count": len(load_json(US_LAST_SEEN, {})),
         "index_entries": len(load_json(IN_SKU_INDEX, {})),
-        "use_product_custom_sku": USE_PRODUCT_CUSTOM_SKU,
-        "only_active_for_mapping": ONLY_ACTIVE_FOR_MAPPING,
-        "mirror_us_increases": MIRROR_US_INCREASES,
-        "clamp_avail_to_zero": CLAMP_AVAIL_TO_ZERO
-    }
-    return _cors(jsonify(d)), 200
+    }), 200
 
 @app.route("/run", methods=["POST"])
 def run_now():
@@ -682,20 +724,13 @@ def run_now():
     status = run_cycle()
     return _cors(jsonify({"status": status})), 200 if status == "ok" else 409
 
-def scheduler_loop():
-    if RUN_EVERY_MIN <= 0: return
-    while True:
-        try:
-            run_cycle()
-        except Exception as e:
-            log_row("⚠️", "SCHED", "BOTH", "ERROR", message=str(e))
-        time.sleep(max(1, RUN_EVERY_MIN) * 60)
-
+# Start scheduler thread if enabled (do NOT use in Render Web Service; use Worker)
 if ENABLE_SCHEDULER:
     Thread(target=scheduler_loop, daemon=True).start()
 
+# WSGI entrypoint
 if __name__ == "__main__":
+    print(f"[BOOT] Dual sync on port {PORT} | API {API_VERSION}")
+    print(f"[CFG] IN={IN_DOMAIN} (loc {IN_LOCATION_ID}) | US={US_DOMAIN} (loc {US_LOCATION_ID}) | DATA_DIR={DATA_DIR}")
     from werkzeug.serving import run_simple
-    print(f"[BOOT] Dual sync on port {PORT} | API {API_VERSION}", flush=True)
-    print(f"[CFG] IN={IN_DOMAIN} (loc {IN_LOCATION_ID}) | US={US_DOMAIN} (loc {US_LOCATION_ID}) | DATA_DIR={DATA_DIR}", flush=True)
     run_simple("0.0.0.0", PORT, app)
