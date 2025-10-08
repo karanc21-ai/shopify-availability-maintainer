@@ -354,36 +354,80 @@ def set_product_metafields(domain:str, token:str, product_gid:str,
 def bump_sales_in(domain:str, token:str, product_gid:str,
                   sales_total_node:dict, sales_dates_node:dict,
                   sold:int, today:str):
-    st_type = (sales_total_node or {}).get("type") or "number_integer"
-    sd_type = (sales_dates_node or {}).get("type") or "list.date"
-    try:
-        current = int((sales_total_node or {}).get("value") or "0")
-    except Exception:
-        current = 0
-    new_total = current + int(sold)
+    """
+    Increments sales_total and stamps sales_dates using the store's real metafield types.
+    - sales_total: supports number_integer or text-like; writes str(new_total)
+    - sales_dates: supports list.date or date (or text fallback); writes correct shape
+    """
+    # Resolve types from nodes or definitions
+    st_type = (sales_total_node or {}).get("type") or \
+              get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, KEY_SALES) or \
+              "number_integer"
 
-    # dates payload
-    if sd_type == "list.date":
-        existing=[]
-        raw=(sales_dates_node or {}).get("value")
+    sd_type = (sales_dates_node or {}).get("type") or \
+              get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, KEY_DATES) or \
+              "date"
+
+    # Current sales_total
+    try:
+        current_total = int((sales_total_node or {}).get("value") or "0")
+    except Exception:
+        current_total = 0
+    new_total = current_total + int(sold)
+
+    # Build sales_dates payload matching the definition
+    if sd_type.startswith("list."):  # e.g., list.date
+        existing = []
+        raw = (sales_dates_node or {}).get("value")
         try:
-            existing = json.loads(raw) if isinstance(raw,str) and raw.startswith("[") else []
-        except: existing=[]
+            if isinstance(raw, str) and raw.strip().startswith("["):
+                existing = json.loads(raw)
+        except Exception:
+            existing = []
         if today not in existing:
             existing.append(today)
-        sd_payload = {"ownerId": product_gid,"namespace":MF_NAMESPACE,"key":KEY_DATES,"type":"list.date","value": json.dumps(sorted(set(existing))[-365:])}
+        sd_payload = {
+            "ownerId": product_gid,
+            "namespace": MF_NAMESPACE,
+            "key": KEY_DATES,
+            "type": "list.date",
+            "value": json.dumps(sorted(set(existing))[-365:])
+        }
+    elif sd_type == "date":
+        sd_payload = {
+            "ownerId": product_gid,
+            "namespace": MF_NAMESPACE,
+            "key": KEY_DATES,
+            "type": "date",
+            "value": today
+        }
     else:
-        sd_payload = {"ownerId": product_gid,"namespace":MF_NAMESPACE,"key":KEY_DATES,"type":"date","value":today}
+        # Fallback for text-like definitions
+        sd_payload = {
+            "ownerId": product_gid,
+            "namespace": MF_NAMESPACE,
+            "key": KEY_DATES,
+            "type": sd_type,
+            "value": today
+        }
 
-    m = "mutation($mfs:[MetafieldsSetInput!]!){ metafieldsSet(metafields:$mfs){ userErrors{ message field } } }"
-    mf_inputs = [
-        {"ownerId":product_gid,"namespace":MF_NAMESPACE,"key":KEY_SALES,"type":st_type,"value":str(new_total)},
+    # Write both metafields
+    mutation = """
+    mutation($mfs:[MetafieldsSetInput!]!){
+      metafieldsSet(metafields:$mfs){
+        userErrors{ field message }
+      }
+    }"""
+    mfs = [
+        {"ownerId": product_gid, "namespace": MF_NAMESPACE, "key": KEY_SALES,
+         "type": st_type, "value": str(new_total)},
         sd_payload
     ]
-    data = gql(domain, token, m, {"mfs": mf_inputs})
+    data = gql(domain, token, mutation, {"mfs": mfs})
     errs = ((data.get("metafieldsSet") or {}).get("userErrors") or [])
     if errs:
-        log_row("⚠️","IN","WARN",product_id=gid_num(product_gid),message=f"sales metafieldsSet errors: {errs}")
+        log_row("⚠️","IN","WARN", product_id=gid_num(product_gid),
+               message=f"sales metafieldsSet errors: {errs}")
 
 # --------------- Index builder (India) ---------------
 def build_in_sku_index():
