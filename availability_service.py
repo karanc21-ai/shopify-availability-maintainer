@@ -539,61 +539,99 @@ def scan_india_and_update(read_only: bool = False):
 
 # --------------- USA scan → mirror to India ---------------
 def scan_usa_and_mirror_to_india(read_only: bool = False):
-    last_seen: Dict[str,int] = load_json(US_LAST_SEEN, {})
-    in_index: Dict[str,Any] = load_json(IN_SKU_INDEX, {})
+    """
+    US scan:
+      - Compute per-variant deltas vs last_seen.
+      - If delta < 0: mirror that decrease to India's matching SKU (EXACT match), adjusting IN inventory by -delta.
+      - Ignore US increases (as per policy).
+      - NEW: After handling delta, if the US variant qty is negative, clamp it back to 0 on the US store.
+    """
+    last_seen: Dict[str, int] = load_json(US_LAST_SEEN, {})
+    in_index: Dict[str, dict] = load_json(IN_SKU_INDEX, {})  # sku_norm -> {"inv_item_id": int, "pid": str, "title": str}
 
     for handle in US_COLLECTIONS:
-        cursor=None
+        cursor = None
         while True:
             data = gql(US_DOMAIN, US_TOKEN, QUERY_COLLECTION_PAGE_US, {"handle": handle, "cursor": cursor})
             coll = data.get("collectionByHandle")
-            if not coll: break
+            if not coll:
+                log_hr("US", "US", "WARN", "", "", "", 0, f"Collection not found: {handle}")
+                break
+
             prods = ((coll.get("products") or {}).get("nodes") or [])
             pageInfo = ((coll.get("products") or {}).get("pageInfo") or {})
+
             for p in prods:
-                p_sku = (((p.get("metafield") or {}).get("value")) or "").strip()
-                title = p.get("title") or ""
+                ptitle = (p.get("title") or "").strip()
                 for v in ((p.get("variants") or {}).get("nodes") or []):
-                    vid = gid_num(v.get("id"))
-                    raw_sku = v.get("sku") or p_sku  # prefer variant sku if present; else product.custom.sku
-                    sku_exact = (raw_sku or "").strip()
+                    vgid = v.get("id") or ""
+                    vid = gid_num(vgid)
+                    raw_sku = v.get("sku") or ""
+                    sku_norm = normalize_sku(raw_sku)
                     qty = int(v.get("inventoryQuantity") or 0)
 
+                    # Establish previous
                     prev = _as_int_or_none(last_seen.get(vid))
                     if prev is None:
-                        last_seen[vid] = qty
+                        last_seen[vid] = qty if qty >= 0 else 0  # learn; never store negative
+                        log_hr("US", "US", "FIRST_SEEN", "", vid, raw_sku, qty, f"qty={qty}")
+                        sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
                         continue
 
                     delta = qty - int(prev)
-                    if delta == 0:
-                        continue
 
-                    # handle increases
-                    if delta > 0:
-                        if not MIRROR_US_INCREASES:
-                            log_row("🙅‍♂️➕","US→IN","IGNORED_INCREASE", variant_id=vid, sku=sku_exact, delta=str(delta), title=title, message="US qty increase; mirroring disabled", before=str(prev), after=str(qty))
-                            last_seen[vid] = qty
-                            continue
-                        # (if enabled, apply +delta)
-
-                    # decreases (delta < 0) → mirror to India
-                    if not read_only and delta < 0 and sku_exact:
-                        idx = in_index.get(sku_exact)
-                        if not idx:
-                            log_row("⚠️","US→IN","WARN_SKU_NOT_FOUND", variant_id=vid, sku=sku_exact, delta=str(delta), title=title, message="No matching SKU in India index")
+                    # Only mirror decreases
+                    if delta < 0 and not read_only:
+                        if not sku_norm:
+                            log_hr("US→IN", "US", "WARN_NO_SKU_US", "", vid, raw_sku, delta,
+                                   "US variant drop but no SKU; cannot mirror to India")
                         else:
-                            in_inv_item_id = int(idx.get("inventory_item_id") or 0)
-                            try:
-                                rest_adjust_inventory(IN_DOMAIN, IN_TOKEN, in_inv_item_id, int(IN_LOCATION_ID), delta)
-                                log_row("🔁","US→IN","APPLIED_DELTA", variant_id=vid, sku=sku_exact, delta=str(delta), title=title, message=f"Adjusted IN inventory_item_id={in_inv_item_id} by {delta} (via EXACT index)")
-                                time.sleep(MUTATION_SLEEP_SEC)
-                            except Exception as e:
-                                log_row("⚠️","US→IN","ERROR_APPLYING_DELTA", variant_id=vid, sku=sku_exact, delta=str(delta), title=title, message=str(e))
+                            # Exact SKU → India inventory_item_id via on-disk index
+                            hit = in_index.get(sku_norm)
+                            if not hit:
+                                log_hr("US→IN", "US", "WARN_SKU_NOT_FOUND_IN_INDIA", "", vid, raw_sku, delta,
+                                       f"US change {delta}; no matching SKU in India index")
+                            else:
+                                in_inv_item_id = int(hit.get("inv_item_id") or 0)
+                                if in_inv_item_id <= 0:
+                                    log_hr("US→IN", "US", "WARN_BAD_INDEX_ENTRY", "", vid, raw_sku, delta,
+                                           f"Invalid India inv_item_id for SKU {raw_sku}: {hit}")
+                                else:
+                                    try:
+                                        rest_adjust_inventory(IN_DOMAIN, IN_TOKEN, in_inv_item_id, int(IN_LOCATION_ID), delta)
+                                        log_hr("US→IN", "IN", "APPLIED_DELTA", "", vid, raw_sku, delta,
+                                               f"Adjusted IN inventory_item_id={in_inv_item_id} by {delta} (via EXACT index) — “{ptitle}”")
+                                        time.sleep(MUTATION_SLEEP_SEC)
+                                    except Exception as e:
+                                        log_hr("US→IN", "IN", "ERROR_APPLYING_DELTA", "", vid, raw_sku, delta, str(e))
 
-                    last_seen[vid] = qty
+                    elif delta > 0:
+                        # Ignore US increases entirely (policy)
+                        log_hr("US→IN", "US", "IGNORED_INCREASE", "", vid, raw_sku, delta,
+                               f"US qty increase; mirroring disabled — “{ptitle}”")
+
+                    # 🔒 NEW: clamp US negatives to 0 (after delta handling), and never store negative last_seen
+                    if qty < 0 and not read_only:
+                        try:
+                            us_inv_item_id = int(gid_num(((v.get("inventoryItem") or {}).get("id") or "")) or "0")
+                            if us_inv_item_id > 0 and US_LOCATION_ID:
+                                # Raise by +abs(qty) to zero
+                                rest_adjust_inventory(US_DOMAIN, US_TOKEN, us_inv_item_id, int(US_LOCATION_ID), -qty)
+                                log_hr("US", "US", "CLAMP_US_TO_ZERO", "", vid, raw_sku, -qty,
+                                       f"Raised US qty to 0 on inventory_item_id={us_inv_item_id} — “{ptitle}”")
+                                time.sleep(MUTATION_SLEEP_SEC)
+                                qty = 0  # reflect clamped reality
+                            else:
+                                log_hr("US", "US", "WARN_US_CLAMP_NO_INV_ITEM", "", vid, raw_sku, -qty,
+                                       f"Cannot clamp; missing inv_item_id or US_LOCATION_ID — “{ptitle}”")
+                        except Exception as e:
+                            log_hr("US", "US", "ERROR_US_CLAMP", "", vid, raw_sku, -qty, str(e))
+
+                    # Persist last_seen (never negative)
+                    last_seen[vid] = qty if qty >= 0 else 0
                     sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
 
-            save_json(US_LAST_SEEN, last_seen)
+            save_json(US_LAST_SEEN, {k: int(v) for k, v in last_seen.items()})
             sleep_ms(SLEEP_BETWEEN_PAGES_MS)
             if pageInfo.get("hasNextPage"):
                 cursor = pageInfo.get("endCursor")
