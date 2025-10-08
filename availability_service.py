@@ -145,6 +145,15 @@ def rest_adjust_inventory(domain: str, token: str, inventory_item_id: int, locat
         return
 
 # ---------- Utils ----------
+def safe_int(v, default=0):
+    try:
+        if isinstance(v, (int, float)): return int(v)
+        if v is None: return default
+        s = str(v).strip()
+        return int(s) if s.lstrip("+-").isdigit() else default
+    except Exception:
+        return default
+
 def now_ist(): return datetime.now(timezone(timedelta(hours=5, minutes=30)))
 def now_ist_str(): return now_ist().strftime("%Y-%m-%d %H:%M:%S %z")
 def today_ist_str(): return now_ist().date().isoformat()
@@ -473,7 +482,7 @@ def scan_india_and_update(read_only: bool = False):
 
                 sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
 
-            save_json(IN_LAST_SEEN, {k:int(v) for k,v in last_seen.items()})
+            save_json(IN_LAST_SEEN, {k: safe_int(v, 0) for k, v in last_seen.items()})
             if pageInfo.get("hasNextPage"):
                 cursor = pageInfo.get("endCursor"); sleep_ms(SLEEP_BETWEEN_PAGES_MS)
             else: break
@@ -541,7 +550,7 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
                             last_seen[vid] = qty
 
                     sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
-            save_json(US_LAST_SEEN, {k:int(v) for k,v in last_seen.items()})
+            save_json(US_LAST_SEEN, {k: safe_int(v, 0) for k, v in last_seen.items()})
             if pageInfo.get("hasNextPage"):
                 cursor = pageInfo.get("endCursor"); sleep_ms(SLEEP_BETWEEN_PAGES_MS)
             else: break
