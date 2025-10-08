@@ -116,27 +116,41 @@ def hdr(token: str) -> Dict[str, str]:
 
 def gql(domain: str, token: str, query: str, variables: dict = None) -> dict:
     url = f"https://{domain}/admin/api/{API_VERSION}/graphql.json"
-    backoffs = [0.3, 0.6, 1.2, 2.0, 3.0, 5.0, 8.0]
-    for attempt, b in enumerate(backoffs, 1):
+    log_queries = os.getenv("LOG_GRAPHQL","0") == "1"
+    last = {"query": query, "variables": variables or {}}
+
+    for attempt in range(1, 8):
+        r = requests.post(url, headers=hdr(token), json={"query": query, "variables": variables or {}}, timeout=60)
+        if r.status_code == 429 or r.status_code >= 500:
+            time.sleep(min(10.0, 0.4 * (2 ** (attempt-1))) + random.uniform(0,0.25))
+            continue
         try:
-            r = requests.post(url, headers=hdr(token), json={"query": query, "variables": variables or {}}, timeout=60)
-            if r.status_code in (502, 503, 504, 520, 522, 524, 429):
-                time.sleep(b + random.uniform(0, 0.25))
-                continue
-            if r.status_code != 200:
-                raise RuntimeError(f"GraphQL HTTP {r.status_code}: {r.text}")
             data = r.json()
-            if data.get("errors"):
-                if any(((e.get("extensions") or {}).get("code","").upper() == "THROTTLED") for e in data["errors"]):
-                    time.sleep(b + random.uniform(0, 0.25))
-                    continue
-                raise RuntimeError(f"GraphQL errors: {data['errors']}")
-            return data["data"]
-        except requests.exceptions.RequestException as e:
-            time.sleep(b + random.uniform(0, 0.25))
-            if attempt == len(backoffs):
-                raise
+        except Exception:
+            # Non-JSON body – log and raise
+            if log_queries:
+                print(f"⚠️ GQL RAW_ERROR body={r.text[:400]}", flush=True)
+                print(f"⚙️ GQL LAST_QUERY {json.dumps(last)[:800]}", flush=True)
+            raise
+
+        if r.status_code != 200:
+            if log_queries:
+                print(f"⚠️ GQL HTTP{r.status_code} body={r.text[:400]}", flush=True)
+                print(f"⚙️ GQL LAST_QUERY {json.dumps(last)[:800]}", flush=True)
+            raise RuntimeError(f"GraphQL HTTP {r.status_code}: {r.text}")
+
+        if data.get("errors"):
+            if log_queries:
+                print(f"⚠️ GQL ERRORS {json.dumps(data['errors'])[:400]}", flush=True)
+                print(f"⚙️ GQL LAST_QUERY {json.dumps(last)[:800]}", flush=True)
+            # retry on throttled
+            if any(((e.get('extensions') or {}).get('code','').upper() == 'THROTTLED') for e in data["errors"]):
+                time.sleep(min(10.0, 0.4 * (2 ** (attempt-1))) + random.uniform(0,0.25))
+                continue
+            raise RuntimeError(f"GraphQL errors: {data['errors']}")
+        return data["data"]
     raise RuntimeError("GraphQL throttled/5xx repeatedly")
+
 
 def rest_adjust_inventory(domain: str, token: str, inventory_item_id: int, location_id: int, delta: int) -> None:
     url = f"https://{domain}/admin/api/{API_VERSION}/inventory_levels/adjust.json"
