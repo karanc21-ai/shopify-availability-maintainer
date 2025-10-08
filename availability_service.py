@@ -2,31 +2,25 @@
 # -*- coding: utf-8 -*-
 
 """
-Dual-site availability sync — Render-friendly
+Dual-site availability sync — Render-friendly (no collection-level query arg)
 
-Key behaviors
-- First full cycle is auto READ-ONLY (learn baselines; no writes).
-- India (IN) scan:
-   * Compute availability per product from variants (tracked-only by default).
-   * On availability drop vs last_seen: bump sales_total & sales_dates.
-   * Always set metafields (badges/delivery) after first cycle.
-   * SPECIAL status rule for SPECIAL_STATUS_HANDLE (symmetric):
-       - avail < 1 & status=ACTIVE  → DRAFT
-       - avail ≥ 1 & status=DRAFT   → ACTIVE
-   * If availability goes negative, immediately CLAMP back to 0 (and set last_seen to 0).
-- USA (US) scan:
-   * Track per-variant qty; mirror ONLY NEGATIVE deltas to India by product.custom.sku (exact match).
-   * Increases are ignored when MIRROR_US_INCREASES=0.
+Fixes:
+- Removed GraphQL `query:` argument under collection products (Shopify doesn't allow it).
+- Filter ACTIVE products client-side when ONLY_ACTIVE_FOR_MAPPING=1.
 
-Render tips
-- Attach a Persistent Disk at /data and set DATA_DIR=/data.
-- Web service can be invoked ad-hoc: POST /run?key=... (ENABLE_SCHEDULER=0).
-- Background worker: set ENABLE_SCHEDULER=1 and just run python3 availability_service.py.
+Behaviors
+- First full cycle is READ-ONLY (learn baselines).
+- IN scan:
+  * Compute availability (tracked-only by default).
+  * On availability drop: bump sales_total & sales_dates.
+  * Set badges/delivery each run after first cycle.
+  * SPECIAL collection status flip ACTIVE<->DRAFT by availability.
+  * If availability negative, CLAMP to 0 and set last_seen=0.
+- US scan:
+  * Mirror ONLY NEGATIVE deltas to IN via exact product.custom.sku.
+  * Increases ignored unless MIRROR_US_INCREASES=1.
 
-Logging
-- CSV:  DATA_DIR/dual_sync_log.csv
-- JSONL: DATA_DIR/dual_sync_log.jsonl
-- Toggle GraphQL query logging with LOG_GRAPHQL=1
+Logging: CSV + JSONL in DATA_DIR. Toggle GraphQL debug with LOG_GRAPHQL=1.
 """
 
 import os, sys, time, json, csv, random
@@ -35,7 +29,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request, jsonify, make_response
 
-# ---------- Config & pacing ----------
+# ---------- Config ----------
 API_VERSION = os.getenv("API_VERSION", "2024-10").strip()
 PIXEL_SHARED_SECRET = os.getenv("PIXEL_SHARED_SECRET", "").strip()
 if not PIXEL_SHARED_SECRET:
@@ -44,33 +38,33 @@ if not PIXEL_SHARED_SECRET:
 RUN_EVERY_MIN = int(os.getenv("RUN_EVERY_MIN", "5"))
 ENABLE_SCHEDULER = os.getenv("ENABLE_SCHEDULER", "0") == "1"
 
-SLEEP_BETWEEN_PRODUCTS_MS = int(os.getenv("SLEEP_BETWEEN_PRODUCTS_MS", "120"))  # ms
-SLEEP_BETWEEN_PAGES_MS = int(os.getenv("SLEEP_BETWEEN_PAGES_MS", "400"))        # ms
-SLEEP_BETWEEN_SHOPS_MS = int(os.getenv("SLEEP_BETWEEN_SHOPS_MS", "800"))        # ms
-MUTATION_SLEEP_SEC = float(os.getenv("MUTATION_SLEEP_SEC", "0.35"))             # sec
+SLEEP_BETWEEN_PRODUCTS_MS = int(os.getenv("SLEEP_BETWEEN_PRODUCTS_MS", "120"))
+SLEEP_BETWEEN_PAGES_MS = int(os.getenv("SLEEP_BETWEEN_PAGES_MS", "400"))
+SLEEP_BETWEEN_SHOPS_MS = int(os.getenv("SLEEP_BETWEEN_SHOPS_MS", "800"))
+MUTATION_SLEEP_SEC = float(os.getenv("MUTATION_SLEEP_SEC", "0.35"))
 
-# India (metafields + receives inventory deltas)
+# India
 IN_DOMAIN = os.getenv("IN_DOMAIN", "").strip()
 IN_TOKEN  = os.getenv("IN_TOKEN", "").strip()
 IN_LOCATION_ID = os.getenv("IN_LOCATION_ID", "").strip()
 IN_COLLECTIONS = [x.strip() for x in os.getenv("IN_COLLECTION_HANDLES","").split(",") if x.strip()]
 IN_INCLUDE_UNTRACKED = os.getenv("IN_INCLUDE_UNTRACKED", "0") == "1"
-IN_CHANGE_STATUS = os.getenv("IN_CHANGE_STATUS", "0") == "1"  # must be 1 to flip status
+IN_CHANGE_STATUS = os.getenv("IN_CHANGE_STATUS", "0") == "1"
 
-# USA (source of variant-level deltas)
+# USA
 US_DOMAIN = os.getenv("US_DOMAIN", "").strip()
 US_TOKEN  = os.getenv("US_TOKEN", "").strip()
 US_LOCATION_ID = os.getenv("US_LOCATION_ID", "").strip()
 US_COLLECTIONS = [x.strip() for x in os.getenv("US_COLLECTION_HANDLES","").split(",") if x.strip()]
 
 # Mapping/filtering
-USE_PRODUCT_CUSTOM_SKU = os.getenv("USE_PRODUCT_CUSTOM_SKU", "1") == "1"  # we map by product.custom.sku (EXACT)
-ONLY_ACTIVE_FOR_MAPPING = os.getenv("ONLY_ACTIVE_FOR_MAPPING", "1") == "1"  # only index/filter active products
+USE_PRODUCT_CUSTOM_SKU = os.getenv("USE_PRODUCT_CUSTOM_SKU", "1") == "1"
+ONLY_ACTIVE_FOR_MAPPING = os.getenv("ONLY_ACTIVE_FOR_MAPPING", "1") == "1"
 
 # US→IN increases mirroring
-MIRROR_US_INCREASES = os.getenv("MIRROR_US_INCREASES", "0") == "1"  # default: ignore increases
+MIRROR_US_INCREASES = os.getenv("MIRROR_US_INCREASES", "0") == "1"
 
-# Clamp negative availability to zero on IN
+# Clamp negatives to zero
 CLAMP_AVAIL_TO_ZERO = os.getenv("CLAMP_AVAIL_TO_ZERO", "1") == "1"
 
 # Metafields (India)
@@ -79,36 +73,33 @@ MF_BADGES_KEY = os.getenv("MF_BADGES_KEY", "badges")
 MF_DELIVERY_KEY = os.getenv("MF_DELIVERY_KEY", "delivery_time")
 KEY_SALES = os.getenv("KEY_SALES", "sales_total")
 KEY_DATES = os.getenv("KEY_DATES", "sales_dates")
-KEY_SKU   = os.getenv("KEY_SKU", "sku")  # product-level custom.sku
+KEY_SKU   = os.getenv("KEY_SKU", "sku")
 
 BADGE_READY    = "Ready To Ship"
 DELIVERY_READY = "2-5 Days Across India"
 DELIVERY_MTO   = "12-15 Days Across India"
 
-# Special collection where availability controls status (symmetric rule)
+# Special collection
 SPECIAL_STATUS_HANDLE = os.getenv(
     "SPECIAL_STATUS_HANDLE",
     "budget-gold-plated-jewelry-premium-jadau-ornaments-on-mix-metal-base"
 ).strip()
 
-# Render / persistence
+# Persistence
 DATA_DIR = os.getenv("DATA_DIR", ".").rstrip("/")
 os.makedirs(DATA_DIR, exist_ok=True)
 LOG_TO_STDOUT = os.getenv("LOG_TO_STDOUT", "1") == "1"
 LOG_GRAPHQL = os.getenv("LOG_GRAPHQL", "0") == "1"
 
-def p(*parts):  # path helper within DATA_DIR
-    return os.path.join(DATA_DIR, *parts)
+def p(*parts): return os.path.join(DATA_DIR, *parts)
+PORT = int(os.getenv("PORT", os.getenv("PORT", "10000")))
 
-PORT = int(os.getenv("PORT", os.getenv("PORT", "10000")))  # Render injects PORT
-
-# Last-seen persistence (no explicit seeding endpoint; first cycle read-only)
-IN_LAST_SEEN  = p("in_last_seen.json")   # product_id(num) -> last_seen_availability (never <0)
-US_LAST_SEEN  = p("us_last_seen.json")   # variant_id(num)  -> last_seen_qty
-STATE_PATH    = p("dual_state.json")     # {"initialized": bool}
-LOG_CSV       = p("dual_sync_log.csv")   # CSV
-LOG_JSONL     = p("dual_sync_log.jsonl") # JSONL
-IN_SKU_INDEX  = p("in_sku_index.json")   # sku -> {"inventory_item_id":int,"product_id":str,"title":str}
+IN_LAST_SEEN  = p("in_last_seen.json")
+US_LAST_SEEN  = p("us_last_seen.json")
+STATE_PATH    = p("dual_state.json")
+LOG_CSV       = p("dual_sync_log.csv")
+LOG_JSONL     = p("dual_sync_log.jsonl")
+IN_SKU_INDEX  = p("in_sku_index.json")
 
 # ---------- HTTP helpers ----------
 def hdr(token: str) -> Dict[str, str]:
@@ -120,9 +111,7 @@ def gql(domain: str, token: str, query: str, variables: dict = None) -> dict:
     for attempt in range(1, 8):
         r = requests.post(url, headers=hdr(token), json={"query": query, "variables": variables or {}}, timeout=60)
         if r.status_code == 429 or r.status_code >= 500:
-            time.sleep(min(10.0, 0.4 * (2 ** (attempt-1))) + random.uniform(0,0.25))
-            continue
-        # parse JSON
+            time.sleep(min(10.0, 0.4 * (2 ** (attempt-1))) + random.uniform(0,0.25)); continue
         try:
             data = r.json()
         except Exception:
@@ -130,21 +119,17 @@ def gql(domain: str, token: str, query: str, variables: dict = None) -> dict:
                 print(f"⚠️ GQL RAW_ERROR body={r.text[:400]}", flush=True)
                 print(f"⚙️ GQL LAST_QUERY {json.dumps(last)[:800]}", flush=True)
             raise
-        # HTTP error
         if r.status_code != 200:
             if LOG_GRAPHQL:
                 print(f"⚠️ GQL HTTP{r.status_code} body={r.text[:400]}", flush=True)
                 print(f"⚙️ GQL LAST_QUERY {json.dumps(last)[:800]}", flush=True)
             raise RuntimeError(f"GraphQL HTTP {r.status_code}: {r.text}")
-        # GraphQL error
         if data.get("errors"):
             if LOG_GRAPHQL:
                 print(f"⚠️ GQL ERRORS {json.dumps(data['errors'])[:400]}", flush=True)
                 print(f"⚙️ GQL LAST_QUERY {json.dumps(last)[:800]}", flush=True)
-            # retry on throttled
             if any(((e.get('extensions') or {}).get('code','').upper() == 'THROTTLED') for e in data["errors"]):
-                time.sleep(min(10.0, 0.4 * (2 ** (attempt-1))) + random.uniform(0,0.25))
-                continue
+                time.sleep(min(10.0, 0.4 * (2 ** (attempt-1))) + random.uniform(0,0.25)); continue
             raise RuntimeError(f"GraphQL errors: {data['errors']}")
         return data["data"]
     raise RuntimeError("GraphQL throttled/5xx repeatedly")
@@ -155,73 +140,46 @@ def rest_adjust_inventory(domain: str, token: str, inventory_item_id: int, locat
     for attempt in range(1, 6):
         r = requests.post(url, headers=hdr(token), json=payload, timeout=30)
         if r.status_code == 429 or r.status_code >= 500:
-            time.sleep(min(8.0, 0.3 * (2 ** (attempt-1))) + random.uniform(0, 0.25))
-            continue
-        if r.status_code >= 400:
-            raise RuntimeError(f"REST adjust {r.status_code}: {r.text}")
+            time.sleep(min(8.0, 0.3 * (2 ** (attempt-1))) + random.uniform(0,0.25)); continue
+        if r.status_code >= 400: raise RuntimeError(f"REST adjust {r.status_code}: {r.text}")
         return
 
 # ---------- Utils ----------
-def now_ist():
-    return datetime.now(timezone(timedelta(hours=5, minutes=30)))
-
-def now_ist_str():
-    return now_ist().strftime("%Y-%m-%d %H:%M:%S %z")
-
-def today_ist_str():
-    return now_ist().date().isoformat()
-
-def sleep_ms(ms: int):
-    time.sleep(max(0, ms) / 1000.0)
-
-def normalize_sku(s: str) -> str:
-    # exact-matching pipeline still trims and lowercases
-    return (s or "").strip().lower()
-
-def gid_num(gid: str) -> str:
-    return (gid or "").split("/")[-1]
+def now_ist(): return datetime.now(timezone(timedelta(hours=5, minutes=30)))
+def now_ist_str(): return now_ist().strftime("%Y-%m-%d %H:%M:%S %z")
+def today_ist_str(): return now_ist().date().isoformat()
+def sleep_ms(ms: int): time.sleep(max(0, ms) / 1000.0)
+def normalize_sku(s: str) -> str: return (s or "").strip().lower()
+def gid_num(gid: str) -> str: return (gid or "").split("/")[-1]
 
 def load_json(path: str, default):
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
+        with open(path, "r", encoding="utf-8") as f: return json.load(f)
+    except Exception: return default
 
 def save_json(path: str, obj):
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2)
+    with open(tmp, "w", encoding="utf-8") as f: json.dump(obj, f, indent=2)
     os.replace(tmp, path)
 
 def ensure_log_header():
     need_csv = (not os.path.exists(LOG_CSV)) or (os.path.getsize(LOG_CSV) == 0)
     if need_csv:
         with open(LOG_CSV, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["ts","phase","shop","note","product_id","variant_id","sku","delta","message"])
-    # JSONL file will just append dicts
+            csv.writer(f).writerow(["ts","phase","shop","note","product_id","variant_id","sku","delta","message"])
 
-def log_row(phase: str, shop: str, note: str, product_id="", variant_id="", sku="", delta="", message="", title="", before="", after="", collections=""):
+def log_row(phase:str, shop:str, note:str, product_id="", variant_id="", sku="", delta="", message="", title="", before="", after="", collections=""):
     ensure_log_header()
     ts = now_ist_str()
-    row = [ts, phase, shop, note, product_id, variant_id, sku, delta, message]
     if LOG_TO_STDOUT:
-        # Pretty single-line
         emoji = {
-            "INDEX_BUILT": "🗂️",
-            "APPLIED_DELTA": "🔁",
-            "IGNORED_INCREASE": "🙅‍♂️➕",
-            "SALES_BUMP": "🧾➖",
-            "RESTOCK": "📦➕",
-            "CLAMP_TO_ZERO": "🧰0️⃣",
-            "WARN": "⚠️",
-            "STATUS_TO_DRAFT": "🟥",
-            "STATUS_TO_ACTIVE": "🟩",
+            "INDEX_BUILT": "🗂️", "APPLIED_DELTA": "🔁", "IGNORED_INCREASE": "🙅‍♂️➕",
+            "SALES_BUMP": "🧾➖", "RESTOCK": "📦➕", "CLAMP_TO_ZERO": "🧰0️⃣",
+            "WARN": "⚠️", "STATUS_TO_DRAFT": "🟥", "STATUS_TO_ACTIVE": "🟩",
         }.get(note, "•")
         print(f"{emoji} {phase} {note} [SKU {sku}] pid={product_id} vid={variant_id} {before}→{after} Δ{delta} “{title}” — {message}", flush=True)
     with open(LOG_CSV, "a", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow(row)
+        csv.writer(f).writerow([ts,phase,shop,note,product_id,variant_id,sku,delta,message])
     try:
         with open(LOG_JSONL, "a", encoding="utf-8") as jf:
             jf.write(json.dumps({
@@ -237,32 +195,29 @@ def log_row(phase: str, shop: str, note: str, product_id="", variant_id="", sku=
 def _as_int_or_none(v):
     try:
         if v is None: return None
-        if isinstance(v, (int, float)): return int(v)
+        if isinstance(v,(int,float)): return int(v)
         s = str(v).strip()
-        if s == "" or s == "-": return None
+        if s in ("","-"): return None
         return int(s)
     except Exception:
         return None
 
-# ---------- State (first-cycle flag) ----------
+# ---------- State ----------
 def load_state():
     try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"initialized": False}
+        with open(STATE_PATH, "r", encoding="utf-8") as f: return json.load(f)
+    except Exception: return {"initialized": False}
 
 def save_state(obj):
     tmp = STATE_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2)
+    with open(tmp, "w", encoding="utf-8") as f: json.dump(obj, f, indent=2)
     os.replace(tmp, STATE_PATH)
 
-# ---------- GraphQL queries (FIXED: no ternary in query; pass $query variable) ----------
+# ---------- GraphQL (no collection-level query arg) ----------
 QUERY_COLLECTION_PAGE_IN = """
-query ($handle:String!, $cursor:String, $query:String) {
+query ($handle:String!, $cursor:String) {
   collectionByHandle(handle:$handle){
-    products(first: 60, after:$cursor, query:$query){
+    products(first: 60, after:$cursor){
       pageInfo{ hasNextPage endCursor }
       nodes{
         id title status
@@ -285,12 +240,12 @@ query ($handle:String!, $cursor:String, $query:String) {
 """
 
 QUERY_COLLECTION_PAGE_US = """
-query ($handle:String!, $cursor:String, $query:String) {
+query ($handle:String!, $cursor:String) {
   collectionByHandle(handle:$handle){
-    products(first: 60, after:$cursor, query:$query){
+    products(first: 60, after:$cursor){
       pageInfo{ hasNextPage endCursor }
       nodes{
-        id title
+        id title status
         variants(first: 100){
           nodes{
             id sku inventoryQuantity
@@ -315,23 +270,18 @@ query ($q:String!){
 }
 """
 
-# ----- India behavior (product-level availability + metafields/sales) -----
+# ---------- IN helpers ----------
 def compute_product_availability(variants: List[dict], include_untracked: bool) -> int:
-    total = 0
-    counted = False
+    total = 0; counted = False
     for v in variants:
         tracked = bool(((v.get("inventoryItem") or {}).get("tracked")))
         qty = int(v.get("inventoryQuantity") or 0)
         if include_untracked or tracked:
-            counted = True
-            total += qty
+            counted = True; total += qty
     return total if counted else 0
 
 def desired_state(avail: int) -> Tuple[str, str, str]:
-    if avail > 0:
-        return ("ACTIVE", BADGE_READY, DELIVERY_READY)
-    else:
-        return ("DRAFT", "", DELIVERY_MTO)
+    return ("ACTIVE", BADGE_READY, DELIVERY_READY) if avail > 0 else ("DRAFT", "", DELIVERY_MTO)
 
 MUTATION_PRODUCT_UPDATE = """
 mutation ProductUpdate($input: ProductInput!) {
@@ -346,17 +296,13 @@ def update_product_status(domain: str, token: str, product_gid: str, target_stat
     data = gql(domain, token, MUTATION_PRODUCT_UPDATE, {"input": {"id": product_gid, "status": target_status}})
     errs = ((data.get("productUpdate") or {}).get("userErrors") or [])
     if errs:
-        log_row("IN", "IN", "WARN", product_id=gid_num(product_gid), message=str(errs))
-        return False
-    time.sleep(MUTATION_SLEEP_SEC)
-    return True
+        log_row("IN", "IN", "WARN", product_id=gid_num(product_gid), message=str(errs)); return False
+    time.sleep(MUTATION_SLEEP_SEC); return True
 
 def set_product_metafields_in(domain:str, token:str, product_gid:str, badges_node:dict, dtime_node:dict,
                               target_badge:str, target_delivery:str, title:str="", sku:str="", pid:str=""):
-    # Respect existing definition types; fallback to safe defaults
     btype = (badges_node or {}).get("type") or "single_line_text_field"
     dtype = (dtime_node or {}).get("type") or "single_line_text_field"
-
     mutation = """
     mutation($metafields:[MetafieldsSetInput!]!){
       metafieldsSet(metafields:$metafields){
@@ -385,10 +331,8 @@ def bump_sales_in(domain:str, token:str, product_gid:str, sales_total_node:dict,
                   sku:str="", pid:str="", title:str=""):
     st_type = (sales_total_node or {}).get("type") or "number_integer"
     sd_type = (sales_dates_node or {}).get("type") or "list.date"
-    try:
-        current = int((sales_total_node or {}).get("value") or "0")
-    except Exception:
-        current = 0
+    try: current = int((sales_total_node or {}).get("value") or "0")
+    except Exception: current = 0
     new_total = current + int(sold)
     if sd_type == "list.date":
         existing = []
@@ -397,8 +341,7 @@ def bump_sales_in(domain:str, token:str, product_gid:str, sales_total_node:dict,
             existing = json.loads(raw) if isinstance(raw,str) and raw.startswith("[") else []
         except Exception:
             existing = []
-        if today not in existing:
-            existing.append(today)
+        if today not in existing: existing.append(today)
         dates_val = json.dumps(sorted(set(existing))[-365:])
         sd_payload = {"ownerId": product_gid,"namespace":MF_NAMESPACE,"key":KEY_DATES,"type":"list.date","value":dates_val}
     else:
@@ -422,14 +365,9 @@ def compute_availability_and_title(p: dict, include_untracked: bool) -> Tuple[in
     return avail, title
 
 def clamp_to_zero_if_needed(domain: str, token: str, product_node: dict, pid_num: str, current_avail: int, sku: str, title: str):
-    """If avail < 0 and CLAMP_AVAIL_TO_ZERO=1 → raise to 0 and log; return (new_avail, was_clamped)."""
-    if not CLAMP_AVAIL_TO_ZERO or current_avail >= 0:
-        return current_avail, False
-    # Pick first variant's inventory_item_id to adjust by +abs(current_avail)
+    if not CLAMP_AVAIL_TO_ZERO or current_avail >= 0: return current_avail, False
     variants = ((product_node.get("variants") or {}).get("nodes") or [])
-    if not variants:
-        return current_avail, False
-    # sum is negative; raise total to zero by adding +abs(total) to the FIRST variant found
+    if not variants: return current_avail, False
     need = -current_avail
     inv_item_gid = ((variants[0].get("inventoryItem") or {}).get("id") or "")
     inv_item_id = int(gid_num(inv_item_gid) or "0")
@@ -443,76 +381,68 @@ def clamp_to_zero_if_needed(domain: str, token: str, product_node: dict, pid_num
             time.sleep(MUTATION_SLEEP_SEC)
             return 0, True
         except Exception as e:
-            log_row("IN", "IN", "WARN", product_id=pid_num, sku=sku, title=title,
-                    message=f"Clamp to zero failed: {e}")
+            log_row("IN", "IN", "WARN", product_id=pid_num, sku=sku, title=title, message=f"Clamp to zero failed: {e}")
     return current_avail, False
 
+# ---------- IN scan ----------
 def scan_india_and_update(read_only: bool = False):
     last_seen: Dict[str,int] = load_json(IN_LAST_SEEN, {})
     today = today_ist_str()
 
-    # Build/refresh IN exact index: custom.sku -> (inventory_item_id, product_id, title)
+    # Build/refresh IN index (exact custom.sku)
     idx: Dict[str, Dict[str, Any]] = {}
     for handle in IN_COLLECTIONS:
         cursor = None
         while True:
-            vars_in = {"handle": handle, "cursor": cursor, "query": ("status:active" if ONLY_ACTIVE_FOR_MAPPING else None)}
-            data = gql(IN_DOMAIN, IN_TOKEN, QUERY_COLLECTION_PAGE_IN, vars_in)
+            data = gql(IN_DOMAIN, IN_TOKEN, QUERY_COLLECTION_PAGE_IN, {"handle": handle, "cursor": cursor})
             coll = data.get("collectionByHandle")
             if not coll:
-                log_row("IN", "IN", "WARN", message=f"Collection not found: {handle}")
-                break
+                log_row("IN", "IN", "WARN", message=f"Collection not found: {handle}"); break
             prods = ((coll.get("products") or {}).get("nodes") or [])
             pageInfo = ((coll.get("products") or {}).get("pageInfo") or {})
             for p in prods:
-                pid = gid_num(p["id"])
-                title = p.get("title") or ""
+                if ONLY_ACTIVE_FOR_MAPPING and (p.get("status","").upper()!="ACTIVE"):  # client-side filter
+                    continue
+                pid = gid_num(p["id"]); title = p.get("title") or ""
                 sku_val = (((p.get("skuMeta") or {}).get("value")) or "").strip()
                 if sku_val:
                     sku_norm = normalize_sku(sku_val)
-                    # choose first variant's inventoryItem as representative for CLAMP
                     variants = ((p.get("variants") or {}).get("nodes") or [])
                     inv_item_id = 0
                     if variants:
                         inv_item_id = int(gid_num(((variants[0].get("inventoryItem") or {}).get("id") or "")) or "0")
                     idx[sku_norm] = {"inventory_item_id": inv_item_id, "product_id": pid, "title": title}
-            sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
+                sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
             if pageInfo.get("hasNextPage"):
                 cursor = pageInfo.get("endCursor"); sleep_ms(SLEEP_BETWEEN_PAGES_MS)
-            else:
-                break
+            else: break
     save_json(IN_SKU_INDEX, idx)
     log_row("IN", "IN", "INDEX_BUILT", message=f"entries={len(idx)}")
 
-    # Now walk through IN again to apply sales bump, metafields, status toggle, clamp
+    # Apply sales/metafields/status/clamp
     for handle in IN_COLLECTIONS:
         cursor = None
         while True:
-            vars_in = {"handle": handle, "cursor": cursor, "query": ("status:active" if ONLY_ACTIVE_FOR_MAPPING else None)}
-            data = gql(IN_DOMAIN, IN_TOKEN, QUERY_COLLECTION_PAGE_IN, vars_in)
+            data = gql(IN_DOMAIN, IN_TOKEN, QUERY_COLLECTION_PAGE_IN, {"handle": handle, "cursor": cursor})
             coll = data.get("collectionByHandle")
-            if not coll:
-                break
+            if not coll: break
             prods = ((coll.get("products") or {}).get("nodes") or [])
             pageInfo = ((coll.get("products") or {}).get("pageInfo") or {})
             for p in prods:
+                if ONLY_ACTIVE_FOR_MAPPING and (p.get("status","").upper()!="ACTIVE"):
+                    continue
                 pid = gid_num(p["id"])
                 sku_val = (((p.get("skuMeta") or {}).get("value")) or "").strip()
-                sku_norm = normalize_sku(sku_val)
                 avail, title = compute_availability_and_title(p, IN_INCLUDE_UNTRACKED)
 
-                # Clamp if negative (and set last_seen=0)
+                # Clamp negatives (and set last_seen=0)
                 if not read_only and avail < 0 and CLAMP_AVAIL_TO_ZERO:
-                    pre_avail = avail
                     avail, did = clamp_to_zero_if_needed(IN_DOMAIN, IN_TOKEN, p, pid, avail, sku_val, title)
-                    if did:
-                        last_seen[pid] = 0  # ensure never negative
-                        # continue to next logic with avail==0
+                    if did: last_seen[pid] = 0
 
                 prev = _as_int_or_none(last_seen.get(pid))
                 if prev is None:
-                    last_seen[pid] = max(0, int(avail))  # never store negative
-                    # No log needed here; first pass learning
+                    last_seen[pid] = max(0, int(avail))
                 else:
                     diff = int(avail) - int(prev)
                     if not read_only and diff < 0:
@@ -521,16 +451,15 @@ def scan_india_and_update(read_only: bool = False):
                         log_row("IN", "IN", "SALES_BUMP",
                                 product_id=pid, sku=sku_val, delta=diff,
                                 message=f"avail {prev}->{avail} (sold={-diff})", title=title, before=str(prev), after=str(avail))
-                    # Update last_seen (never negative)
                     last_seen[pid] = max(0, int(avail))
 
-                # badges/delivery every time UNLESS first global cycle (read_only)
+                # badges/delivery
                 _, target_badge, target_delivery = desired_state(avail)
                 if not read_only:
                     set_product_metafields_in(IN_DOMAIN, IN_TOKEN, p["id"], p.get("badges") or {}, p.get("dtime") or {},
                                               target_badge, target_delivery, title=title, sku=sku_val, pid=pid)
 
-                # SPECIAL STATUS RULE (symmetric) for the special collection
+                # SPECIAL STATUS RULE
                 if (not read_only) and IN_CHANGE_STATUS and (handle == SPECIAL_STATUS_HANDLE):
                     current_status = (p.get("status") or "").upper()
                     if avail < 1 and current_status == "ACTIVE":
@@ -547,14 +476,12 @@ def scan_india_and_update(read_only: bool = False):
             save_json(IN_LAST_SEEN, {k:int(v) for k,v in last_seen.items()})
             if pageInfo.get("hasNextPage"):
                 cursor = pageInfo.get("endCursor"); sleep_ms(SLEEP_BETWEEN_PAGES_MS)
-            else:
-                break
+            else: break
 
-# ----- USA behavior (variant-level deltas → adjust India by exact product.custom.sku) -----
+# ---------- US scan (mirror decreases only) ----------
 def find_in_index_by_sku_exact(sku_val: str) -> Optional[Dict[str, Any]]:
     idx = load_json(IN_SKU_INDEX, {})
-    entry = idx.get(normalize_sku(sku_val))
-    return entry
+    return idx.get(normalize_sku(sku_val))
 
 def scan_usa_and_mirror_to_india(read_only: bool = False):
     last_seen: Dict[str,int] = load_json(US_LAST_SEEN, {})
@@ -562,20 +489,19 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
     for handle in US_COLLECTIONS:
         cursor = None
         while True:
-            vars_us = {"handle": handle, "cursor": cursor, "query": ("status:active" if ONLY_ACTIVE_FOR_MAPPING else None)}
-            data = gql(US_DOMAIN, US_TOKEN, QUERY_COLLECTION_PAGE_US, vars_us)
+            data = gql(US_DOMAIN, US_TOKEN, QUERY_COLLECTION_PAGE_US, {"handle": handle, "cursor": cursor})
             coll = data.get("collectionByHandle")
             if not coll:
-                log_row("US", "US", "WARN", message=f"Collection not found: {handle}")
-                break
+                log_row("US", "US", "WARN", message=f"Collection not found: {handle}"); break
             prods = ((coll.get("products") or {}).get("nodes") or [])
             pageInfo = ((coll.get("products") or {}).get("pageInfo") or {})
             for p in prods:
+                if ONLY_ACTIVE_FOR_MAPPING and (p.get("status","").upper()!="ACTIVE"):
+                    continue
                 title = p.get("title") or ""
                 prod_sku = ((((p.get("skuMeta") or {}).get("value")) or "").strip())
                 for v in ((p.get("variants") or {}).get("nodes") or []):
-                    vgid = v.get("id")
-                    vid = gid_num(vgid)
+                    vgid = v.get("id"); vid = gid_num(vgid)
                     raw_sku = v.get("sku") or prod_sku or ""
                     qty = int(v.get("inventoryQuantity") or 0)
 
@@ -618,10 +544,9 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
             save_json(US_LAST_SEEN, {k:int(v) for k,v in last_seen.items()})
             if pageInfo.get("hasNextPage"):
                 cursor = pageInfo.get("endCursor"); sleep_ms(SLEEP_BETWEEN_PAGES_MS)
-            else:
-                break
+            else: break
 
-# ---------- Scheduler loop ----------
+# ---------- Scheduler ----------
 from threading import Thread, Lock
 run_lock = Lock()
 is_running = False
@@ -629,36 +554,27 @@ is_running = False
 def run_cycle():
     global is_running
     with run_lock:
-        if is_running:
-            return "busy"
+        if is_running: return "busy"
         is_running = True
     try:
-        # Decide if this is the very first global cycle (read-only)
         state = load_state()
         in_seen = load_json(IN_LAST_SEEN, {})
         us_seen = load_json(US_LAST_SEEN, {})
-        first_cycle = (not state.get("initialized", False)) and (len(in_seen) == 0 and len(us_seen) == 0)
+        first_cycle = (not state.get("initialized", False)) and (len(in_seen)==0 and len(us_seen)==0)
 
-        # India first (index build + sales/metafields/status/clamp)
         scan_india_and_update(read_only=first_cycle)
         sleep_ms(SLEEP_BETWEEN_SHOPS_MS)
-
-        # USA second (mirror variant deltas → IN)
         scan_usa_and_mirror_to_india(read_only=first_cycle)
 
-        # Mark initialized after the first full cycle completes
         if first_cycle:
             state["initialized"] = True
             save_state(state)
             log_row("SCHED", "BOTH", "FIRST_CYCLE_DONE", message="Baselines learned; future cycles will apply deltas")
-
         return "ok"
     except Exception as e:
-        log_row("SCHED", "BOTH", "WARN", message=str(e))
-        return "error"
+        log_row("SCHED", "BOTH", "WARN", message=str(e)); return "error"
     finally:
-        with run_lock:
-            is_running = False
+        with run_lock: is_running = False
 
 # ---------- Flask ----------
 app = Flask(__name__)
@@ -670,8 +586,7 @@ def _cors(resp):
     return resp
 
 @app.route("/health", methods=["GET"])
-def health():
-    return "ok", 200
+def health(): return "ok", 200
 
 @app.route("/diag", methods=["GET"])
 def diag():
@@ -697,19 +612,15 @@ def diag():
 @app.route("/run", methods=["POST"])
 def run_now():
     key = (request.args.get("key") or request.form.get("key") or "").strip()
-    if key != PIXEL_SHARED_SECRET:
-        return _cors(make_response(("forbidden", 403)))
+    if key != PIXEL_SHARED_SECRET: return _cors(make_response(("forbidden", 403)))
     status = run_cycle()
     return _cors(jsonify({"status": status})), 200 if status == "ok" else 409
 
 def scheduler_loop():
-    if RUN_EVERY_MIN <= 0:
-        return
+    if RUN_EVERY_MIN <= 0: return
     while True:
-        try:
-            run_cycle()
-        except Exception as e:
-            log_row("SCHED", "BOTH", "WARN", message=str(e))
+        try: run_cycle()
+        except Exception as e: log_row("SCHED", "BOTH", "WARN", message=str(e))
         time.sleep(max(1, RUN_EVERY_MIN) * 60)
 
 if ENABLE_SCHEDULER:
