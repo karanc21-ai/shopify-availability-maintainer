@@ -3,6 +3,7 @@
 
 """
 Dual-site availability sync — Render-friendly, exact SKU index, list/single metafield safe.
+Includes robust fallback for US clamp-to-zero to avoid REST 422 (connect + set).
 
 ENV VARS (set on Web Service and Worker, except where noted):
 - API_VERSION=2024-10
@@ -16,8 +17,8 @@ India shop (receives deltas + metafields):
 - IN_TOKEN=shpat_*************************
 - IN_LOCATION_ID=57791840446
 - IN_COLLECTION_HANDLES=gold-plated,another-collection
-- IN_INCLUDE_UNTRACKED=0|1                # default 0
-- IN_CHANGE_STATUS=1                      # to flip ACTIVE<->DRAFT for special hadle
+- IN_INCLUDE_UNTRACKED=0|1
+- IN_CHANGE_STATUS=1
 - SPECIAL_STATUS_HANDLE=budget-gold-plated-jewelry-premium-jadau-ornaments-on-mix-metal-base
 
 USA shop (source of deltas):
@@ -37,7 +38,8 @@ Behavior toggles:
 - USE_PRODUCT_CUSTOM_SKU=1                # exact SKU mapping via product metafield custom.sku
 - ONLY_ACTIVE_FOR_MAPPING=1               # index only ACTIVE products for SKU→inventory_item_id
 - MIRROR_US_INCREASES=0                   # ignore US quantity increases
-- CLAMP_AVAIL_TO_ZERO=1                   # after counting sales, raise <0 to 0
+- CLAMP_AVAIL_TO_ZERO=1                   # INDIA: after counting sales, raise <0 to 0
+- CLAMP_US_NEGATIVES_TO_ZERO=1            # NEW: also clamp US negatives to 0 (with 422-safe fallback)
 
 Pacing:
 - MUTATION_SLEEP_SEC=0.35
@@ -52,15 +54,16 @@ Logging:
 
 Notes
 - First global cycle is read-only: learns baselines, builds IN SKU index. No writes.
-- After that, India scan:
-    * compute availability (tracked-only by default)
+- India scan:
+    * compute availability
     * if new_avail < last_seen → SALES_BUMP (+ sales_dates)
     * if new_avail < 0 and CLAMP_AVAIL_TO_ZERO=1 → REST adjust to raise to 0
-    * set badges/delivery 每次 (list/single safe)
+    * set badges/delivery each time (list/single safe)
     * optional SPECIAL_STATUS_HANDLE ACTIVE<->DRAFT
   USA scan:
     * when variant qty decreases, find India product by exact product custom.sku and apply delta
     * increases ignored if MIRROR_US_INCREASES=0
+    * if US qty < 0 and CLAMP_US_NEGATIVES_TO_ZERO=1 → clamp to 0
 - last_seen is guaranteed non-negative (never store <0)
 """
 
@@ -115,6 +118,7 @@ USE_PRODUCT_CUSTOM_SKU = os.getenv("USE_PRODUCT_CUSTOM_SKU","1") == "1"
 ONLY_ACTIVE_FOR_MAPPING = os.getenv("ONLY_ACTIVE_FOR_MAPPING","1") == "1"
 MIRROR_US_INCREASES = os.getenv("MIRROR_US_INCREASES","0") == "1"
 CLAMP_AVAIL_TO_ZERO = os.getenv("CLAMP_AVAIL_TO_ZERO","1") == "1"
+CLAMP_US_NEGATIVES_TO_ZERO = os.getenv("CLAMP_US_NEGATIVES_TO_ZERO","1") == "1"
 
 # Persistence
 DATA_DIR = os.getenv("DATA_DIR",".").rstrip("/")
@@ -149,11 +153,9 @@ def gql(domain: str, token: str, query: str, variables: dict = None) -> dict:
             raise RuntimeError(f"GraphQL HTTP {r.status_code}: {r.text}")
         data = r.json()
         if data.get("errors"):
-            # throttle or others
             if any(((e.get("extensions") or {}).get("code","").upper()=="THROTTLED") for e in data["errors"]):
                 time.sleep(_backoff(attempt, base=0.4))
                 continue
-            # dump helpful context
             log_row("⚠️","GQL","ERRORS", message=json.dumps(data["errors"]), extra={"LAST_QUERY":query[:800]})
             raise RuntimeError(f"GraphQL errors: {data['errors']}")
         return data["data"]
@@ -169,6 +171,29 @@ def rest_adjust_inventory(domain: str, token: str, inventory_item_id: int, locat
             continue
         if r.status_code >= 400:
             raise RuntimeError(f"REST adjust {r.status_code}: {r.text}")
+        return
+
+# NEW: set & connect helpers for 422 fallback
+def rest_set_inventory(domain: str, token: str, inventory_item_id: int, location_id: int, available: int) -> None:
+    url = f"https://{domain}/admin/api/{API_VERSION}/inventory_levels/set.json"
+    payload = {"inventory_item_id": int(inventory_item_id), "location_id": int(location_id), "available": int(available)}
+    for attempt in range(1, 5):
+        r = requests.post(url, headers=hdr(token), json=payload, timeout=30)
+        if r.status_code == 429 or r.status_code >= 500:
+            time.sleep(_backoff(attempt, base=0.3, mx=8.0)); continue
+        if r.status_code >= 400:
+            raise RuntimeError(f"REST set {r.status_code}: {r.text}")
+        return
+
+def rest_connect_inventory(domain: str, token: str, inventory_item_id: int, location_id: int) -> None:
+    url = f"https://{domain}/admin/api/{API_VERSION}/inventory_levels/connect.json"
+    payload = {"inventory_item_id": int(inventory_item_id), "location_id": int(location_id)}
+    for attempt in range(1, 5):
+        r = requests.post(url, headers=hdr(token), json=payload, timeout=30)
+        if r.status_code == 429 or r.status_code >= 500:
+            time.sleep(_backoff(attempt, base=0.3, mx=8.0)); continue
+        if r.status_code >= 400:
+            raise RuntimeError(f"REST connect {r.status_code}: {r.text}")
         return
 
 # --------------- Utils ---------------
@@ -195,6 +220,9 @@ def save_json(path: str, obj):
     tmp=path+".tmp"
     with open(tmp,"w",encoding="utf-8") as f: json.dump(obj,f,indent=2)
     os.replace(tmp,path)
+
+def normalize_sku(s: str) -> str:
+    return (s or "").strip()
 
 # logging
 def ensure_log_header():
@@ -320,7 +348,7 @@ def set_product_metafields(domain:str, token:str, product_gid:str,
 
     mf_inputs = []
 
-    # badges: handle list vs single safely
+    # badges (list vs single)
     if target_badge:
         if str(badges_type).startswith("list."):
             mf_inputs.append({
@@ -333,12 +361,11 @@ def set_product_metafields(domain:str, token:str, product_gid:str,
                 "type": badges_type, "value": target_badge
             })
     else:
-        # clear if exists
         if (badges_node or {}).get("id"):
             delm = "mutation($id:ID!){ metafieldDelete(input:{id:$id}){ userErrors{message} } }"
             gql(domain, token, delm, {"id": badges_node["id"]})
 
-    # delivery time (scalar on your store)
+    # delivery time
     mf_inputs.append({
         "ownerId": product_gid, "namespace": MF_NAMESPACE, "key": MF_DELIVERY_KEY,
         "type": delivery_type, "value": target_delivery
@@ -354,29 +381,21 @@ def set_product_metafields(domain:str, token:str, product_gid:str,
 def bump_sales_in(domain:str, token:str, product_gid:str,
                   sales_total_node:dict, sales_dates_node:dict,
                   sold:int, today:str):
-    """
-    Increments sales_total and stamps sales_dates using the store's real metafield types.
-    - sales_total: supports number_integer or text-like; writes str(new_total)
-    - sales_dates: supports list.date or date (or text fallback); writes correct shape
-    """
-    # Resolve types from nodes or definitions
+    # Resolve types
     st_type = (sales_total_node or {}).get("type") or \
               get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, KEY_SALES) or \
               "number_integer"
-
     sd_type = (sales_dates_node or {}).get("type") or \
               get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, KEY_DATES) or \
               "date"
 
-    # Current sales_total
-    try:
-        current_total = int((sales_total_node or {}).get("value") or "0")
-    except Exception:
-        current_total = 0
+    # Current total
+    try: current_total = int((sales_total_node or {}).get("value") or "0")
+    except Exception: current_total = 0
     new_total = current_total + int(sold)
 
-    # Build sales_dates payload matching the definition
-    if sd_type.startswith("list."):  # e.g., list.date
+    # Dates payload
+    if sd_type.startswith("list."):  # list.date
         existing = []
         raw = (sales_dates_node or {}).get("value")
         try:
@@ -386,32 +405,12 @@ def bump_sales_in(domain:str, token:str, product_gid:str,
             existing = []
         if today not in existing:
             existing.append(today)
-        sd_payload = {
-            "ownerId": product_gid,
-            "namespace": MF_NAMESPACE,
-            "key": KEY_DATES,
-            "type": "list.date",
-            "value": json.dumps(sorted(set(existing))[-365:])
-        }
+        sd_payload = {"ownerId": product_gid,"namespace":MF_NAMESPACE,"key":KEY_DATES,"type":"list.date","value": json.dumps(sorted(set(existing))[-365:])}
     elif sd_type == "date":
-        sd_payload = {
-            "ownerId": product_gid,
-            "namespace": MF_NAMESPACE,
-            "key": KEY_DATES,
-            "type": "date",
-            "value": today
-        }
+        sd_payload = {"ownerId": product_gid,"namespace":MF_NAMESPACE,"key":KEY_DATES,"type":"date","value":today}
     else:
-        # Fallback for text-like definitions
-        sd_payload = {
-            "ownerId": product_gid,
-            "namespace": MF_NAMESPACE,
-            "key": KEY_DATES,
-            "type": sd_type,
-            "value": today
-        }
+        sd_payload = {"ownerId": product_gid,"namespace":MF_NAMESPACE,"key":KEY_DATES,"type":sd_type,"value":today}
 
-    # Write both metafields
     mutation = """
     mutation($mfs:[MetafieldsSetInput!]!){
       metafieldsSet(metafields:$mfs){
@@ -419,8 +418,7 @@ def bump_sales_in(domain:str, token:str, product_gid:str,
       }
     }"""
     mfs = [
-        {"ownerId": product_gid, "namespace": MF_NAMESPACE, "key": KEY_SALES,
-         "type": st_type, "value": str(new_total)},
+        {"ownerId": product_gid,"namespace":MF_NAMESPACE,"key":KEY_SALES,"type":st_type,"value":str(new_total)},
         sd_payload
     ]
     data = gql(domain, token, mutation, {"mfs": mfs})
@@ -446,8 +444,7 @@ def build_in_sku_index():
                     continue
                 sku = (((p.get("metafield") or {}).get("value")) or "").strip()
                 if not sku: continue
-                sku_key = sku.strip()  # exact key, no normalization
-                # choose the first variant's inventory_item_id as authoritative for clamping/adjust
+                sku_key = sku.strip()  # exact key
                 variants = ((p.get("variants") or {}).get("nodes") or [])
                 if not variants: continue
                 inv_item_gid = (((variants[0].get("inventoryItem") or {}).get("id")) or "")
@@ -491,17 +488,14 @@ def scan_india_and_update(read_only: bool = False):
                 variants = ((p.get("variants") or {}).get("nodes") or [])
                 avail = compute_product_availability(variants, IN_INCLUDE_UNTRACKED)
 
-                # last_seen is never negative
                 prev = _as_int_or_none(last_seen.get(pid))
                 if prev is None: prev = 0
 
-                # sales detection & clamping
                 if not read_only and avail < prev:
                     sold = prev - avail
                     bump_sales_in(IN_DOMAIN, IN_TOKEN, p["id"], p.get("salesTotal") or {}, p.get("salesDates") or {}, sold, today)
                     log_row("🧾➖","IN","SALES_BUMP", product_id=pid, sku=sku, delta=f"-{sold}", message=f"avail {prev}->{avail} (sold={sold})", title=title, before=str(prev), after=str(avail))
 
-                # clamp <0 → 0 (after counting sales); update last_seen accordingly to 0
                 if not read_only and CLAMP_AVAIL_TO_ZERO and avail < 0 and variants:
                     inv_item_gid = (((variants[0].get("inventoryItem") or {}).get("id")) or "")
                     inv_item_id = int(gid_num(inv_item_gid) or "0")
@@ -512,7 +506,6 @@ def scan_india_and_update(read_only: bool = False):
                     except Exception as e:
                         log_row("⚠️","IN","WARN", product_id=pid, sku=sku, message=f"Clamp error: {e}")
 
-                # desired badges/delivery & optional status flip
                 _, target_badge, target_delivery = desired_state(avail)
                 if not read_only:
                     set_product_metafields(IN_DOMAIN, IN_TOKEN, p["id"], p.get("badges") or {}, p.get("dtime") or {}, target_badge, target_delivery)
@@ -525,9 +518,7 @@ def scan_india_and_update(read_only: bool = False):
                         ok = update_product_status(IN_DOMAIN, IN_TOKEN, p["id"], "ACTIVE")
                         log_row("✅","IN","STATUS_TO_ACTIVE" if ok else "STATUS_TO_ACTIVE_FAILED", product_id=pid, sku=sku, delta=str(avail), title=title, message=f"handle={handle}")
 
-                # update last_seen (never negative)
                 last_seen[pid] = max(0, int(avail))
-
                 sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
 
             save_json(IN_LAST_SEEN, last_seen)
@@ -537,120 +528,76 @@ def scan_india_and_update(read_only: bool = False):
             else:
                 break
 
-# --------------- USA scan → mirror to India ---------------
+# --------------- USA scan → mirror to India + clamp US negatives ---------------
 def scan_usa_and_mirror_to_india(read_only: bool = False):
-    """
-    Mirrors US decreases to IN using exact product custom.sku via the IN index.
-    After computing/applying the delta, if a US variant's qty is negative and
-    CLAMP_AVAIL_TO_ZERO=1, we raise it to 0 on the US location as well, and
-    persist last_seen=0 (never store negatives).
-    """
     last_seen: Dict[str,int] = load_json(US_LAST_SEEN, {})
     in_index: Dict[str,Any] = load_json(IN_SKU_INDEX, {})
 
     for handle in US_COLLECTIONS:
-        cursor = None
+        cursor=None
         while True:
             data = gql(US_DOMAIN, US_TOKEN, QUERY_COLLECTION_PAGE_US, {"handle": handle, "cursor": cursor})
             coll = data.get("collectionByHandle")
-            if not coll:
-                break
+            if not coll: break
             prods = ((coll.get("products") or {}).get("nodes") or [])
             pageInfo = ((coll.get("products") or {}).get("pageInfo") or {})
-
             for p in prods:
                 p_sku = (((p.get("metafield") or {}).get("value")) or "").strip()
                 title = p.get("title") or ""
-
                 for v in ((p.get("variants") or {}).get("nodes") or []):
                     vid = gid_num(v.get("id"))
                     raw_sku = v.get("sku") or p_sku
-                    sku_exact = (raw_sku or "").strip()
+                    sku_exact = normalize_sku(raw_sku)
                     qty = int(v.get("inventoryQuantity") or 0)
+                    inv_item_gid = (((v.get("inventoryItem") or {}).get("id")) or "")
+                    inv_item_id = int(gid_num(inv_item_gid) or "0")
 
                     prev = _as_int_or_none(last_seen.get(vid))
                     if prev is None:
-                        last_seen[vid] = max(0, qty)  # never store negatives
+                        last_seen[vid] = qty
                         continue
 
                     delta = qty - int(prev)
                     if delta == 0:
-                        # Optional: clamp even if no delta (e.g., prev already negative elsewhere)
-                        if not read_only and CLAMP_AVAIL_TO_ZERO and qty < 0:
-                            inv_item_gid = ((v.get("inventoryItem") or {}).get("id") or "")
-                            if inv_item_gid:
-                                try:
-                                    rest_adjust_inventory(US_DOMAIN, US_TOKEN, int(gid_num(inv_item_gid) or "0"), int(US_LOCATION_ID), -qty)
-                                    log_row("🧰0️⃣","US","CLAMP_TO_ZERO_US",
-                                           variant_id=vid, sku=sku_exact, delta=f"+{-qty}", title=title,
-                                           message=f"Raised US availability to 0 on inventory_item_id={gid_num(inv_item_gid)}",
-                                           before=str(qty), after="0")
-                                    qty = 0
-                                except Exception as e:
-                                    log_row("⚠️","US→IN","WARN", variant_id=vid, sku=sku_exact, title=title, message=f"US clamp error: {e}")
-                        last_seen[vid] = max(0, qty)
+                        # still clamp if qty < 0 and allowed
+                        if not read_only and CLAMP_US_NEGATIVES_TO_ZERO and qty < 0 and inv_item_id > 0:
+                            _clamp_us_to_zero(inv_item_id, qty, title, sku_exact, vid)
+                            qty = 0
+                        last_seen[vid] = qty
                         continue
 
-                    # Handle increases
+                    # handle increases
                     if delta > 0:
                         if not MIRROR_US_INCREASES:
-                            log_row("🙅‍♂️➕","US→IN","IGNORED_INCREASE",
-                                   variant_id=vid, sku=sku_exact, delta=str(delta), title=title,
-                                   message="US qty increase; mirroring disabled",
-                                   before=str(prev), after=str(qty))
-                            # Still clamp negatives if present (edge case)
-                            if not read_only and CLAMP_AVAIL_TO_ZERO and qty < 0:
-                                inv_item_gid = ((v.get("inventoryItem") or {}).get("id") or "")
-                                if inv_item_gid:
-                                    try:
-                                        rest_adjust_inventory(US_DOMAIN, US_TOKEN, int(gid_num(inv_item_gid) or "0"), int(US_LOCATION_ID), -qty)
-                                        log_row("🧰0️⃣","US","CLAMP_TO_ZERO_US",
-                                               variant_id=vid, sku=sku_exact, delta=f"+{-qty}", title=title,
-                                               message=f"Raised US availability to 0 on inventory_item_id={gid_num(inv_item_gid)}",
-                                               before=str(qty), after="0")
-                                        qty = 0
-                                    except Exception as e:
-                                        log_row("⚠️","US→IN","WARN", variant_id=vid, sku=sku_exact, title=title, message=f"US clamp error: {e}")
-                            last_seen[vid] = max(0, qty)
+                            log_row("🙅‍♂️➕","US→IN","IGNORED_INCREASE", variant_id=vid, sku=sku_exact, delta=str(delta), title=title, message="US qty increase; mirroring disabled", before=str(prev), after=str(qty))
+                            # also clamp if qty <0 (unlikely with increase)
+                            if not read_only and CLAMP_US_NEGATIVES_TO_ZERO and qty < 0 and inv_item_id > 0:
+                                _clamp_us_to_zero(inv_item_id, qty, title, sku_exact, vid)
+                                qty = 0
+                            last_seen[vid] = qty
                             continue
-                        # else (if you ever enable MIRROR_US_INCREASES=1), apply +delta to IN here.
+                        # (if enabled, you could mirror +delta to IN here)
 
-                    # Decreases (delta < 0) → mirror to India
+                    # decreases (delta < 0) → mirror to India
                     if not read_only and delta < 0 and sku_exact:
                         idx = in_index.get(sku_exact)
                         if not idx:
-                            log_row("⚠️","US→IN","WARN_SKU_NOT_FOUND",
-                                   variant_id=vid, sku=sku_exact, delta=str(delta), title=title,
-                                   message="No matching SKU in India index")
+                            log_row("⚠️","US→IN","WARN_SKU_NOT_FOUND", variant_id=vid, sku=sku_exact, delta=str(delta), title=title, message="No matching SKU in India index")
                         else:
                             in_inv_item_id = int(idx.get("inventory_item_id") or 0)
                             try:
                                 rest_adjust_inventory(IN_DOMAIN, IN_TOKEN, in_inv_item_id, int(IN_LOCATION_ID), delta)
-                                log_row("🔁","US→IN","APPLIED_DELTA",
-                                       variant_id=vid, sku=sku_exact, delta=str(delta), title=title,
-                                       message=f"Adjusted IN inventory_item_id={in_inv_item_id} by {delta} (via EXACT index)",
-                                       before=str(prev), after=str(qty))
+                                log_row("🔁","US→IN","APPLIED_DELTA", variant_id=vid, sku=sku_exact, delta=str(delta), title=title, message=f"Adjusted IN inventory_item_id={in_inv_item_id} by {delta} (via EXACT index)")
                                 time.sleep(MUTATION_SLEEP_SEC)
                             except Exception as e:
-                                log_row("⚠️","US→IN","ERROR_APPLYING_DELTA",
-                                       variant_id=vid, sku=sku_exact, delta=str(delta), title=title, message=str(e))
+                                log_row("⚠️","US→IN","ERROR_APPLYING_DELTA", variant_id=vid, sku=sku_exact, delta=str(delta), title=title, message=str(e))
 
-                    # After delta handling, clamp US negatives to 0 (if enabled)
-                    if not read_only and CLAMP_AVAIL_TO_ZERO and qty < 0:
-                        inv_item_gid = ((v.get("inventoryItem") or {}).get("id") or "")
-                        if inv_item_gid:
-                            try:
-                                rest_adjust_inventory(US_DOMAIN, US_TOKEN, int(gid_num(inv_item_gid) or "0"), int(US_LOCATION_ID), -qty)
-                                log_row("🧰0️⃣","US","CLAMP_TO_ZERO_US",
-                                       variant_id=vid, sku=sku_exact, delta=f"+{-qty}", title=title,
-                                       message=f"Raised US availability to 0 on inventory_item_id={gid_num(inv_item_gid)}",
-                                       before=str(qty), after="0")
-                                qty = 0
-                            except Exception as e:
-                                log_row("⚠️","US→IN","WARN", variant_id=vid, sku=sku_exact, title=title, message=f"US clamp error: {e}")
+                    # after mirroring, if US qty is negative, clamp to zero
+                    if not read_only and CLAMP_US_NEGATIVES_TO_ZERO and qty < 0 and inv_item_id > 0:
+                        _clamp_us_to_zero(inv_item_id, qty, title, sku_exact, vid)
+                        qty = 0
 
-                    # Persist last_seen (never negative)
-                    last_seen[vid] = max(0, qty)
+                    last_seen[vid] = qty
                     sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
 
             save_json(US_LAST_SEEN, last_seen)
@@ -660,6 +607,24 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
             else:
                 break
 
+def _clamp_us_to_zero(inv_item_id: int, qty: int, title: str, sku: str, vid: str):
+    """Try adjust; on 422 fallback to connect+set; log each step."""
+    try:
+        rest_adjust_inventory(US_DOMAIN, US_TOKEN, inv_item_id, int(US_LOCATION_ID), -qty)  # raise to 0
+        log_row("🧰0️⃣","US","CLAMP_TO_ZERO_US", variant_id=vid, sku=sku, delta=f"+{-qty}", title=title, message=f"Raised US availability to 0 on inventory_item_id={inv_item_id}", before=str(qty), after="0")
+    except RuntimeError as e:
+        msg = str(e)
+        log_row("⚠️","US→IN","WARN", variant_id=vid, sku=sku, title=title, message=f"US adjust error: {msg}")
+        if "REST adjust 422" in msg:
+            # try connect then set
+            try:
+                rest_connect_inventory(US_DOMAIN, US_TOKEN, inv_item_id, int(US_LOCATION_ID))
+                log_row("🔌","US","CLAMP_CONNECT", variant_id=vid, sku=sku, title=title, message=f"Connected inventory_item_id={inv_item_id} to US location")
+                time.sleep(MUTATION_SLEEP_SEC)
+                rest_set_inventory(US_DOMAIN, US_TOKEN, inv_item_id, int(US_LOCATION_ID), 0)
+                log_row("🧰0️⃣","US","CLAMP_SET", variant_id=vid, sku=sku, delta=f"+{-qty}", title=title, message=f"Set US availability to 0 on inventory_item_id={inv_item_id}", before=str(qty), after="0")
+            except Exception as e2:
+                log_row("⚠️","US→IN","WARN", variant_id=vid, sku=sku, title=title, message=f"US clamp fallback failed: {e2}")
 
 # --------------- Scheduler / Runner ---------------
 from threading import Thread, Lock
@@ -682,24 +647,20 @@ def run_cycle():
             return "busy"
         is_running = True
     try:
-        # First-cycle detection: if both last_seen files are empty and no index yet
         state = load_state()
         in_seen = load_json(IN_LAST_SEEN, {})
         us_seen = load_json(US_LAST_SEEN, {})
         index   = load_json(IN_SKU_INDEX, {})
         first_cycle = (not state.get("initialized", False)) and (len(in_seen)==0 and len(us_seen)==0)
 
-        # Always (re)build index before scans
         try:
             build_in_sku_index()
         except Exception as e:
             log_row("⚠️","SCHED","WARN", message=str(e))
 
-        # India scan (metafields/sales/clamp)
         scan_india_and_update(read_only=first_cycle)
         sleep_ms(SLEEP_BETWEEN_SHOPS_MS)
 
-        # USA scan (mirror decreases only)
         scan_usa_and_mirror_to_india(read_only=first_cycle)
 
         if first_cycle:
@@ -739,7 +700,8 @@ def diag():
         "use_product_custom_sku": USE_PRODUCT_CUSTOM_SKU,
         "only_active_for_mapping": ONLY_ACTIVE_FOR_MAPPING,
         "mirror_us_increases": MIRROR_US_INCREASES,
-        "clamp_avail_to_zero": CLAMP_AVAIL_TO_ZERO
+        "clamp_avail_to_zero": CLAMP_AVAIL_TO_ZERO,
+        "clamp_us_negatives_to_zero": CLAMP_US_NEGATIVES_TO_ZERO
     }
     return _cors(jsonify(info)), 200
 
