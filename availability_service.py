@@ -17,7 +17,7 @@ India shop (receives deltas + metafields):
 - IN_LOCATION_ID=57791840446
 - IN_COLLECTION_HANDLES=gold-plated,another-collection
 - IN_INCLUDE_UNTRACKED=0|1                # default 0
-- IN_CHANGE_STATUS=1                      # to flip ACTIVE<->DRAFT for special handle
+- IN_CHANGE_STATUS=1                      # to flip ACTIVE<->DRAFT for special hadle
 - SPECIAL_STATUS_HANDLE=budget-gold-plated-jewelry-premium-jadau-ornaments-on-mix-metal-base
 
 USA shop (source of deltas):
