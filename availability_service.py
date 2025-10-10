@@ -539,58 +539,118 @@ def scan_india_and_update(read_only: bool = False):
 
 # --------------- USA scan → mirror to India ---------------
 def scan_usa_and_mirror_to_india(read_only: bool = False):
+    """
+    Mirrors US decreases to IN using exact product custom.sku via the IN index.
+    After computing/applying the delta, if a US variant's qty is negative and
+    CLAMP_AVAIL_TO_ZERO=1, we raise it to 0 on the US location as well, and
+    persist last_seen=0 (never store negatives).
+    """
     last_seen: Dict[str,int] = load_json(US_LAST_SEEN, {})
     in_index: Dict[str,Any] = load_json(IN_SKU_INDEX, {})
 
     for handle in US_COLLECTIONS:
-        cursor=None
+        cursor = None
         while True:
             data = gql(US_DOMAIN, US_TOKEN, QUERY_COLLECTION_PAGE_US, {"handle": handle, "cursor": cursor})
             coll = data.get("collectionByHandle")
-            if not coll: break
+            if not coll:
+                break
             prods = ((coll.get("products") or {}).get("nodes") or [])
             pageInfo = ((coll.get("products") or {}).get("pageInfo") or {})
+
             for p in prods:
                 p_sku = (((p.get("metafield") or {}).get("value")) or "").strip()
                 title = p.get("title") or ""
+
                 for v in ((p.get("variants") or {}).get("nodes") or []):
                     vid = gid_num(v.get("id"))
-                    raw_sku = v.get("sku") or p_sku  # prefer variant sku if present; else product.custom.sku
+                    raw_sku = v.get("sku") or p_sku
                     sku_exact = (raw_sku or "").strip()
                     qty = int(v.get("inventoryQuantity") or 0)
 
                     prev = _as_int_or_none(last_seen.get(vid))
                     if prev is None:
-                        last_seen[vid] = qty
+                        last_seen[vid] = max(0, qty)  # never store negatives
                         continue
 
                     delta = qty - int(prev)
                     if delta == 0:
+                        # Optional: clamp even if no delta (e.g., prev already negative elsewhere)
+                        if not read_only and CLAMP_AVAIL_TO_ZERO and qty < 0:
+                            inv_item_gid = ((v.get("inventoryItem") or {}).get("id") or "")
+                            if inv_item_gid:
+                                try:
+                                    rest_adjust_inventory(US_DOMAIN, US_TOKEN, int(gid_num(inv_item_gid) or "0"), int(US_LOCATION_ID), -qty)
+                                    log_row("🧰0️⃣","US","CLAMP_TO_ZERO_US",
+                                           variant_id=vid, sku=sku_exact, delta=f"+{-qty}", title=title,
+                                           message=f"Raised US availability to 0 on inventory_item_id={gid_num(inv_item_gid)}",
+                                           before=str(qty), after="0")
+                                    qty = 0
+                                except Exception as e:
+                                    log_row("⚠️","US→IN","WARN", variant_id=vid, sku=sku_exact, title=title, message=f"US clamp error: {e}")
+                        last_seen[vid] = max(0, qty)
                         continue
 
-                    # handle increases
+                    # Handle increases
                     if delta > 0:
                         if not MIRROR_US_INCREASES:
-                            log_row("🙅‍♂️➕","US→IN","IGNORED_INCREASE", variant_id=vid, sku=sku_exact, delta=str(delta), title=title, message="US qty increase; mirroring disabled", before=str(prev), after=str(qty))
-                            last_seen[vid] = qty
+                            log_row("🙅‍♂️➕","US→IN","IGNORED_INCREASE",
+                                   variant_id=vid, sku=sku_exact, delta=str(delta), title=title,
+                                   message="US qty increase; mirroring disabled",
+                                   before=str(prev), after=str(qty))
+                            # Still clamp negatives if present (edge case)
+                            if not read_only and CLAMP_AVAIL_TO_ZERO and qty < 0:
+                                inv_item_gid = ((v.get("inventoryItem") or {}).get("id") or "")
+                                if inv_item_gid:
+                                    try:
+                                        rest_adjust_inventory(US_DOMAIN, US_TOKEN, int(gid_num(inv_item_gid) or "0"), int(US_LOCATION_ID), -qty)
+                                        log_row("🧰0️⃣","US","CLAMP_TO_ZERO_US",
+                                               variant_id=vid, sku=sku_exact, delta=f"+{-qty}", title=title,
+                                               message=f"Raised US availability to 0 on inventory_item_id={gid_num(inv_item_gid)}",
+                                               before=str(qty), after="0")
+                                        qty = 0
+                                    except Exception as e:
+                                        log_row("⚠️","US→IN","WARN", variant_id=vid, sku=sku_exact, title=title, message=f"US clamp error: {e}")
+                            last_seen[vid] = max(0, qty)
                             continue
-                        # (if enabled, apply +delta)
+                        # else (if you ever enable MIRROR_US_INCREASES=1), apply +delta to IN here.
 
-                    # decreases (delta < 0) → mirror to India
+                    # Decreases (delta < 0) → mirror to India
                     if not read_only and delta < 0 and sku_exact:
                         idx = in_index.get(sku_exact)
                         if not idx:
-                            log_row("⚠️","US→IN","WARN_SKU_NOT_FOUND", variant_id=vid, sku=sku_exact, delta=str(delta), title=title, message="No matching SKU in India index")
+                            log_row("⚠️","US→IN","WARN_SKU_NOT_FOUND",
+                                   variant_id=vid, sku=sku_exact, delta=str(delta), title=title,
+                                   message="No matching SKU in India index")
                         else:
                             in_inv_item_id = int(idx.get("inventory_item_id") or 0)
                             try:
                                 rest_adjust_inventory(IN_DOMAIN, IN_TOKEN, in_inv_item_id, int(IN_LOCATION_ID), delta)
-                                log_row("🔁","US→IN","APPLIED_DELTA", variant_id=vid, sku=sku_exact, delta=str(delta), title=title, message=f"Adjusted IN inventory_item_id={in_inv_item_id} by {delta} (via EXACT index)")
+                                log_row("🔁","US→IN","APPLIED_DELTA",
+                                       variant_id=vid, sku=sku_exact, delta=str(delta), title=title,
+                                       message=f"Adjusted IN inventory_item_id={in_inv_item_id} by {delta} (via EXACT index)",
+                                       before=str(prev), after=str(qty))
                                 time.sleep(MUTATION_SLEEP_SEC)
                             except Exception as e:
-                                log_row("⚠️","US→IN","ERROR_APPLYING_DELTA", variant_id=vid, sku=sku_exact, delta=str(delta), title=title, message=str(e))
+                                log_row("⚠️","US→IN","ERROR_APPLYING_DELTA",
+                                       variant_id=vid, sku=sku_exact, delta=str(delta), title=title, message=str(e))
 
-                    last_seen[vid] = qty
+                    # After delta handling, clamp US negatives to 0 (if enabled)
+                    if not read_only and CLAMP_AVAIL_TO_ZERO and qty < 0:
+                        inv_item_gid = ((v.get("inventoryItem") or {}).get("id") or "")
+                        if inv_item_gid:
+                            try:
+                                rest_adjust_inventory(US_DOMAIN, US_TOKEN, int(gid_num(inv_item_gid) or "0"), int(US_LOCATION_ID), -qty)
+                                log_row("🧰0️⃣","US","CLAMP_TO_ZERO_US",
+                                       variant_id=vid, sku=sku_exact, delta=f"+{-qty}", title=title,
+                                       message=f"Raised US availability to 0 on inventory_item_id={gid_num(inv_item_gid)}",
+                                       before=str(qty), after="0")
+                                qty = 0
+                            except Exception as e:
+                                log_row("⚠️","US→IN","WARN", variant_id=vid, sku=sku_exact, title=title, message=f"US clamp error: {e}")
+
+                    # Persist last_seen (never negative)
+                    last_seen[vid] = max(0, qty)
                     sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
 
             save_json(US_LAST_SEEN, last_seen)
@@ -599,6 +659,7 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
                 cursor = pageInfo.get("endCursor")
             else:
                 break
+
 
 # --------------- Scheduler / Runner ---------------
 from threading import Thread, Lock
