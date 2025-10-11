@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-Dual-site availability sync — Render-friendly, exact SKU index, list/single metafield safe.
-Includes robust fallback for US clamp-to-zero to avoid REST 422 (connect + set).
+Dual-site availability + pricing sync — Render-friendly, exact SKU index,
+numeric per-product temp discount, safe metafields, clamp-to-zero, and rich logs.
 
-ENV VARS (set on Web Service and Worker, except where noted):
+ENV VARS (set on Web Service and Worker, except noted):
 - API_VERSION=2024-10
-- PIXEL_SHARED_SECRET=********             # required for /run
+- PIXEL_SHARED_SECRET=********             # required for /run and /rebuild_index
 - DATA_DIR=/data                           # strongly recommended (Persistent Disk)
 - RUN_EVERY_MIN=5
 - ENABLE_SCHEDULER=0 (web) / 1 (worker)
@@ -17,8 +17,8 @@ India shop (receives deltas + metafields):
 - IN_TOKEN=shpat_*************************
 - IN_LOCATION_ID=57791840446
 - IN_COLLECTION_HANDLES=gold-plated,another-collection
-- IN_INCLUDE_UNTRACKED=0|1
-- IN_CHANGE_STATUS=1
+- IN_INCLUDE_UNTRACKED=0|1                # default 0
+- IN_CHANGE_STATUS=1                      # flip ACTIVE<->DRAFT for special handle
 - SPECIAL_STATUS_HANDLE=budget-gold-plated-jewelry-premium-jadau-ornaments-on-mix-metal-base
 
 USA shop (source of deltas):
@@ -33,13 +33,16 @@ Metafields (India):
 - MF_DELIVERY_KEY=delivery_time
 - KEY_SALES=sales_total
 - KEY_DATES=sales_dates
+- NOTE: The temporary discount percent metafield is: custom.temp_discount_apply  (0,5,10,15,20,25,...)
 
 Behavior toggles:
 - USE_PRODUCT_CUSTOM_SKU=1                # exact SKU mapping via product metafield custom.sku
 - ONLY_ACTIVE_FOR_MAPPING=1               # index only ACTIVE products for SKU→inventory_item_id
 - MIRROR_US_INCREASES=0                   # ignore US quantity increases
-- CLAMP_AVAIL_TO_ZERO=1                   # INDIA: after counting sales, raise <0 to 0
-- CLAMP_US_NEGATIVES_TO_ZERO=1            # NEW: also clamp US negatives to 0 (with 422-safe fallback)
+- CLAMP_AVAIL_TO_ZERO=1                   # after counting sales, raise <0 to 0
+- DISCOUNT_DEFAULT_PCT=""                 # optional fallback percent if metafield missing/invalid (e.g. "10")
+- IN_PRICE_STEP=5                         # INR rounding step for discounts
+- US_PRICE_STEP=5                         # USD rounding step for discounts
 
 Pacing:
 - MUTATION_SLEEP_SEC=0.35
@@ -53,23 +56,26 @@ Logging:
 - Also writes JSONL: {DATA_DIR}/dual_sync_log.jsonl
 
 Notes
-- First global cycle is read-only: learns baselines, builds IN SKU index. No writes.
+- First global cycle is read-only for availability/sales; but we DO run per-product discount bootstrap once per shop
+  if custom.temp_discount_apply > 0 and availability>0.
 - India scan:
-    * compute availability
+    * compute availability (tracked-only by default)
     * if new_avail < last_seen → SALES_BUMP (+ sales_dates)
     * if new_avail < 0 and CLAMP_AVAIL_TO_ZERO=1 → REST adjust to raise to 0
-    * set badges/delivery each time (list/single safe)
+    * set badges/delivery every time (list/single safe)
     * optional SPECIAL_STATUS_HANDLE ACTIVE<->DRAFT
-  USA scan:
+- USA scan:
     * when variant qty decreases, find India product by exact product custom.sku and apply delta
     * increases ignored if MIRROR_US_INCREASES=0
-    * if US qty < 0 and CLAMP_US_NEGATIVES_TO_ZERO=1 → clamp to 0
+    * if US qty < 0 and CLAMP_AVAIL_TO_ZERO=1 → raise US to 0 (422 handled)
 - last_seen is guaranteed non-negative (never store <0)
+- Temp discount restore: on first detected sale for a discounted product, restore original variant prices and set custom.temp_discount_apply → "0".
 """
 
 import os, sys, time, json, csv, random
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, ROUND_UP, InvalidOperation
 import requests
 from flask import Flask, request, jsonify, make_response
 
@@ -102,12 +108,15 @@ US_TOKEN  = os.getenv("US_TOKEN", "").strip()
 US_LOCATION_ID = os.getenv("US_LOCATION_ID", "").strip()
 US_COLLECTIONS = [x.strip() for x in os.getenv("US_COLLECTION_HANDLES","").split(",") if x.strip()]
 
-# Metafields
+# Metafields / discount
 MF_NAMESPACE = os.getenv("MF_NAMESPACE", "custom")
 MF_BADGES_KEY = os.getenv("MF_BADGES_KEY", "badges")
 MF_DELIVERY_KEY = os.getenv("MF_DELIVERY_KEY", "delivery_time")
 KEY_SALES = os.getenv("KEY_SALES", "sales_total")
 KEY_DATES = os.getenv("KEY_DATES", "sales_dates")
+DISCOUNT_DEFAULT_PCT = os.getenv("DISCOUNT_DEFAULT_PCT", "").strip()
+IN_PRICE_STEP = Decimal(os.getenv("IN_PRICE_STEP", "5"))
+US_PRICE_STEP = Decimal(os.getenv("US_PRICE_STEP", "5"))
 
 BADGE_READY    = "Ready To Ship"
 DELIVERY_READY = "2-5 Days Across India"
@@ -118,7 +127,6 @@ USE_PRODUCT_CUSTOM_SKU = os.getenv("USE_PRODUCT_CUSTOM_SKU","1") == "1"
 ONLY_ACTIVE_FOR_MAPPING = os.getenv("ONLY_ACTIVE_FOR_MAPPING","1") == "1"
 MIRROR_US_INCREASES = os.getenv("MIRROR_US_INCREASES","0") == "1"
 CLAMP_AVAIL_TO_ZERO = os.getenv("CLAMP_AVAIL_TO_ZERO","1") == "1"
-CLAMP_US_NEGATIVES_TO_ZERO = os.getenv("CLAMP_US_NEGATIVES_TO_ZERO","1") == "1"
 
 # Persistence
 DATA_DIR = os.getenv("DATA_DIR",".").rstrip("/")
@@ -129,8 +137,9 @@ PORT = int(os.getenv("PORT", "10000"))
 def p(*parts): return os.path.join(DATA_DIR, *parts)
 IN_LAST_SEEN   = p("in_last_seen.json")     # product_id(num) -> last_seen_availability (>=0)
 US_LAST_SEEN   = p("us_last_seen.json")     # variant_id(num) -> last_seen_qty
-STATE_PATH     = p("dual_state.json")       # {"initialized": bool}
+STATE_PATH     = p("dual_state.json")       # {"initialized": bool, "in_discount_done": bool, "us_discount_done": bool}
 IN_SKU_INDEX   = p("in_sku_index.json")     # { "NS 202": {"product_id":..., "inventory_item_id":..., "title":...}, ... }
+DISCOUNT_STATE = p("discount_state.json")   # { "IN": {product_id: {variant_id: {"orig": "...","disc":"...","pct":"...","ts":"..."}}}, "US": {...} }
 LOG_CSV        = p("dual_sync_log.csv")
 LOG_JSONL      = p("dual_sync_log.jsonl")
 LOG_TO_STDOUT  = os.getenv("LOG_TO_STDOUT","1") == "1"
@@ -169,40 +178,31 @@ def rest_adjust_inventory(domain: str, token: str, inventory_item_id: int, locat
         if r.status_code == 429 or r.status_code >= 500:
             time.sleep(_backoff(attempt, base=0.3, mx=8.0))
             continue
+        if r.status_code == 422:
+            # Often means item/location not connected yet. Promote a human-friendly log and exit.
+            raise RuntimeError(f"REST adjust 422 for inventory_item_id={inventory_item_id} at location={location_id}; ensure the item is stocked at this location")
         if r.status_code >= 400:
             raise RuntimeError(f"REST adjust {r.status_code}: {r.text}")
         return
 
-# NEW: set & connect helpers for 422 fallback
-def rest_set_inventory(domain: str, token: str, inventory_item_id: int, location_id: int, available: int) -> None:
-    url = f"https://{domain}/admin/api/{API_VERSION}/inventory_levels/set.json"
-    payload = {"inventory_item_id": int(inventory_item_id), "location_id": int(location_id), "available": int(available)}
-    for attempt in range(1, 5):
-        r = requests.post(url, headers=hdr(token), json=payload, timeout=30)
-        if r.status_code == 429 or r.status_code >= 500:
-            time.sleep(_backoff(attempt, base=0.3, mx=8.0)); continue
-        if r.status_code >= 400:
-            raise RuntimeError(f"REST set {r.status_code}: {r.text}")
-        return
+def rest_variant_get(domain:str, token:str, variant_id_num:int) -> dict:
+    url = f"https://{domain}/admin/api/{API_VERSION}/variants/{variant_id_num}.json"
+    r = requests.get(url, headers=hdr(token), timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"Variant GET {r.status_code}: {r.text}")
+    return (r.json().get("variant") or {})
 
-def rest_connect_inventory(domain: str, token: str, inventory_item_id: int, location_id: int) -> None:
-    url = f"https://{domain}/admin/api/{API_VERSION}/inventory_levels/connect.json"
-    payload = {"inventory_item_id": int(inventory_item_id), "location_id": int(location_id)}
-    for attempt in range(1, 5):
-        r = requests.post(url, headers=hdr(token), json=payload, timeout=30)
-        if r.status_code == 429 or r.status_code >= 500:
-            time.sleep(_backoff(attempt, base=0.3, mx=8.0)); continue
-        if r.status_code >= 400:
-            raise RuntimeError(f"REST connect {r.status_code}: {r.text}")
-        return
+def rest_variant_update_price(domain:str, token:str, variant_id_num:int, new_price:str) -> None:
+    url = f"https://{domain}/admin/api/{API_VERSION}/variants/{variant_id_num}.json"
+    payload = {"variant": {"id": int(variant_id_num), "price": str(new_price), "compare_at_price": None}}
+    r = requests.put(url, headers=hdr(token), json=payload, timeout=30)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Variant PUT {r.status_code}: {r.text}")
 
 # --------------- Utils ---------------
-def now_ist():
-    return datetime.now(timezone(timedelta(hours=5, minutes=30)))
-def now_ist_str():
-    return now_ist().strftime("%Y-%m-%d %H:%M:%S %z")
-def today_ist_str():
-    return now_ist().date().isoformat()
+def now_ist(): return datetime.now(timezone(timedelta(hours=5, minutes=30)))
+def now_ist_str(): return now_ist().strftime("%Y-%m-%d %H:%M:%S %z")
+def today_ist_str(): return now_ist().date().isoformat()
 def sleep_ms(ms: int): time.sleep(max(0, ms)/1000.0)
 def gid_num(gid: str) -> str: return (gid or "").split("/")[-1]
 def _as_int_or_none(v):
@@ -222,7 +222,26 @@ def save_json(path: str, obj):
     os.replace(tmp,path)
 
 def normalize_sku(s: str) -> str:
+    # Keep exact by default, but trim superficial spaces
     return (s or "").strip()
+
+def as_decimal(s: Any, default: str="0") -> Decimal:
+    try:
+        return Decimal(str(s))
+    except (InvalidOperation, Exception):
+        return Decimal(default)
+
+def ceil_to_step(value: Decimal, step: Decimal) -> Decimal:
+    if step <= 0:
+        return value
+    q = (value / step).to_integral_value(rounding=ROUND_UP)
+    return q * step
+
+# discount state
+def ld_state() -> dict:
+    return load_json(DISCOUNT_STATE, {"IN":{}, "US":{}})
+def sv_state(st:dict):
+    save_json(DISCOUNT_STATE, st)
 
 # logging
 def ensure_log_header():
@@ -254,6 +273,7 @@ query ($handle:String!, $cursor:String) {
       nodes{
         id title status
         metafield(namespace:"custom", key:"sku"){ value }
+        tempDiscPct: metafield(namespace:"%NS%", key:"temp_discount_apply"){ id value type }
         variants(first: 100){
           nodes{
             id title sku inventoryQuantity
@@ -279,6 +299,7 @@ query ($handle:String!, $cursor:String) {
       nodes{
         id title
         metafield(namespace:"custom", key:"sku"){ value }
+        tempDiscPct: metafield(namespace:"%NS%", key:"temp_discount_apply"){ id value type }
         variants(first: 100){
           nodes{
             id sku inventoryQuantity
@@ -289,7 +310,7 @@ query ($handle:String!, $cursor:String) {
     }
   }
 }
-"""
+""".replace("%NS%", MF_NAMESPACE)
 
 # definition lookup cache
 _MF_DEF_CACHE: Dict[Tuple[str,str,str], str] = {}  # (ownerType, namespace, key)->typeName
@@ -303,7 +324,8 @@ def get_mf_def_type(domain:str, token:str, owner_type:str, namespace:str, key:st
       }
     }"""
     data = gql(domain, token, q, {"ownerType": owner_type, "ns": namespace, "key": key})
-    edges = (((data.get("metafieldDefinitions") or {}).get("edges")) or [])
+    defs = ((data or {}).get("metafieldDefinitions") or {})
+    edges = (defs.get("edges") or [])
     tname = ((((edges[0] if edges else {}).get("node") or {}).get("type") or {}).get("name")) or ""
     _MF_DEF_CACHE[ck] = tname or "single_line_text_field"
     return _MF_DEF_CACHE[ck]
@@ -348,7 +370,7 @@ def set_product_metafields(domain:str, token:str, product_gid:str,
 
     mf_inputs = []
 
-    # badges (list vs single)
+    # badges: handle list vs single safely
     if target_badge:
         if str(badges_type).startswith("list."):
             mf_inputs.append({
@@ -361,6 +383,7 @@ def set_product_metafields(domain:str, token:str, product_gid:str,
                 "type": badges_type, "value": target_badge
             })
     else:
+        # clear if exists
         if (badges_node or {}).get("id"):
             delm = "mutation($id:ID!){ metafieldDelete(input:{id:$id}){ userErrors{message} } }"
             gql(domain, token, delm, {"id": badges_node["id"]})
@@ -381,21 +404,27 @@ def set_product_metafields(domain:str, token:str, product_gid:str,
 def bump_sales_in(domain:str, token:str, product_gid:str,
                   sales_total_node:dict, sales_dates_node:dict,
                   sold:int, today:str):
+    """
+    Increments sales_total and stamps sales_dates using the store's real metafield types.
+    """
     # Resolve types
     st_type = (sales_total_node or {}).get("type") or \
               get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, KEY_SALES) or \
               "number_integer"
+
     sd_type = (sales_dates_node or {}).get("type") or \
               get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, KEY_DATES) or \
               "date"
 
-    # Current total
-    try: current_total = int((sales_total_node or {}).get("value") or "0")
-    except Exception: current_total = 0
+    # Current sales_total
+    try:
+        current_total = int((sales_total_node or {}).get("value") or "0")
+    except Exception:
+        current_total = 0
     new_total = current_total + int(sold)
 
-    # Dates payload
-    if sd_type.startswith("list."):  # list.date
+    # Build sales_dates payload matching the definition
+    if sd_type.startswith("list."):  # e.g., list.date
         existing = []
         raw = (sales_dates_node or {}).get("value")
         try:
@@ -405,27 +434,111 @@ def bump_sales_in(domain:str, token:str, product_gid:str,
             existing = []
         if today not in existing:
             existing.append(today)
-        sd_payload = {"ownerId": product_gid,"namespace":MF_NAMESPACE,"key":KEY_DATES,"type":"list.date","value": json.dumps(sorted(set(existing))[-365:])}
+        sd_payload = {"ownerId": product_gid,"namespace": MF_NAMESPACE,"key": KEY_DATES,"type":"list.date","value": json.dumps(sorted(set(existing))[-365:])}
     elif sd_type == "date":
-        sd_payload = {"ownerId": product_gid,"namespace":MF_NAMESPACE,"key":KEY_DATES,"type":"date","value":today}
+        sd_payload = {"ownerId": product_gid,"namespace": MF_NAMESPACE,"key": KEY_DATES,"type":"date","value": today}
     else:
-        sd_payload = {"ownerId": product_gid,"namespace":MF_NAMESPACE,"key":KEY_DATES,"type":sd_type,"value":today}
+        sd_payload = {"ownerId": product_gid,"namespace": MF_NAMESPACE,"key": KEY_DATES,"type": sd_type,"value": today}
 
-    mutation = """
-    mutation($mfs:[MetafieldsSetInput!]!){
-      metafieldsSet(metafields:$mfs){
-        userErrors{ field message }
-      }
-    }"""
+    # Write both metafields
+    mutation = "mutation($mfs:[MetafieldsSetInput!]!){ metafieldsSet(metafields:$mfs){ userErrors{ message field } } }"
     mfs = [
-        {"ownerId": product_gid,"namespace":MF_NAMESPACE,"key":KEY_SALES,"type":st_type,"value":str(new_total)},
+        {"ownerId": product_gid,"namespace": MF_NAMESPACE,"key": KEY_SALES,"type": st_type,"value": str(new_total)},
         sd_payload
     ]
     data = gql(domain, token, mutation, {"mfs": mfs})
     errs = ((data.get("metafieldsSet") or {}).get("userErrors") or [])
     if errs:
-        log_row("⚠️","IN","WARN", product_id=gid_num(product_gid),
-               message=f"sales metafieldsSet errors: {errs}")
+        log_row("⚠️","IN","WARN", product_id=gid_num(product_gid), message=f"sales metafieldsSet errors: {errs}")
+
+# ------- Discount helpers -------
+def set_temp_discount_apply(domain:str, token:str, product_gid:str, pct_str:str):
+    t = get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, "temp_discount_apply") or "single_line_text_field"
+    mutation = "mutation($mfs:[MetafieldsSetInput!]!){ metafieldsSet(metafields:$mfs){ userErrors{ field message } } }"
+    mf = [{"ownerId":product_gid,"namespace":MF_NAMESPACE,"key":"temp_discount_apply","type":t,"value":str(pct_str)}]
+    data = gql(domain, token, mutation, {"mfs": mf})
+    errs = ((data.get("metafieldsSet") or {}).get("userErrors") or [])
+    if errs:
+        log_row("⚠️","MF","WARN", product_id=gid_num(product_gid), message=f"temp_discount_apply set errors: {errs}")
+
+def apply_temp_discount_for_product(shop:str, domain:str, token:str, product_gid:str,
+                                    product_id_num:str, title:str, variants:list,
+                                    price_step:Decimal, percent:Decimal):
+    if percent is None or percent <= 0:
+        return
+    st = ld_state()
+    st_shop = st.get(shop) or {}
+    pmap = st_shop.get(product_id_num) or {}
+    changed = False
+
+    for v in variants:
+        vid_num = int(gid_num(v.get("id") or "0") or "0")
+        if vid_num <= 0: continue
+        if str(vid_num) in pmap:  # already discounted
+            continue
+
+        try:
+            vdata = rest_variant_get(domain, token, vid_num)
+            orig_price = as_decimal(vdata.get("price", "0"), "0")
+        except Exception as e:
+            log_row("⚠️",shop,"DISCOUNT_SKIPPED", product_id=product_id_num, variant_id=str(vid_num), title=title, message=f"Get price failed: {e}")
+            continue
+
+        if orig_price <= 0:
+            continue
+
+        # price' = ceil( orig*(1-pct/100) , step )
+        disc = orig_price * (Decimal(100) - percent) / Decimal(100)
+        disc = ceil_to_step(disc, price_step)
+        if disc >= orig_price:
+            continue
+
+        try:
+            rest_variant_update_price(domain, token, vid_num, str(disc))
+            log_row("🏷️",shop,"DISCOUNT_APPLIED", product_id=product_id_num, variant_id=str(vid_num),
+                    delta=str(disc - orig_price), title=title, message=f"{percent}% → {orig_price} -> {disc}")
+            pmap[str(vid_num)] = {"orig": str(orig_price), "disc": str(disc), "pct": str(percent), "ts": now_ist_str()}
+            changed = True
+            time.sleep(MUTATION_SLEEP_SEC)
+        except Exception as e:
+            log_row("⚠️",shop,"DISCOUNT_ERROR", product_id=product_id_num, variant_id=str(vid_num), title=title, message=str(e))
+
+    if changed:
+        st_shop[product_id_num] = pmap
+        st[shop] = st_shop
+        sv_state(st)
+
+def restore_temp_discount_for_product(shop:str, domain:str, token:str, product_gid:str, product_id_num:str, title:str):
+    st = ld_state()
+    st_shop = st.get(shop) or {}
+    pmap = st_shop.get(product_id_num) or {}
+    if not pmap:
+        return False
+
+    restored_any = False
+    for vid, rec in list(pmap.items()):
+        try:
+            orig = rec.get("orig")
+            if orig is None:
+                continue
+            rest_variant_update_price(domain, token, int(vid), str(orig))
+            log_row("🔁",shop,"DISCOUNT_RESTORED", product_id=product_id_num, variant_id=str(vid),
+                    delta="", title=title, message=f"Price restored to {orig}")
+            restored_any = True
+            time.sleep(MUTATION_SLEEP_SEC)
+        except Exception as e:
+            log_row("⚠️",shop,"DISCOUNT_RESTORE_ERR", product_id=product_id_num, variant_id=str(vid), title=title, message=str(e))
+
+    if restored_any:
+        # Clear state for this product and set metafield to "0"
+        st_shop.pop(product_id_num, None)
+        st[shop] = st_shop
+        sv_state(st)
+        try:
+            set_temp_discount_apply(domain, token, product_gid, "0")
+        except Exception as e:
+            log_row("⚠️",shop,"DISCOUNT_FLAG_ERR", product_id=product_id_num, title=title, message=str(e))
+    return restored_any
 
 # --------------- Index builder (India) ---------------
 def build_in_sku_index():
@@ -442,9 +555,9 @@ def build_in_sku_index():
                 status = (p.get("status") or "").upper()
                 if ONLY_ACTIVE_FOR_MAPPING and status != "ACTIVE":
                     continue
-                sku = (((p.get("metafield") or {}).get("value")) or "").strip()
+                sku = ((((p.get("metafield") or {})).get("value")) or "").strip()
                 if not sku: continue
-                sku_key = sku.strip()  # exact key
+                sku_key = sku.strip()
                 variants = ((p.get("variants") or {}).get("nodes") or [])
                 if not variants: continue
                 inv_item_gid = (((variants[0].get("inventoryItem") or {}).get("id")) or "")
@@ -466,7 +579,7 @@ def build_in_sku_index():
     log_row("🗂️","IN","INDEX_BUILT", message=f"entries={len(index)}")
 
 # --------------- India scan ---------------
-def scan_india_and_update(read_only: bool = False):
+def scan_india_and_update(read_only: bool = False, bootstrap_discount: bool = False):
     last_seen: Dict[str,int] = load_json(IN_LAST_SEEN, {})
     today = today_ist_str()
 
@@ -484,10 +597,28 @@ def scan_india_and_update(read_only: bool = False):
                 pid = gid_num(p["id"])
                 title = p.get("title") or ""
                 status = (p.get("status") or "").upper()
-                sku = (((p.get("metafield") or {}).get("value")) or "").strip()
+                sku = ((((p.get("metafield") or {})).get("value")) or "").strip()
                 variants = ((p.get("variants") or {}).get("nodes") or [])
                 avail = compute_product_availability(variants, IN_INCLUDE_UNTRACKED)
 
+                # Bootstrap discount (once) if desired
+                if bootstrap_discount:
+                    # decide percent
+                    tmp = (((p.get("tempDiscPct") or {}).get("value")) or "").strip()
+                    percent = None
+                    if tmp:
+                        try: percent = Decimal(tmp)
+                        except: percent = None
+                    if percent is None and DISCOUNT_DEFAULT_PCT:
+                        try: percent = Decimal(DISCOUNT_DEFAULT_PCT)
+                        except: percent = None
+                    if percent and percent > 0 and avail > 0:
+                        try:
+                            apply_temp_discount_for_product("IN", IN_DOMAIN, IN_TOKEN, p["id"], pid, title, variants, IN_PRICE_STEP, percent)
+                        except Exception as e:
+                            log_row("⚠️","IN","DISCOUNT_BOOT_ERR", product_id=pid, title=title, message=str(e))
+
+                # last_seen is never negative
                 prev = _as_int_or_none(last_seen.get(pid))
                 if prev is None: prev = 0
 
@@ -495,7 +626,15 @@ def scan_india_and_update(read_only: bool = False):
                     sold = prev - avail
                     bump_sales_in(IN_DOMAIN, IN_TOKEN, p["id"], p.get("salesTotal") or {}, p.get("salesDates") or {}, sold, today)
                     log_row("🧾➖","IN","SALES_BUMP", product_id=pid, sku=sku, delta=f"-{sold}", message=f"avail {prev}->{avail} (sold={sold})", title=title, before=str(prev), after=str(avail))
+                    # if discounted, restore immediately
+                    try:
+                        restored = restore_temp_discount_for_product("IN", IN_DOMAIN, IN_TOKEN, p["id"], pid, title)
+                        if restored:
+                            log_row("🔔","IN","DISCOUNT_AUTO_RESTORED", product_id=pid, title=title, message="Restored original prices on first sale")
+                    except Exception as e:
+                        log_row("⚠️","IN","DISCOUNT_RESTORE_ERR", product_id=pid, title=title, message=str(e))
 
+                # clamp <0 → 0 (after counting sales)
                 if not read_only and CLAMP_AVAIL_TO_ZERO and avail < 0 and variants:
                     inv_item_gid = (((variants[0].get("inventoryItem") or {}).get("id")) or "")
                     inv_item_id = int(gid_num(inv_item_gid) or "0")
@@ -506,6 +645,7 @@ def scan_india_and_update(read_only: bool = False):
                     except Exception as e:
                         log_row("⚠️","IN","WARN", product_id=pid, sku=sku, message=f"Clamp error: {e}")
 
+                # desired badges/delivery & optional status flip
                 _, target_badge, target_delivery = desired_state(avail)
                 if not read_only:
                     set_product_metafields(IN_DOMAIN, IN_TOKEN, p["id"], p.get("badges") or {}, p.get("dtime") or {}, target_badge, target_delivery)
@@ -528,8 +668,8 @@ def scan_india_and_update(read_only: bool = False):
             else:
                 break
 
-# --------------- USA scan → mirror to India + clamp US negatives ---------------
-def scan_usa_and_mirror_to_india(read_only: bool = False):
+# --------------- USA scan → mirror to India (+ clamp US <0) ---------------
+def scan_usa_and_mirror_to_india(read_only: bool = False, bootstrap_discount: bool = False):
     last_seen: Dict[str,int] = load_json(US_LAST_SEEN, {})
     in_index: Dict[str,Any] = load_json(IN_SKU_INDEX, {})
 
@@ -542,41 +682,71 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
             prods = ((coll.get("products") or {}).get("nodes") or [])
             pageInfo = ((coll.get("products") or {}).get("pageInfo") or {})
             for p in prods:
-                p_sku = (((p.get("metafield") or {}).get("value")) or "").strip()
+                p_sku = ((((p.get("metafield") or {})).get("value")) or "").strip()
                 title = p.get("title") or ""
-                for v in ((p.get("variants") or {}).get("nodes") or []):
+                vnodes = ((p.get("variants") or {}).get("nodes") or [])
+
+                # Bootstrap discount (once) if desired (availability > 0)
+                if bootstrap_discount:
+                    tmp = (((p.get("tempDiscPct") or {}).get("value")) or "").strip()
+                    percent = None
+                    if tmp:
+                        try: percent = Decimal(tmp)
+                        except: percent = None
+                    if percent is None and DISCOUNT_DEFAULT_PCT:
+                        try: percent = Decimal(DISCOUNT_DEFAULT_PCT)
+                        except: percent = None
+                    avail_us = sum(int(v.get("inventoryQuantity") or 0) for v in vnodes)
+                    if percent and percent > 0 and avail_us > 0:
+                        try:
+                            apply_temp_discount_for_product("US", US_DOMAIN, US_TOKEN, p["id"], gid_num(p["id"]), title, vnodes, US_PRICE_STEP, percent)
+                        except Exception as e:
+                            log_row("⚠️","US","DISCOUNT_BOOT_ERR", product_id=gid_num(p["id"]), title=title, message=str(e))
+
+                for v in vnodes:
                     vid = gid_num(v.get("id"))
-                    raw_sku = v.get("sku") or p_sku
-                    sku_exact = normalize_sku(raw_sku)
+                    raw_sku = v.get("sku") or p_sku  # variant SKU if present; else product.custom.sku
+                    sku_exact = (raw_sku or "").strip()
                     qty = int(v.get("inventoryQuantity") or 0)
-                    inv_item_gid = (((v.get("inventoryItem") or {}).get("id")) or "")
-                    inv_item_id = int(gid_num(inv_item_gid) or "0")
 
                     prev = _as_int_or_none(last_seen.get(vid))
                     if prev is None:
-                        last_seen[vid] = qty
+                        last_seen[vid] = max(0, qty) if CLAMP_AVAIL_TO_ZERO else qty
                         continue
 
                     delta = qty - int(prev)
                     if delta == 0:
-                        # still clamp if qty < 0 and allowed
-                        if not read_only and CLAMP_US_NEGATIVES_TO_ZERO and qty < 0 and inv_item_id > 0:
-                            _clamp_us_to_zero(inv_item_id, qty, title, sku_exact, vid)
-                            qty = 0
-                        last_seen[vid] = qty
+                        # If qty is negative (shouldn't happen), clamp anyway
+                        if not read_only and CLAMP_AVAIL_TO_ZERO and qty < 0:
+                            inv_item_gid = ((v.get("inventoryItem") or {}).get("id") or "")
+                            invid = int(gid_num(inv_item_gid) or "0")
+                            try:
+                                rest_adjust_inventory(US_DOMAIN, US_TOKEN, invid, int(US_LOCATION_ID), -qty)
+                                log_row("🧰0️⃣","US","CLAMP_TO_ZERO_US", variant_id=vid, sku=sku_exact, delta=f"+{-qty}", title=title, message=f"Raised US availability to 0 on inventory_item_id={invid}", before=str(qty), after="0")
+                                qty = 0
+                            except Exception as e:
+                                log_row("⚠️","US→IN","WARN", variant_id=vid, title=title, message=f"US clamp error: {e}")
+                            last_seen[vid] = 0
                         continue
+
+                    # If after change the qty is negative, clamp US to 0
+                    if not read_only and CLAMP_AVAIL_TO_ZERO and qty < 0:
+                        inv_item_gid = ((v.get("inventoryItem") or {}).get("id") or "")
+                        invid = int(gid_num(inv_item_gid) or "0")
+                        try:
+                            rest_adjust_inventory(US_DOMAIN, US_TOKEN, invid, int(US_LOCATION_ID), -qty)
+                            log_row("🧰0️⃣","US","CLAMP_TO_ZERO_US", variant_id=vid, sku=sku_exact, delta=f"+{-qty}", title=title, message=f"Raised US availability to 0 on inventory_item_id={invid}", before=str(qty), after="0")
+                            qty = 0
+                        except Exception as e:
+                            log_row("⚠️","US→IN","WARN", variant_id=vid, title=title, message=f"US clamp error: {e}")
 
                     # handle increases
                     if delta > 0:
                         if not MIRROR_US_INCREASES:
                             log_row("🙅‍♂️➕","US→IN","IGNORED_INCREASE", variant_id=vid, sku=sku_exact, delta=str(delta), title=title, message="US qty increase; mirroring disabled", before=str(prev), after=str(qty))
-                            # also clamp if qty <0 (unlikely with increase)
-                            if not read_only and CLAMP_US_NEGATIVES_TO_ZERO and qty < 0 and inv_item_id > 0:
-                                _clamp_us_to_zero(inv_item_id, qty, title, sku_exact, vid)
-                                qty = 0
-                            last_seen[vid] = qty
+                            last_seen[vid] = max(0, qty)
                             continue
-                        # (if enabled, you could mirror +delta to IN here)
+                        # (if enabled, could mirror +delta to IN)
 
                     # decreases (delta < 0) → mirror to India
                     if not read_only and delta < 0 and sku_exact:
@@ -592,12 +762,7 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
                             except Exception as e:
                                 log_row("⚠️","US→IN","ERROR_APPLYING_DELTA", variant_id=vid, sku=sku_exact, delta=str(delta), title=title, message=str(e))
 
-                    # after mirroring, if US qty is negative, clamp to zero
-                    if not read_only and CLAMP_US_NEGATIVES_TO_ZERO and qty < 0 and inv_item_id > 0:
-                        _clamp_us_to_zero(inv_item_id, qty, title, sku_exact, vid)
-                        qty = 0
-
-                    last_seen[vid] = qty
+                    last_seen[vid] = max(0, qty) if CLAMP_AVAIL_TO_ZERO else qty
                     sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
 
             save_json(US_LAST_SEEN, last_seen)
@@ -607,25 +772,6 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
             else:
                 break
 
-def _clamp_us_to_zero(inv_item_id: int, qty: int, title: str, sku: str, vid: str):
-    """Try adjust; on 422 fallback to connect+set; log each step."""
-    try:
-        rest_adjust_inventory(US_DOMAIN, US_TOKEN, inv_item_id, int(US_LOCATION_ID), -qty)  # raise to 0
-        log_row("🧰0️⃣","US","CLAMP_TO_ZERO_US", variant_id=vid, sku=sku, delta=f"+{-qty}", title=title, message=f"Raised US availability to 0 on inventory_item_id={inv_item_id}", before=str(qty), after="0")
-    except RuntimeError as e:
-        msg = str(e)
-        log_row("⚠️","US→IN","WARN", variant_id=vid, sku=sku, title=title, message=f"US adjust error: {msg}")
-        if "REST adjust 422" in msg:
-            # try connect then set
-            try:
-                rest_connect_inventory(US_DOMAIN, US_TOKEN, inv_item_id, int(US_LOCATION_ID))
-                log_row("🔌","US","CLAMP_CONNECT", variant_id=vid, sku=sku, title=title, message=f"Connected inventory_item_id={inv_item_id} to US location")
-                time.sleep(MUTATION_SLEEP_SEC)
-                rest_set_inventory(US_DOMAIN, US_TOKEN, inv_item_id, int(US_LOCATION_ID), 0)
-                log_row("🧰0️⃣","US","CLAMP_SET", variant_id=vid, sku=sku, delta=f"+{-qty}", title=title, message=f"Set US availability to 0 on inventory_item_id={inv_item_id}", before=str(qty), after="0")
-            except Exception as e2:
-                log_row("⚠️","US→IN","WARN", variant_id=vid, sku=sku, title=title, message=f"US clamp fallback failed: {e2}")
-
 # --------------- Scheduler / Runner ---------------
 from threading import Thread, Lock
 run_lock = Lock()
@@ -634,7 +780,7 @@ is_running = False
 def load_state():
     try:
         with open(STATE_PATH,"r",encoding="utf-8") as f: return json.load(f)
-    except: return {"initialized": False}
+    except: return {"initialized": False, "in_discount_done": False, "us_discount_done": False}
 def save_state(obj):
     tmp=STATE_PATH+".tmp"
     with open(tmp,"w",encoding="utf-8") as f: json.dump(obj,f,indent=2)
@@ -647,21 +793,35 @@ def run_cycle():
             return "busy"
         is_running = True
     try:
+        # First-cycle detection for availability + separate discount bootstrap flags per shop
         state = load_state()
         in_seen = load_json(IN_LAST_SEEN, {})
         us_seen = load_json(US_LAST_SEEN, {})
         index   = load_json(IN_SKU_INDEX, {})
         first_cycle = (not state.get("initialized", False)) and (len(in_seen)==0 and len(us_seen)==0)
 
+        # Always (re)build index before scans
         try:
             build_in_sku_index()
         except Exception as e:
             log_row("⚠️","SCHED","WARN", message=str(e))
 
-        scan_india_and_update(read_only=first_cycle)
+        # Determine per-shop discount bootstrap (once)
+        bootstrap_in = not state.get("in_discount_done", False)
+        bootstrap_us = not state.get("us_discount_done", False)
+
+        # India scan (metafields/sales/clamp + optional discount bootstrap)
+        scan_india_and_update(read_only=first_cycle, bootstrap_discount=bootstrap_in)
+        if bootstrap_in:
+            state["in_discount_done"] = True
+            save_state(state)
         sleep_ms(SLEEP_BETWEEN_SHOPS_MS)
 
-        scan_usa_and_mirror_to_india(read_only=first_cycle)
+        # USA scan (mirror decreases only + clamp US negatives + optional discount bootstrap)
+        scan_usa_and_mirror_to_india(read_only=first_cycle, bootstrap_discount=bootstrap_us)
+        if bootstrap_us:
+            state["us_discount_done"] = True
+            save_state(state)
 
         if first_cycle:
             state["initialized"] = True
@@ -701,7 +861,10 @@ def diag():
         "only_active_for_mapping": ONLY_ACTIVE_FOR_MAPPING,
         "mirror_us_increases": MIRROR_US_INCREASES,
         "clamp_avail_to_zero": CLAMP_AVAIL_TO_ZERO,
-        "clamp_us_negatives_to_zero": CLAMP_US_NEGATIVES_TO_ZERO
+        "discount_source": "custom.temp_discount_apply (per-product percent)",
+        "discount_default_pct": DISCOUNT_DEFAULT_PCT or "",
+        "in_discount_done": load_state().get("in_discount_done", False),
+        "us_discount_done": load_state().get("us_discount_done", False),
     }
     return _cors(jsonify(info)), 200
 
