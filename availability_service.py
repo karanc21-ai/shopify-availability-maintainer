@@ -2,29 +2,27 @@
 # -*- coding: utf-8 -*-
 
 """
-Dual-site availability sync — with temp discount (percent) + auto-revert on sale.
+Dual-site availability sync — temp discount (apply-once + revert-on-sale) + periodic US priceinindia sync.
 
-What this adds (on top of your last working build):
-- Read product metafield custom.temp_discount_active (numeric percent; 0=off).
-- If percent > 0 and availability > 0:
-    * Apply discount to ALL variants' prices on that product (rounded UP to nearest 5).
-    * Persist originals to /data/discount_state.json so we can restore later.
-- When a sale is detected on INDIA (new < prev):
-    * Immediately restore original prices for that product (if we had discounted)
-    * Set custom.temp_discount_active = 0 on that product
+What’s new vs your last working file:
+1) Temp discount is **apply-once**:
+   - Reads product metafield custom.temp_discount_active (percent; 0=off).
+   - If percent>0 and availability>0 and not previously applied → discount ALL variants once (rounded UP to nearest 5).
+   - Persist originals in /data/discount_state.json; DO NOT re-apply on later passes.
+   - On INDIA sale detection (new<prev), immediately restore original prices and set custom.temp_discount_active=0.
 
-Env keys (same as before) + these are used/assumed:
-- MF_NAMESPACE=custom
-- TEMP_DISC_KEY=temp_discount_active         # (numeric percent metafield on PRODUCT)
-- DISCOUNT_ROUND_STEP_INR=5                  # step for India rounding (default 5)
-- DISCOUNT_ROUND_STEP_USD=5                  # step for US rounding (default 5)
+2) Periodic US priceinindia sync:
+   - New envs:
+       PRICE_SYNC_HOURS=6              # run the check every N hours
+       MF_PRICE_IN_INDIA_KEY=priceinindia
+   - On each run, if at least PRICE_SYNC_HOURS elapsed since last sync, we:
+       * build/read India SKU index (which now stores India base variant_id)
+       * for each US product with SKU that exists in India index:
+           - fetch India base variant price
+           - write that value into US product metafield custom.priceinindia (type-safe)
+     (No price conversion or rounding; we write India’s number as-is.)
 
-REST endpoints used for pricing (safe across versions):
-- GET  /admin/api/{ver}/variants/{variant_id}.json
-- PUT  /admin/api/{ver}/variants/{variant_id}.json  ({"variant":{"id":..., "price":"..."}})
-
-Everything else (index build, clamping, badges/delivery, sales_total, US→IN mirror)
-remains as in your last working file.
+Everything else (index build, clamping, badges/delivery, sales_total, US→IN mirror) remains unchanged.
 """
 
 import os, sys, time, json, csv, random, math
@@ -69,6 +67,7 @@ MF_DELIVERY_KEY = os.getenv("MF_DELIVERY_KEY", "delivery_time")
 KEY_SALES = os.getenv("KEY_SALES", "sales_total")
 KEY_DATES = os.getenv("KEY_DATES", "sales_dates")
 TEMP_DISC_KEY = os.getenv("TEMP_DISC_KEY", "temp_discount_active")
+MF_PRICE_IN_INDIA_KEY = os.getenv("MF_PRICE_IN_INDIA_KEY", "priceinindia")
 
 BADGE_READY    = "Ready To Ship"
 DELIVERY_READY = "2-5 Days Across India"
@@ -84,6 +83,9 @@ CLAMP_AVAIL_TO_ZERO = os.getenv("CLAMP_AVAIL_TO_ZERO","1") == "1"
 ROUND_STEP_INR = int(os.getenv("DISCOUNT_ROUND_STEP_INR", "5"))
 ROUND_STEP_USD = int(os.getenv("DISCOUNT_ROUND_STEP_USD", "5"))
 
+# Price sync cadence
+PRICE_SYNC_HOURS = int(os.getenv("PRICE_SYNC_HOURS", "6"))
+
 # Persistence
 DATA_DIR = os.getenv("DATA_DIR",".").rstrip("/")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -93,10 +95,10 @@ def p(*parts): return os.path.join(DATA_DIR, *parts)
 IN_LAST_SEEN   = p("in_last_seen.json")
 US_LAST_SEEN   = p("us_last_seen.json")
 STATE_PATH     = p("dual_state.json")
-IN_SKU_INDEX   = p("in_sku_index.json")
+IN_SKU_INDEX   = p("in_sku_index.json")     # now includes india_base_variant_id
 LOG_CSV        = p("dual_sync_log.csv")
 LOG_JSONL      = p("dual_sync_log.jsonl")
-DISC_STATE     = p("discount_state.json")   # { "IN:pid:vid": {"original_price": "...", "ts": "..."} , ... }
+DISC_STATE     = p("discount_state.json")   # per-variant originals
 LOG_TO_STDOUT  = os.getenv("LOG_TO_STDOUT","1") == "1"
 
 # --------------- HTTP helpers ---------------
@@ -232,6 +234,7 @@ query ($handle:String!, $cursor:String) {{
         id title
         metafield(namespace:"{MF_NAMESPACE}", key:"sku"){{ value }}
         tdisc: metafield(namespace:"{MF_NAMESPACE}", key:"{TEMP_DISC_KEY}"){{ id value type }}
+        pIn:  metafield(namespace:"{MF_NAMESPACE}", key:"{MF_PRICE_IN_INDIA_KEY}"){{ id value type }}
         variants(first: 100){{
           nodes{{
             id sku inventoryQuantity
@@ -354,10 +357,9 @@ def bump_sales_in(domain:str, token:str, product_gid:str,
     if errs:
         log_row("⚠️","IN","WARN", product_id=gid_num(product_gid), message=f"sales metafieldsSet errors: {errs}")
 
-# --- temp discount helpers ---
+# --- temp discount helpers (apply-once + revert-on-sale) ---
 def ceil_to_step(value: float, step: int) -> float:
-    if step <= 1: return math.ceil(value * 100) / 100.0  # safe fallback
-    # Round UP to nearest step (integer money unit)
+    if step <= 1: return math.ceil(value * 100) / 100.0
     return float(int(math.ceil(value / step) * step))
 
 def discount_round_step_for_domain(domain: str) -> int:
@@ -378,7 +380,6 @@ def parse_percent(node: dict) -> int:
     except: return 0
 
 def set_temp_discount_percent(domain:str, token:str, product_gid:str, node:dict, percent:int):
-    # Set product metafield custom.temp_discount_active to a numeric value (0 disables)
     mtype = (node or {}).get("type") or get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, TEMP_DISC_KEY) or "number_integer"
     mutation = "mutation($mfs:[MetafieldsSetInput!]!){ metafieldsSet(metafields:$mfs){ userErrors{ field message } } }"
     mfs = [{"ownerId":product_gid,"namespace":MF_NAMESPACE,"key":TEMP_DISC_KEY,"type":mtype,"value":str(int(percent))}]
@@ -389,9 +390,7 @@ def set_temp_discount_percent(domain:str, token:str, product_gid:str, node:dict,
 
 def maybe_apply_temp_discount_for_product(shop_tag:str, domain:str, token:str, product_node:dict, availability:int):
     """
-    If product has temp_discount_active > 0 and availability > 0:
-      - discount all variant prices (rounded UP to nearest 5)
-      - persist originals for revert
+    Apply ONCE if temp_discount_active > 0 and availability > 0, and not already applied per variant.
     """
     tdisc_node = product_node.get("tdisc") or {}
     percent = parse_percent(tdisc_node)
@@ -409,23 +408,25 @@ def maybe_apply_temp_discount_for_product(shop_tag:str, domain:str, token:str, p
     for v in ((product_node.get("variants") or {}).get("nodes") or []):
         vid = gid_num(v.get("id"))
         key = disc_key(shop_tag, pid, vid)
+        if key in disc_state:
+            continue  # already discounted earlier → don't re-apply
+
         try:
             var = rest_get_variant(domain, token, int(vid))
             cur_price = float(var.get("price") or 0.0)
             if cur_price <= 0:
                 continue
-            # Store original if not already stored
-            if key not in disc_state:
-                disc_state[key] = {"original_price": str(cur_price), "ts": now_ist_str()}
 
             new_price = ceil_to_step(cur_price * (1.0 - (percent/100.0)), step)
             if new_price <= 0:
                 continue
             if abs(new_price - cur_price) >= 0.01:
+                # store original then update
+                disc_state[key] = {"original_price": str(cur_price), "ts": now_ist_str()}
                 rest_update_variant_price(domain, token, int(vid), str(int(new_price)))
                 changed_any = True
-                log_row("🏷️","DISC","APPLIED", product_id=pid, variant_id=vid, sku=sku, delta=f"-{percent}%", title=title,
-                        message=f"Price {cur_price} → {new_price} (step {step})")
+                log_row("🏷️","DISC","APPLIED", product_id=pid, variant_id=vid, sku=sku, delta=f"-{percent}%",
+                        title=title, message=f"Price {cur_price} → {new_price} (step {step})")
                 time.sleep(MUTATION_SLEEP_SEC)
         except Exception as e:
             log_row("⚠️","DISC","WARN", product_id=pid, variant_id=vid, sku=sku, message=f"Apply discount error: {e}")
@@ -435,7 +436,7 @@ def maybe_apply_temp_discount_for_product(shop_tag:str, domain:str, token:str, p
 
 def revert_temp_discount_for_product(shop_tag:str, domain:str, token:str, product_node:dict):
     """
-    If we have originals stored for this product's variants, restore them and set temp_discount_active=0
+    If we had discounted this product earlier, restore all variants and set temp_discount_active=0.
     """
     pid = gid_num(product_node["id"])
     title = product_node.get("title") or ""
@@ -456,18 +457,19 @@ def revert_temp_discount_for_product(shop_tag:str, domain:str, token:str, produc
             log_row("↩️","DISC","REVERTED", product_id=pid, variant_id=vid, sku=sku, title=title,
                     message=f"Restored price to {original_price}")
             time.sleep(MUTATION_SLEEP_SEC)
-            # remove entry
             disc_state.pop(key, None)
         except Exception as e:
             log_row("⚠️","DISC","WARN", product_id=pid, variant_id=vid, sku=sku, message=f"Revert discount error: {e}")
 
     if changed_any:
         save_disc_state(disc_state)
-        # flip temp_discount_active to 0
         set_temp_discount_percent(domain, token, product_node["id"], product_node.get("tdisc") or {}, 0)
 
 # --------------- Index builder (India) ---------------
 def build_in_sku_index():
+    """
+    Build exact SKU index for India and store: product_id, inventory_item_id, **india_base_variant_id**, title, status.
+    """
     index: Dict[str, Dict[str,Any]] = {}
     for handle in IN_COLLECTIONS:
         cursor=None
@@ -488,9 +490,11 @@ def build_in_sku_index():
                 inv_item_gid = (((variants[0].get("inventoryItem") or {}).get("id")) or "")
                 if not inv_item_gid: continue
                 inv_item_id = int(gid_num(inv_item_gid) or "0")
+                base_vid = gid_num(variants[0].get("id"))
                 index[sku] = {
                     "product_id": gid_num(p["id"]),
                     "inventory_item_id": inv_item_id,
+                    "india_base_variant_id": base_vid,   # NEW
                     "title": p.get("title") or "",
                     "status": status
                 }
@@ -526,7 +530,7 @@ def scan_india_and_update(read_only: bool = False):
                 variants = ((p.get("variants") or {}).get("nodes") or [])
                 avail = compute_product_availability(variants, IN_INCLUDE_UNTRACKED)
 
-                # Try applying discount if requested (percent >0) and we have stock
+                # Try applying discount once (percent >0) if we have stock
                 if not read_only:
                     try:
                         maybe_apply_temp_discount_for_product("IN", IN_DOMAIN, IN_TOKEN, p, avail)
@@ -600,14 +604,12 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
                 title = p.get("title") or ""
 
                 # apply discount on US too if percent>0 and availability>0
-                # we compute availability on US per-product (sum variants)
-                us_avail = 0
-                for v0 in ((p.get("variants") or {}).get("nodes") or []):
-                    us_avail += int(v0.get("inventoryQuantity") or 0)
-                try:
-                    maybe_apply_temp_discount_for_product("US", US_DOMAIN, US_TOKEN, p, us_avail)
-                except Exception as e:
-                    log_row("⚠️","DISC","WARN", product_id=gid_num(p["id"]), message=f"US apply discount pass error: {e}")
+                us_avail = sum(int(v0.get("inventoryQuantity") or 0) for v0 in ((p.get("variants") or {}).get("nodes") or []))
+                if not read_only:
+                    try:
+                        maybe_apply_temp_discount_for_product("US", US_DOMAIN, US_TOKEN, p, us_avail)
+                    except Exception as e:
+                        log_row("⚠️","DISC","WARN", product_id=gid_num(p["id"]), message=f"US apply discount pass error: {e}")
 
                 for v in ((p.get("variants") or {}).get("nodes") or []):
                     vid = gid_num(v.get("id"))
@@ -656,6 +658,75 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
             else:
                 break
 
+# --------------- US priceinindia sync ---------------
+def set_us_priceinindia(domain:str, token:str, product_gid:str, node:dict, value: str):
+    """Type-safe set of custom.priceinindia at the PRODUCT level."""
+    mtype = (node or {}).get("type") or get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, MF_PRICE_IN_INDIA_KEY) or "single_line_text_field"
+    mutation = "mutation($mfs:[MetafieldsSetInput!]!){ metafieldsSet(metafields:$mfs){ userErrors{ field message } } }"
+    mfs = [{"ownerId":product_gid,"namespace":MF_NAMESPACE,"key":MF_PRICE_IN_INDIA_KEY,"type":mtype,"value":str(value)}]
+    data = gql(domain, token, mutation, {"mfs": mfs})
+    errs = ((data.get("metafieldsSet") or {}).get("userErrors") or [])
+    if errs:
+        log_row("⚠️","US→IN","WARN", product_id=gid_num(product_gid), message=f"priceinindia set errors: {errs}")
+
+def maybe_sync_us_priceinindia():
+    """
+    Every PRICE_SYNC_HOURS, update US product.metafield custom.priceinindia
+    to equal India base variant price for the same SKU (if available).
+    """
+    try:
+        state = load_json(STATE_PATH, {})
+        last = state.get("last_price_sync_ts")
+        due = True
+        if last:
+            try:
+                last_dt = datetime.fromisoformat(last.replace(" +0530",""))
+                due = (now_ist() - last_dt) >= timedelta(hours=PRICE_SYNC_HOURS)
+            except:
+                due = True
+        if not due:
+            return
+
+        in_index = load_json(IN_SKU_INDEX, {})
+        # iterate all US collections/products
+        for handle in US_COLLECTIONS:
+            cursor=None
+            while True:
+                data = gql(US_DOMAIN, US_TOKEN, QUERY_COLLECTION_PAGE_US, {"handle": handle, "cursor": cursor})
+                coll = data.get("collectionByHandle")
+                if not coll: break
+                prods = ((coll.get("products") or {}).get("nodes") or [])
+                pageInfo = ((coll.get("products") or {}).get("pageInfo") or {})
+                for p in prods:
+                    p_sku = (((p.get("metafield") or {}).get("value")) or "").strip()
+                    if not p_sku: continue
+                    idx = in_index.get(p_sku)
+                    if not idx: continue
+                    base_vid = idx.get("india_base_variant_id")
+                    if not base_vid: continue
+                    try:
+                        v = rest_get_variant(IN_DOMAIN, IN_TOKEN, int(base_vid))
+                        in_price = v.get("price")
+                        if in_price is None: continue
+                        current_pi = ((p.get("pIn") or {}).get("value")) or ""
+                        if str(current_pi).strip() != str(in_price).strip():
+                            set_us_priceinindia(US_DOMAIN, US_TOKEN, p["id"], p.get("pIn") or {}, str(in_price))
+                            log_row("🏷️","US","PRICEINDIA_SET", product_id=gid_num(p["id"]), sku=p_sku, delta=str(in_price),
+                                    message=f"Set US {MF_NAMESPACE}.{MF_PRICE_IN_INDIA_KEY} = {in_price}", title=p.get("title") or "")
+                            time.sleep(MUTATION_SLEEP_SEC)
+                    except Exception as e:
+                        log_row("⚠️","US","PRICEINDIA_WARN", product_id=gid_num(p["id"]), sku=p_sku, message=str(e))
+                sleep_ms(SLEEP_BETWEEN_PAGES_MS)
+                if pageInfo.get("hasNextPage"):
+                    cursor = pageInfo.get("endCursor")
+                else:
+                    break
+
+        state["last_price_sync_ts"] = now_ist_str()
+        save_json(STATE_PATH, state)
+    except Exception as e:
+        log_row("⚠️","US","PRICEINDIA_WARN", message=f"sync error: {e}")
+
 # --------------- Scheduler / Runner ---------------
 from threading import Thread, Lock
 run_lock = Lock()
@@ -683,7 +754,7 @@ def run_cycle():
         index   = load_json(IN_SKU_INDEX, {})
         first_cycle = (not state.get("initialized", False)) and (len(in_seen)==0 and len(us_seen)==0)
 
-        # Always (re)build index before scans
+        # Always (re)build index before scans (now includes india_base_variant_id)
         try:
             build_in_sku_index()
         except Exception as e:
@@ -695,6 +766,9 @@ def run_cycle():
 
         # USA scan
         scan_usa_and_mirror_to_india(read_only=first_cycle)
+
+        # Periodic US priceinindia sync
+        maybe_sync_us_priceinindia()
 
         if first_cycle:
             state["initialized"] = True
@@ -736,7 +810,9 @@ def diag():
         "clamp_avail_to_zero": CLAMP_AVAIL_TO_ZERO,
         "round_step_inr": ROUND_STEP_INR,
         "round_step_usd": ROUND_STEP_USD,
-        "temp_discount_key": f"{MF_NAMESPACE}.{TEMP_DISC_KEY}"
+        "temp_discount_key": f"{MF_NAMESPACE}.{TEMP_DISC_KEY}",
+        "price_sync_hours": PRICE_SYNC_HOURS,
+        "priceinindia_key": f"{MF_NAMESPACE}.{MF_PRICE_IN_INDIA_KEY}"
     }
     return _cors(jsonify(info)), 200
 
