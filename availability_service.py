@@ -45,7 +45,7 @@ Behavior toggles
 - CLAMP_AVAIL_TO_ZERO=1                   # clamp negative availability to zero after counting sales
 
 Temp discount (always-on; per product)
-- TEMP_DISCOUNT_KEY=temp_discount_apply   # product metafield (numeric percent, e.g., 5/10/15/20/25)
+- TEMP_DISCOUNT_KEY=temp_discount_active   # product metafield (numeric percent, e.g., 5/10/15/20/25)
 - DISCOUNT_STEP_IN=5                      # ₹ step to round UP to (e.g., 5 → 23444 → 23445)
 - DISCOUNT_STEP_US=5                      # $ step to round UP to
 - DISCOUNT_STATE_FILE will be stored at {DATA_DIR}/discount_state.json automatically
@@ -113,7 +113,7 @@ KEY_SALES = os.getenv("KEY_SALES", "sales_total")
 KEY_DATES = os.getenv("KEY_DATES", "sales_dates")
 
 # Temp discount config
-TEMP_DISCOUNT_KEY = os.getenv("TEMP_DISCOUNT_KEY", "temp_discount_apply")
+TEMP_DISCOUNT_KEY = os.getenv("TEMP_DISCOUNT_KEY", "temp_discount_active")
 DISCOUNT_STEP_IN = Decimal(str(os.getenv("DISCOUNT_STEP_IN", "5")))
 DISCOUNT_STEP_US = Decimal(str(os.getenv("DISCOUNT_STEP_US", "5")))
 
@@ -544,7 +544,7 @@ def product_availability_from_nodes(variants: List[dict], include_untracked: boo
 def ensure_discount_apply_or_revert(shop_key:str, domain:str, token:str,
                                     product_node:dict, availability:int, step:Decimal):
     """
-    Enforce discount/revert for a product based on product metafield custom.temp_discount_apply (numeric %).
+    Enforce discount/revert for a product based on product metafield custom.temp_discount_active (numeric %).
     Saves originals on first apply; reverts when percent<=0 or availability==0.
     """
     st = load_discount_state()
