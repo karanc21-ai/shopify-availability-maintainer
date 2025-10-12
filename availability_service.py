@@ -110,16 +110,19 @@ def _backoff(attempt:int, base:float=0.35, mx:float=10.0)->float:
 
 def gql(domain: str, token: str, query: str, variables: dict = None) -> dict:
     url = f"https://{domain}/admin/api/{API_VERSION}/graphql.json"
-    for attempt in range(1, 8):
+    for attempt in range(1,  nine := 9):
         r = requests.post(url, headers=hdr(token), json={"query": query, "variables": variables or {}}, timeout=60)
-        if r.status_code >= 500 or r.status_code == 429:
-            time.sleep(_backoff(attempt, base=0.4))
-            continue
+        if r.status_code in (429,) or r.status_code >= 500:
+            time.sleep(min(12, 0.4 * (2 ** (attempt-1))) + random.uniform(0, 0.25)); continue
         if r.status_code != 200:
             raise RuntimeError(f"GraphQL HTTP {r.status_code}: {r.text}")
         data = r.json()
-        if data.get("errors"):
-            raise RuntimeError(f"GQL errors: {data['errors']}")
+        errs = data.get("errors") or []
+        if errs:
+            # Retry specifically on Shopify throttle
+            if any((e.get("extensions", {}).get("code","").upper() == "THROTTLED") for e in errs):
+                time.sleep(min(12, 0.4 * (2 ** (attempt-1))) + random.uniform(0, 0.25)); continue
+            raise RuntimeError(f"GQL errors: {errs}")
         return data["data"]
     raise RuntimeError("GraphQL throttled/5xx repeatedly")
 
