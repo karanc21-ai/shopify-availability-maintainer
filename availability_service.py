@@ -130,7 +130,7 @@ if not SHOPIFY_WEBHOOK_SECRET:
 INVENTORY_POLL_SEC = int(os.getenv("INVENTORY_POLL_SEC", "0"))  # 0 disables availability polling
 AVAIL_POLL_PRODUCT_IDS: Set[str] = set(s.strip() for s in (os.getenv("AVAIL_POLL_PRODUCT_IDS","") or "").split(",") if s.strip())
 
-ALLOWED_PIXEL_HOSTS = set(h.strip().lower() for h in (os.getenv("ALLOWED_PIXEL_HOSTS","rudradhan.com").split(",")))
+ALLOWED_PIXEL_HOSTS = set(h.strip().lower() for h in (os.getenv("ALLOWED_PIXEL_HOSTS","silver-rudradhan.myshopify.com").split(",")))
 # IP ignore list for pixels (comma-separated single IPs or CIDRs)
 IGNORE_IPS_ENV = [s.strip() for s in os.getenv("IGNORE_IPS", "").split(",")] if os.getenv("IGNORE_IPS") else []
 
