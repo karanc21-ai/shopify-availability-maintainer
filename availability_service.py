@@ -1222,6 +1222,15 @@ def diag():
     }
     return _cors(jsonify(info)), 200
 
+@app.route("/debug/flush_now", methods=["POST","GET"])
+def debug_flush_now():
+    key = (request.args.get("key") or "").strip()
+    if key != PIXEL_SHARED_SECRET:
+        return "forbidden", 403
+    flush_once()
+    return "flushed", 200
+
+
 @app.route("/rebuild_index", methods=["POST"])
 def rebuild_index():
     key = (request.args.get("key") or request.form.get("key") or "").strip()
@@ -1551,6 +1560,43 @@ def flusher():
             print(f"[PUSH] {ADMIN_HOST_LOCAL}: {len(chunk)} -> {'OK' if ok else 'ERR'}")
             time.sleep(0.3)
         _persist_all()
+        
+def flush_once():
+    ADMIN_HOST_LOCAL = list(ADMIN_TOKENS.keys())[0]
+    TOKEN_LOCAL = ADMIN_TOKENS[ADMIN_HOST_LOCAL]
+    with lock:
+        if not (dirty_views or dirty_atc or dirty_sales or dirty_age):
+            print("[PUSH] nothing to flush", flush=True)
+            return
+        to_push = {}
+        for (_shop, pid) in dirty_views: to_push.setdefault(pid, set()).add("views")
+        for (_shop, pid) in dirty_atc:   to_push.setdefault(pid, set()).add("atc")
+        for (_shop, pid) in dirty_sales: to_push.setdefault(pid, set()).add("sales")
+        for (_shop, pid) in dirty_age:   to_push.setdefault(pid, set()).add("age")
+        dirty_views.clear(); dirty_atc.clear(); dirty_sales.clear(); dirty_age.clear()
+
+    mfs = []
+    for pid, kinds in to_push.items():
+        if "views" in kinds:
+            mfs.append({"ownerId": f"gid://shopify/Product/{pid}", "namespace": MF_NAMESPACE, "key": KEY_VIEWS, "type": "number_integer", "value": str(int(view_counts.get(pid, 0)))})
+        if "atc" in kinds:
+            mfs.append({"ownerId": f"gid://shopify/Product/{pid}", "namespace": MF_NAMESPACE, "key": KEY_ATC, "type": "number_integer", "value": str(int(atc_counts.get(pid, 0)))})
+        if "sales" in kinds:
+            mfs.append({"ownerId": f"gid://shopify/Product/{pid}", "namespace": MF_NAMESPACE, "key": KEY_SALES, "type": "number_integer", "value": str(int(sales_counts.get(pid, 0)))})
+            dates = sorted(list(sale_dates.get(pid, set())))
+            mfs.append({"ownerId": f"gid://shopify/Product/{pid}", "namespace": MF_NAMESPACE, "key": KEY_DATES, "type": "list.date", "value": json.dumps(dates)})
+        if "age" in kinds:
+            mfs.append({"ownerId": f"gid://shopify/Product/{pid}", "namespace": MF_NAMESPACE, "key": KEY_AGE, "type": "number_integer", "value": str(int(age_days.get(pid, 0)))})
+    CHUNK = 25
+    items = list(mfs)
+    if items:
+        print(f"[PUSH] preview ownerId/key/type -> {items[0].get('ownerId')}, {items[0].get('key')}, {items[0].get('type')}", flush=True)
+    for i in range(0, len(items), CHUNK):
+        chunk = items[i:i+CHUNK]
+        ok = metafields_set(ADMIN_HOST_LOCAL, TOKEN_LOCAL, chunk)
+        print(f"[PUSH] {ADMIN_HOST_LOCAL}: {len(chunk)} -> {'OK' if ok else 'ERR'}", flush=True)
+        time.sleep(0.3)
+    _persist_all()
 
 # ========================= SCHEDULER / RUNNER =========================
 
