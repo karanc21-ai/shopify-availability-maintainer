@@ -27,12 +27,6 @@ B) Counters + Daily CSV (IST midnight)
    - Daily CSV ledger (12:00 AM IST): date_ist, product_id, views_today, atc_today, sales_today, age_in_days_today
    - Background flusher pushes counters to metafields every FLUSH_INTERVAL_SEC
 
-C) NEW: App B manufacturing trigger (opt-in via env)
-   - On a real availability drop detected in the India scan, this app will, if configured,
-     send a signed JSON to App B with SKU, before/after, delta, product handle/title/ids.
-   - Controlled by presence of B_ENDPOINT_URL and A_TO_B_SHARED_SECRET (no change if unset).
-   - Idempotency key: "{SOURCE_SITE}-{UTCyyyymmddTHHMMssZ}-{SKUnoSpace}-{availability_after}"
-
 Notes
 -----
 - Uses Shopify Admin GraphQL for reads/writes (metafields, listings) and REST for inventory adjust and variant pricing.
@@ -54,7 +48,6 @@ import random
 import math
 import hmac
 import base64
-import hashlib  # (added) for HMAC SHA-256
 import threading
 import ipaddress
 from typing import Dict, Any, List, Optional, Tuple, Set
@@ -70,11 +63,6 @@ API_VERSION = os.getenv("API_VERSION", "2024-10").strip()
 PIXEL_SHARED_SECRET = os.getenv("PIXEL_SHARED_SECRET", "").strip()
 if not PIXEL_SHARED_SECRET:
     raise SystemExit("PIXEL_SHARED_SECRET required")
-
-# ---- App B trigger (NEW) ----
-B_ENDPOINT_URL = os.getenv("B_ENDPOINT_URL", "").strip()          # e.g. https://manufacturing-handler.onrender.com/manufacturing/start
-A_TO_B_SHARED_SECRET = os.getenv("A_TO_B_SHARED_SECRET", "").strip()
-SOURCE_SITE = os.getenv("SOURCE_SITE", "IN").strip().upper()      # "IN" or "US" (we use IN)
 
 # ---- Scheduler (Dual-site) ----
 RUN_EVERY_MIN = int(os.getenv("RUN_EVERY_MIN", "5"))
@@ -113,9 +101,9 @@ KEY_ATC = os.getenv("KEY_ATC", "added_to_cart_total").strip()
 KEY_AGE = os.getenv("KEY_AGE", "age_in_days").strip()
 KEY_DOB = os.getenv("KEY_DOB", "dob").strip()
 
-BADGE_READY = os.getenv("BADGE_READY", "Ready To Ship")
-DELIVERY_READY = os.getenv("DELIVERY_READY", "2-5 Days Across India")
-DELIVERY_MTO = os.getenv("DELIVERY_MTO", "12-15 Days Across India")
+BADGE_READY = os.getenv("BADGE_READY", "Ready To Ship").strip()
+DELIVERY_READY = os.getenv("DELIVERY_READY", "2-5 Days Across India").strip()
+DELIVERY_MTO = os.getenv("DELIVERY_MTO", "12-15 Days Across India").strip()
 
 # ---- Behavior toggles (Dual-site) ----
 USE_PRODUCT_CUSTOM_SKU = os.getenv("USE_PRODUCT_CUSTOM_SKU", "1") == "1"
@@ -152,6 +140,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 PORT = int(os.getenv("PORT", "10000"))
 FLUSH_INTERVAL_SEC = int(os.getenv("FLUSH_INTERVAL_SEC", "5"))
 LOG_TO_STDOUT = os.getenv("LOG_TO_STDOUT", "1") == "1"
+# NEW: quiet toggle for push logs
+QUIET_PUSH = os.getenv("QUIET_PUSH", "0") == "1"
 
 def p(*parts): return os.path.join(DATA_DIR, *parts)
 
@@ -371,7 +361,6 @@ query ($handle:String!, $cursor:String) {{
       pageInfo{{ hasNextPage endCursor }}
       nodes{{
         id
-        handle
         title
         status
         metafield(namespace:"{MF_NAMESPACE}", key:"sku"){{ value }}
@@ -508,7 +497,7 @@ def bump_sales_in(domain: str, token: str, product_gid: str, sales_total_node: d
         existing = []
         raw = (sales_dates_node or {}).get("value")
         try:
-            if isinstance(raw, str) and raw.strip().startsWith("["):
+            if isinstance(raw, str) and raw.strip().startswith("["):
                 existing = json.loads(raw)
         except:
             existing = []
@@ -656,62 +645,6 @@ def sync_priceinindia_for_us_product(us_product_node: dict, idx: dict):
     except Exception as e:
         log_row("⚠️", "US", "PRICEINDIA_WARN", product_id=pid_us, sku=sku, message=f"sync error: {e}")
 
-# ========================= App B trigger helper (NEW) =========================
-
-def normalize_sku_spaces(s: str) -> str:
-    return (s or "").replace(" ", "").upper()
-
-def _b_idempotency_key(site: str, skuns: str, availability_after: int) -> str:
-    now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return f"{site}-{now}-{skuns}-{int(availability_after)}"
-
-def post_to_b_on_drop(*, sku: str, delta: int, availability_before: int, availability_after: int,
-                      product_id_gid: str, variant_id_gid: Optional[str], handle: str, title: str) -> None:
-    """
-    Sends a signed availability_drop event to App B, if B_ENDPOINT_URL and A_TO_B_SHARED_SECRET are set.
-    Safe no-op otherwise. Errors are swallowed after a couple retries; we log preview once.
-    """
-    if not (B_ENDPOINT_URL and A_TO_B_SHARED_SECRET):
-        return
-    try:
-        skuns = normalize_sku_spaces(sku)
-        idem = _b_idempotency_key(SOURCE_SITE, skuns, availability_after)
-        body = {
-            "event_type": "availability_drop",
-            "source_site": SOURCE_SITE,
-            "sku": sku,
-            "delta": int(delta),  # negative
-            "availability_before": int(availability_before),
-            "availability_after": int(availability_after),
-            "product_id": product_id_gid,
-            "variant_id": variant_id_gid or "",
-            "handle": handle or "",
-            "title": title or "",
-            "at": datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
-            "idempotency_key": idem
-        }
-        raw = json.dumps(body, separators=(",", ":")).encode("utf-8")
-        sig = base64.b64encode(hmac.new(A_TO_B_SHARED_SECRET.encode("utf-8"), raw, hashlib.sha256).digest()).decode("utf-8")
-        headers = {
-            "Content-Type": "application/json",
-            "X-A-Signature": sig,
-            "X-Idempotency-Key": idem
-        }
-        # light retry on 5xx
-        for attempt, backoff in enumerate([0, 2, 6], start=1):
-            try:
-                r = requests.post(B_ENDPOINT_URL, data=raw, headers=headers, timeout=6)
-                print(f"[B.POST] http={r.status_code} idemp={idem} sku={sku} after={availability_after} resp={r.text[:180]}", flush=True)
-                if r.status_code >= 500 and attempt < 3:
-                    time.sleep(backoff); continue
-                break
-            except Exception as e:
-                if attempt < 3:
-                    time.sleep(backoff); continue
-                print(f"[B.POST] fail idemp={idem} err={e}", flush=True)
-    except Exception as e:
-        print(f"[B.POST] unexpected error: {e}", flush=True)
-
 # ========================= INDEX BUILDER (IN) =========================
 
 def build_in_sku_index():
@@ -765,7 +698,6 @@ def scan_india_and_update(read_only: bool = False):
             for p in prods:
                 pid = gid_num(p["id"])
                 title = p.get("title") or ""
-                p_handle = p.get("handle") or ""  # (NEW) needed for App B link
                 status = (p.get("status") or "").upper()
                 sku = (((p.get("metafield") or {}).get("value")) or "").strip()
                 variants = ((p.get("variants") or {}).get("nodes") or [])
@@ -779,25 +711,8 @@ def scan_india_and_update(read_only: bool = False):
                     sold = prev - avail
                     bump_sales_in(IN_DOMAIN, IN_TOKEN, p["id"], p.get("salesTotal") or {}, p.get("salesDates") or {}, sold, today)
                     log_row("🧾➖", "IN", "SALES_BUMP", product_id=pid, sku=sku, delta=f"-{sold}", message=f"avail {prev}->{avail} (sold={sold})", title=title, before=str(prev), after=str(avail))
-                    try:
-                        revert_temp_discount_for_product("IN", IN_DOMAIN, IN_TOKEN, p)
-                    except Exception as e:
-                        log_row("⚠️", "DISC", "WARN", product_id=pid, sku=sku, message=f"Revert on sale error: {e}")
-                    # (NEW) Notify App B about the drop (negative delta)
-                    try:
-                        first_variant_gid = (variants[0].get("id") if variants else None)
-                        post_to_b_on_drop(
-                            sku=sku,
-                            delta=avail - prev,  # negative
-                            availability_before=prev,
-                            availability_after=avail,
-                            product_id_gid=f"gid://shopify/Product/{pid}",
-                            variant_id_gid=first_variant_gid,
-                            handle=p_handle,
-                            title=title
-                        )
-                    except Exception as e:
-                        print(f"[B.POST] skipped due to error: {e}", flush=True)
+                    try: revert_temp_discount_for_product("IN", IN_DOMAIN, IN_TOKEN, p)
+                    except Exception as e: log_row("⚠️", "DISC", "WARN", product_id=pid, sku=sku, message=f"Revert on sale error: {e}")
                 if not read_only and CLAMP_AVAIL_TO_ZERO and avail < 0 and variants:
                     inv_item_gid = (((variants[0].get("inventoryItem") or {}).get("id")) or "")
                     inv_item_id = int(gid_num(inv_item_gid) or "0")
@@ -1115,6 +1030,21 @@ def _compute_age_for_pid(pid: str, today_date):
         return True
     return False
 
+def _recompute_age_for_known_pids():
+    today = datetime.now(timezone.utc).date()
+    with lock:
+        pids = set(view_counts.keys()) | set(atc_counts.keys()) | set(sales_counts.keys())
+    changed = 0
+    for pid in pids:
+        try:
+            if _compute_age_for_pid(pid, today):
+                changed += 1
+        except Exception:
+            pass
+    if changed:
+        _persist_all()
+    return changed
+
 def _list_all_product_nodes():
     admin_host = list(ADMIN_TOKENS.keys())[0]
     token = ADMIN_TOKENS[admin_host]
@@ -1205,7 +1135,7 @@ def _availability_seed_all():
     current = _list_products_availability(AVAIL_POLL_PRODUCT_IDS if AVAIL_POLL_PRODUCT_IDS else None)
     with lock:
         last_avail.clear()
-        last_avail.update({pid:int(av) for pid,av in current.items()})
+        last_avail.update({k:int(v) for k,v in current.items()})
     _persist_all()
     return len(current)
 
@@ -1621,7 +1551,7 @@ def flusher():
                 mfs.append({"ownerId": f"gid://shopify/Product/{pid}", "namespace": MF_NAMESPACE, "key": KEY_AGE, "type": "number_integer", "value": str(int(age_days.get(pid, 0)))})
         CHUNK = 25
         items = list(mfs)
-        if items:
+        if items and not QUIET_PUSH:
             try:
                 print(f"[PUSH] preview ownerId/key/type -> {items[0].get('ownerId')}, {items[0].get('key')}, {items[0].get('type')}")
             except Exception:
@@ -1629,7 +1559,8 @@ def flusher():
         for i in range(0, len(items), CHUNK):
             chunk = items[i:i+CHUNK]
             ok = metafields_set(ADMIN_HOST_LOCAL, TOKEN_LOCAL, chunk)
-            print(f"[PUSH] {ADMIN_HOST_LOCAL}: {len(chunk)} -> {'OK' if ok else 'ERR'}")
+            if not QUIET_PUSH:
+                print(f"[PUSH] {ADMIN_HOST_LOCAL}: {len(chunk)} -> {'OK' if ok else 'ERR'}")
             time.sleep(0.3)
         _persist_all()
         
@@ -1661,12 +1592,13 @@ def flush_once():
             mfs.append({"ownerId": f"gid://shopify/Product/{pid}", "namespace": MF_NAMESPACE, "key": KEY_AGE, "type": "number_integer", "value": str(int(age_days.get(pid, 0)))})
     CHUNK = 25
     items = list(mfs)
-    if items:
+    if items and not QUIET_PUSH:
         print(f"[PUSH] preview ownerId/key/type -> {items[0].get('ownerId')}, {items[0].get('key')}, {items[0].get('type')}", flush=True)
     for i in range(0, len(items), CHUNK):
         chunk = items[i:i+CHUNK]
         ok = metafields_set(ADMIN_HOST_LOCAL, TOKEN_LOCAL, chunk)
-        print(f"[PUSH] {ADMIN_HOST_LOCAL}: {len(chunk)} -> {'OK' if ok else 'ERR'}", flush=True)
+        if not QUIET_PUSH:
+            print(f"[PUSH] {ADMIN_HOST_LOCAL}: {len(chunk)} -> {'OK' if ok else 'ERR'}", flush=True)
         time.sleep(0.3)
     _persist_all()
 
@@ -1743,21 +1675,6 @@ if not os.path.exists(ATC_CSV):
         csv.writer(f).writerow(["ts_iso","shop","productId","qty","handle","sessionId","userAgent","ip"])
 
 # Load counters lifetime state
-def _load_json(path, default):
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return default
-
-def _save_json(path, data):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, path)
-
 _view_disk = _load_json(VIEWS_JSON, {})
 for k, v in _view_disk.items(): view_counts[str(k)] = int(v)
 _atc_disk = _load_json(ATC_JSON, {})
@@ -1773,30 +1690,11 @@ processed_orders = set(_load_json(PROCESSED_ORDERS, []))
 last_avail.update(_load_json(AVAIL_BASELINE_JSON, {}))
 
 # Load per-day state (IST) & rollover if missed
-_today_ist_date_str: Optional[str] = None
-def _ist_today_date_str():
-    return today_ist_str()
-def _load_today_state():
-    global _today_ist_date_str
-    st = _load_json(TODAY_STATE_JSON, {})
-    _today_ist_date_str = st.get("ist_date_str") or _ist_today_date_str()
-    for k, v in (st.get("views_today") or {}).items(): views_today[str(k)] = int(v)
-    for k, v in (st.get("atc_today") or {}).items():   atc_today[str(k)]   = int(v)
-    for k, v in (st.get("sales_today") or {}).items(): sales_today[str(k)] = int(v)
-def _save_today_state():
-    _save_json(TODAY_STATE_JSON, {
-        "ist_date_str": _today_ist_date_str,
-        "views_today":  {k:int(v) for k,v in views_today.items()},
-        "atc_today":    {k:int(v) for k,v in atc_today.items()},
-        "sales_today":  {k:int(v) for k,v in sales_today.items()},
-    })
-
 _load_today_state()
 try: _rollover_if_needed()
 except Exception as e: print("[BOOT] rollover check error:", e)
 
 # Start background workers
-from threading import Thread
 Thread(target=flusher, daemon=True).start()
 Thread(target=daily_csv_worker, daemon=True).start()
 Thread(target=availability_poller, daemon=True).start()
