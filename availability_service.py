@@ -667,10 +667,12 @@ def send_to_manufacturing(*, sku: str, delta: int, before: int, after: int,
     if not (B_ENDPOINT_URL and A_TO_B_SHARED_SECRET):
         print("[MFG] skipped (missing B_ENDPOINT_URL or A_TO_B_SHARED_SECRET)", flush=True)
         return
+
     from datetime import datetime
     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     sku_compact = (sku or "").replace(" ", "")
     idem = f"{SOURCE_SITE}-{ts}-{sku_compact}-{after}"
+
     payload = {
         "event_type": "availability_drop",
         "source_site": SOURCE_SITE,
@@ -684,18 +686,37 @@ def send_to_manufacturing(*, sku: str, delta: int, before: int, after: int,
         "at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "idempotency_key": idem,
     }
+
     raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     sig = _mfg_hmac_b64(A_TO_B_SHARED_SECRET, raw)
-    try:
-        r = requests.post(
-            B_ENDPOINT_URL,
-            headers={"Content-Type":"application/json","X-A-Signature":sig,"X-Idempotency-Key":idem},
-            data=raw,
-            timeout=25
-        )
-        print(f"[MFG] POST {B_ENDPOINT_URL} -> {r.status_code} {r.text[:200]}", flush=True)
-    except Exception as e:
-        print(f"[MFG] error: {e}", flush=True)
+
+    # Robust send with retries (preserve idempotency key)
+    attempts, last_err = 0, None
+    while attempts < 3:
+        attempts += 1
+        try:
+            r = requests.post(
+                B_ENDPOINT_URL,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-A-Signature": sig,
+                    "X-Idempotency-Key": idem,
+                },
+                data=raw,
+                timeout=25,  # longer than before
+            )
+            print(f"[MFG] POST {B_ENDPOINT_URL} -> {r.status_code} {r.text[:200]}", flush=True)
+            if 200 <= r.status_code < 300:
+                break  # success (202 expected)
+            if r.status_code >= 500:
+                raise RuntimeError(f"server {r.status_code}")  # retry on 5xx
+            return  # 4xx -> config error; do not retry
+        except Exception as e:
+            last_err = e
+            if attempts >= 3:
+                print(f"[MFG] error (final): {e}", flush=True)
+                break
+            time.sleep(1 if attempts == 1 else 2)  # small backoff
 
 # ========================= DUAL-SITE SCANS =========================
 
