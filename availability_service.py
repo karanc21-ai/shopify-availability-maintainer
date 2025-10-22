@@ -691,7 +691,7 @@ def send_to_manufacturing(*, sku: str, delta: int, before: int, after: int,
             B_ENDPOINT_URL,
             headers={"Content-Type":"application/json","X-A-Signature":sig,"X-Idempotency-Key":idem},
             data=raw,
-            timeout=12
+            timeout=25
         )
         print(f"[MFG] POST {B_ENDPOINT_URL} -> {r.status_code} {r.text[:200]}", flush=True)
     except Exception as e:
