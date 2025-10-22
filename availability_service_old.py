@@ -3,40 +3,7 @@
 
 """
 Unified Shopify app: Dual-site availability sync + Counters + Daily CSV (IST)
-
-What it combines (superset of both apps)
-----------------------------------------
-A) Dual-site sync (India + USA)
-   - India scan: availability → badges/delivery/status, sales inference on drops,
-     clamp negatives to 0 (optional), temp discount (apply/revert), sales_total & sales_dates.
-   - USA scan: mirror decreases to India by exact SKU index; clamp negatives to 0 (optional);
-     temp discount; copy India's first-variant price → US metafield custom.priceinindia.
-   - Index: exact SKU → {product_id, inventory_item_id(first variant), variant_id(first variant), title, status}
-   - Persistence: in_last_seen/us_last_seen, in_sku_index, discount_state
-   - Logs: CSV + JSONL. HTTP: /health, /diag, /run, /rebuild_index
-   - Scheduler loop (optional) to run every RUN_EVERY_MIN
-
-B) Counters + Daily CSV (IST midnight)
-   - Pixel endpoints:
-       POST /track/product  (views_total)
-       POST /track/atc      (added_to_cart_total)
-     (scoped to ALLOWED_PIXEL_HOSTS env)
-   - Availability-based sales proxy (background polling) → sales_total, sales_dates
-   - DOB & AGE helpers:
-       /dob/set, /dob/bulk, /dob/backfill_created_at, /dob/set_all_today, /age/recompute, /age/seed_all
-   - Daily CSV ledger (12:00 AM IST): date_ist, product_id, views_today, atc_today, sales_today, age_in_days_today
-   - Background flusher pushes counters to metafields every FLUSH_INTERVAL_SEC
-
-Notes
------
-- Uses Shopify Admin GraphQL for reads/writes (metafields, listings) and REST for inventory adjust and variant pricing.
-- First Dual-site cycle is read-only (learn baselines + build index), then deltas apply.
-- Timezone: IST for CSV rollovers and "today" stamps, UTC for event ts normalization.
-
-Portability
------------
-- Tested for Python 3.10+ (Render default stacks). If you must run 3.8, swap typing `|` with Optional/Set and add backports.zoneinfo.
-
+(With manufacturing notifier wired in on availability drops)
 """
 
 import os
@@ -101,9 +68,9 @@ KEY_ATC = os.getenv("KEY_ATC", "added_to_cart_total").strip()
 KEY_AGE = os.getenv("KEY_AGE", "age_in_days").strip()
 KEY_DOB = os.getenv("KEY_DOB", "dob").strip()
 
-BADGE_READY = os.getenv("BADGE_READY", "Ready To Ship")
-DELIVERY_READY = os.getenv("DELIVERY_READY", "2-5 Days Across India")
-DELIVERY_MTO = os.getenv("DELIVERY_MTO", "12-15 Days Across India")
+BADGE_READY = os.getenv("BADGE_READY", "Ready To Ship").strip()
+DELIVERY_READY = os.getenv("DELIVERY_READY", "2-5 Days Across India").strip()
+DELIVERY_MTO = os.getenv("DELIVERY_MTO", "12-15 Days Across India").strip()
 
 # ---- Behavior toggles (Dual-site) ----
 USE_PRODUCT_CUSTOM_SKU = os.getenv("USE_PRODUCT_CUSTOM_SKU", "1") == "1"
@@ -134,12 +101,20 @@ ALLOWED_PIXEL_HOSTS = set(h.strip().lower() for h in (os.getenv("ALLOWED_PIXEL_H
 # IP ignore list for pixels (comma-separated single IPs or CIDRs)
 IGNORE_IPS_ENV = [s.strip() for s in os.getenv("IGNORE_IPS", "").split(",")] if os.getenv("IGNORE_IPS") else []
 
+# ---- App A -> App B Manufacturing notifier (NEW) ----
+ENABLE_MFG_NOTIFY = os.getenv("ENABLE_MFG_NOTIFY", "1") == "1"
+B_ENDPOINT_URL = os.getenv("B_ENDPOINT_URL", "").strip()  # e.g. https://manufacturing-handler.onrender.com/manufacturing/start
+A_TO_B_SHARED_SECRET = os.getenv("A_TO_B_SHARED_SECRET", "").strip()
+SOURCE_SITE = os.getenv("SOURCE_SITE", "IN").strip()
+
 # ---- Server & persistence ----
 DATA_DIR = os.getenv("DATA_DIR", ".").rstrip("/")
 os.makedirs(DATA_DIR, exist_ok=True)
 PORT = int(os.getenv("PORT", "10000"))
 FLUSH_INTERVAL_SEC = int(os.getenv("FLUSH_INTERVAL_SEC", "5"))
 LOG_TO_STDOUT = os.getenv("LOG_TO_STDOUT", "1") == "1"
+# quiet toggle for push logs
+QUIET_PUSH = os.getenv("QUIET_PUSH", "0") == "1"
 
 def p(*parts): return os.path.join(DATA_DIR, *parts)
 
@@ -678,6 +653,50 @@ def build_in_sku_index():
     save_json(IN_SKU_INDEX, index)
     log_row("🗂️", "IN", "INDEX_BUILT", message=f"entries={len(index)}")
 
+# ========================= MFG NOTIFIER (NEW) =========================
+
+def _mfg_hmac_b64(secret: str, raw: bytes) -> str:
+    import hashlib, hmac, base64
+    return base64.b64encode(hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).digest()).decode()
+
+def send_to_manufacturing(*, sku: str, delta: int, before: int, after: int,
+                          product_id: str = "", variant_id: str = "", title: str = "") -> None:
+    """Send signed JSON to App B when availability drops in IN."""
+    if not ENABLE_MFG_NOTIFY:
+        return
+    if not (B_ENDPOINT_URL and A_TO_B_SHARED_SECRET):
+        print("[MFG] skipped (missing B_ENDPOINT_URL or A_TO_B_SHARED_SECRET)", flush=True)
+        return
+    from datetime import datetime
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    sku_compact = (sku or "").replace(" ", "")
+    idem = f"{SOURCE_SITE}-{ts}-{sku_compact}-{after}"
+    payload = {
+        "event_type": "availability_drop",
+        "source_site": SOURCE_SITE,
+        "sku": sku,
+        "delta": int(delta),
+        "availability_before": int(before),
+        "availability_after": int(after),
+        "product_id": product_id,
+        "variant_id": variant_id,
+        "title": title,
+        "at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "idempotency_key": idem,
+    }
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    sig = _mfg_hmac_b64(A_TO_B_SHARED_SECRET, raw)
+    try:
+        r = requests.post(
+            B_ENDPOINT_URL,
+            headers={"Content-Type":"application/json","X-A-Signature":sig,"X-Idempotency-Key":idem},
+            data=raw,
+            timeout=12
+        )
+        print(f"[MFG] POST {B_ENDPOINT_URL} -> {r.status_code} {r.text[:200]}", flush=True)
+    except Exception as e:
+        print(f"[MFG] error: {e}", flush=True)
+
 # ========================= DUAL-SITE SCANS =========================
 
 def scan_india_and_update(read_only: bool = False):
@@ -705,12 +724,32 @@ def scan_india_and_update(read_only: bool = False):
                     except Exception as e: log_row("⚠️", "DISC", "WARN", product_id=pid, sku=sku, message=f"Apply discount pass error: {e}")
                 prev = _as_int_or_none(last_seen.get(pid))
                 if prev is None: prev = 0
+
                 if not read_only and avail < prev:
                     sold = prev - avail
                     bump_sales_in(IN_DOMAIN, IN_TOKEN, p["id"], p.get("salesTotal") or {}, p.get("salesDates") or {}, sold, today)
                     log_row("🧾➖", "IN", "SALES_BUMP", product_id=pid, sku=sku, delta=f"-{sold}", message=f"avail {prev}->{avail} (sold={sold})", title=title, before=str(prev), after=str(avail))
+                    # --- NEW: Notify manufacturing on drop
+                    try:
+                        v0 = variants[0] if variants else {}
+                        variant_id = gid_num(v0.get("id") or "")
+                        sku_eff = sku or (v0.get("sku") or "")
+                        print(f'[MFG] DROP DETECTED site={SOURCE_SITE} sku="{(sku_eff or "").strip()}" {prev}->{avail} delta={avail - prev}', flush=True)
+                        send_to_manufacturing(
+                            sku=(sku_eff or "").strip(),
+                            delta=avail - prev,  # negative
+                            before=prev,
+                            after=avail,
+                            product_id=pid,
+                            variant_id=variant_id,
+                            title=title
+                        )
+                    except Exception as e:
+                        print(f"[MFG] invoke error: {e}", flush=True)
+
                     try: revert_temp_discount_for_product("IN", IN_DOMAIN, IN_TOKEN, p)
                     except Exception as e: log_row("⚠️", "DISC", "WARN", product_id=pid, sku=sku, message=f"Revert on sale error: {e}")
+
                 if not read_only and CLAMP_AVAIL_TO_ZERO and avail < 0 and variants:
                     inv_item_gid = (((variants[0].get("inventoryItem") or {}).get("id")) or "")
                     inv_item_id = int(gid_num(inv_item_gid) or "0")
@@ -720,9 +759,11 @@ def scan_india_and_update(read_only: bool = False):
                         avail = 0
                     except Exception as e:
                         log_row("⚠️", "IN", "WARN", product_id=pid, sku=sku, message=f"Clamp error: {e}")
+
                 _, target_badge, target_delivery = desired_state(avail)
                 if not read_only:
                     set_product_metafields(IN_DOMAIN, IN_TOKEN, p["id"], p.get("badges") or {}, p.get("dtime") or {}, target_badge, target_delivery)
+
                 if (not read_only) and IN_CHANGE_STATUS and SPECIAL_STATUS_HANDLE and (handle == SPECIAL_STATUS_HANDLE):
                     if avail < 1 and status == "ACTIVE":
                         ok = update_product_status(IN_DOMAIN, IN_TOKEN, p["id"], "DRAFT")
@@ -730,6 +771,7 @@ def scan_india_and_update(read_only: bool = False):
                     elif avail >= 1 and status == "DRAFT":
                         ok = update_product_status(IN_DOMAIN, IN_TOKEN, p["id"], "ACTIVE")
                         log_row("✅", "IN", "STATUS_TO_ACTIVE" if ok else "STATUS_TO_ACTIVE_FAILED", product_id=pid, sku=sku, delta=str(avail), title=title, message=f"handle={handle}")
+
                 last_seen[pid] = max(0, int(avail))
                 sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
             save_json(IN_LAST_SEEN, last_seen)
@@ -1133,7 +1175,7 @@ def _availability_seed_all():
     current = _list_products_availability(AVAIL_POLL_PRODUCT_IDS if AVAIL_POLL_PRODUCT_IDS else None)
     with lock:
         last_avail.clear()
-        last_avail.update({pid:int(av) for pid,av in current.items()})
+        last_avail.update({k:int(v) for k,v in current.items()})
     _persist_all()
     return len(current)
 
@@ -1219,6 +1261,12 @@ def diag():
         "inventory_poll_sec": INVENTORY_POLL_SEC,
         "allowed_pixel_hosts": sorted(list(ALLOWED_PIXEL_HOSTS)),
         "daily_csv": DAILY_CSV,
+
+        # manufacturing notifier
+        "mfg_notify_enabled": ENABLE_MFG_NOTIFY,
+        "b_endpoint": bool(B_ENDPOINT_URL),
+        "a_to_b_secret": bool(A_TO_B_SHARED_SECRET),
+        "source_site": SOURCE_SITE,
     }
     return _cors(jsonify(info)), 200
 
@@ -1549,7 +1597,7 @@ def flusher():
                 mfs.append({"ownerId": f"gid://shopify/Product/{pid}", "namespace": MF_NAMESPACE, "key": KEY_AGE, "type": "number_integer", "value": str(int(age_days.get(pid, 0)))})
         CHUNK = 25
         items = list(mfs)
-        if items:
+        if items and not QUIET_PUSH:
             try:
                 print(f"[PUSH] preview ownerId/key/type -> {items[0].get('ownerId')}, {items[0].get('key')}, {items[0].get('type')}")
             except Exception:
@@ -1557,7 +1605,8 @@ def flusher():
         for i in range(0, len(items), CHUNK):
             chunk = items[i:i+CHUNK]
             ok = metafields_set(ADMIN_HOST_LOCAL, TOKEN_LOCAL, chunk)
-            print(f"[PUSH] {ADMIN_HOST_LOCAL}: {len(chunk)} -> {'OK' if ok else 'ERR'}")
+            if not QUIET_PUSH:
+                print(f"[PUSH] {ADMIN_HOST_LOCAL}: {len(chunk)} -> {'OK' if ok else 'ERR'}")
             time.sleep(0.3)
         _persist_all()
         
@@ -1589,12 +1638,13 @@ def flush_once():
             mfs.append({"ownerId": f"gid://shopify/Product/{pid}", "namespace": MF_NAMESPACE, "key": KEY_AGE, "type": "number_integer", "value": str(int(age_days.get(pid, 0)))})
     CHUNK = 25
     items = list(mfs)
-    if items:
+    if items and not QUIET_PUSH:
         print(f"[PUSH] preview ownerId/key/type -> {items[0].get('ownerId')}, {items[0].get('key')}, {items[0].get('type')}", flush=True)
     for i in range(0, len(items), CHUNK):
         chunk = items[i:i+CHUNK]
         ok = metafields_set(ADMIN_HOST_LOCAL, TOKEN_LOCAL, chunk)
-        print(f"[PUSH] {ADMIN_HOST_LOCAL}: {len(chunk)} -> {'OK' if ok else 'ERR'}", flush=True)
+        if not QUIET_PUSH:
+            print(f"[PUSH] {ADMIN_HOST_LOCAL}: {len(chunk)} -> {'OK' if ok else 'ERR'}", flush=True)
         time.sleep(0.3)
     _persist_all()
 
