@@ -661,7 +661,7 @@ def _mfg_hmac_b64(secret: str, raw: bytes) -> str:
 
 def send_to_manufacturing(*, sku: str, delta: int, before: int, after: int,
                           product_id: str = "", variant_id: str = "", title: str = "") -> None:
-    """Send signed JSON to App B when availability drops in IN."""
+    """Send signed JSON to App B when availability drops in IN (robust)."""
     if not ENABLE_MFG_NOTIFY:
         return
     if not (B_ENDPOINT_URL and A_TO_B_SHARED_SECRET):
@@ -690,33 +690,46 @@ def send_to_manufacturing(*, sku: str, delta: int, before: int, after: int,
     raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     sig = _mfg_hmac_b64(A_TO_B_SHARED_SECRET, raw)
 
-    # Robust send with retries (preserve idempotency key)
-    attempts, last_err = 0, None
-    while attempts < 3:
-        attempts += 1
+    # Retry policy
+    RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+    MAX_ATTEMPTS = 8
+    TIMEOUT_S = 25
+    BASE = 0.8
+    CAP = 20.0
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-A-Signature": sig,
+        "X-Idempotency-Key": idem,
+        # calm some proxies/load balancers
+        "Accept-Encoding": "identity",
+        "Connection": "close",
+    }
+
+    last_err = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            r = requests.post(
-                B_ENDPOINT_URL,
-                headers={
-                    "Content-Type": "application/json",
-                    "X-A-Signature": sig,
-                    "X-Idempotency-Key": idem,
-                },
-                data=raw,
-                timeout=25,  # longer than before
-            )
-            print(f"[MFG] POST {B_ENDPOINT_URL} -> {r.status_code} {r.text[:200]}", flush=True)
-            if 200 <= r.status_code < 300:
-                break  # success (202 expected)
-            if r.status_code >= 500:
-                raise RuntimeError(f"server {r.status_code}")  # retry on 5xx
-            return  # 4xx -> config error; do not retry
-        except Exception as e:
+            r = requests.post(B_ENDPOINT_URL, data=raw, headers=headers, timeout=TIMEOUT_S)
+            # Treat explicit ack from App B as success even if status is 5xx (edge glitch)
+            if r.status_code < 400 or r.headers.get("X-AppB-Ack"):
+                print(f"[MFG] POST {B_ENDPOINT_URL} -> {r.status_code} {r.text[:200]}", flush=True)
+                return
+            # Retry only if status is in our retryable set; else stop
+            if r.status_code not in RETRYABLE_STATUS:
+                print(f"[MFG] POST {B_ENDPOINT_URL} -> {r.status_code} {r.text[:200]}", flush=True)
+                return
+        except requests.RequestException as e:
             last_err = e
-            if attempts >= 3:
-                print(f"[MFG] error (final): {e}", flush=True)
-                break
-            time.sleep(1 if attempts == 1 else 2)  # small backoff
+
+        # jittered exponential backoff
+        sleep_s = min(CAP, BASE * (2 ** (attempt - 1))) + random.uniform(0.2, 0.8)
+        time.sleep(sleep_s)
+
+    # Exhausted
+    if last_err:
+        print(f"[MFG] error (final): {last_err}", flush=True)
+    else:
+        print(f"[MFG] error (final): retries exhausted", flush=True)
 
 # ========================= DUAL-SITE SCANS =========================
 
