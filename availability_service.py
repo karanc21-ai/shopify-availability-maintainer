@@ -3,7 +3,39 @@
 
 """
 Unified Shopify app: Dual-site availability sync + Counters + Daily CSV (IST)
-(With manufacturing notifier wired in on availability drops)
+
+What this script does
+---------------------
+1) Scans your IN (and optionally US) Shopify stores by collection:
+   - Tracks per-product availability (sum of tracked variant quantities).
+   - On availability drop in IN:
+       • bumps sales counters & dates metafields,
+       • (NEW) sets custom.start_manufacturing="Start Manufacturing" so your team
+         can manually kick off manufacturing,
+       • optionally notifies a separate Manufacturing Handler app (App B),
+       • reverts temporary discounts,
+       • clamps negative availability back to 0.
+   - Updates product metafields for badges and delivery time depending on availability.
+   - (Optional) Changes product status to DRAFT/ACTIVE for a special collection.
+   - (US→IN) Mirrors US decreases to IN stock (by SKU index) and syncs price-in-India metafield.
+
+2) Counters and Pixels:
+   - Lightweight endpoints to record views/add-to-cart events and push rolling totals to metafields.
+   - Maintains a daily CSV snapshot in IST.
+   - Optional inventory polling to infer sales by availability drops.
+
+3) Ops & Admin:
+   - Health/diag endpoints, state persistence, index building, scheduler loop.
+   - Robust Shopify GraphQL/REST calls with throttling-aware retries.
+
+New in this version
+-------------------
+- Manual manufacturing gate: sets metafield `custom.start_manufacturing = "Start Manufacturing"`
+  on any availability DROP in IN. Optional auto-clear on availability INCREASE.
+- Config via:
+    MF_START_MFG_KEY (default "start_manufacturing")
+    START_MFG_VALUE  (default "Start Manufacturing")
+    AUTO_CLEAR_START_MFG_ON_INCREASE (default "0" -> disabled)
 """
 
 import os
@@ -68,6 +100,11 @@ KEY_VIEWS = os.getenv("KEY_VIEWS", "views_total").strip()
 KEY_ATC = os.getenv("KEY_ATC", "added_to_cart_total").strip()
 KEY_AGE = os.getenv("KEY_AGE", "age_in_days").strip()
 KEY_DOB = os.getenv("KEY_DOB", "dob").strip()
+
+# --- Manufacturing trigger metafield (manual gate) ---
+MF_START_MFG_KEY = os.getenv("MF_START_MFG_KEY", "start_manufacturing").strip()
+START_MFG_VALUE  = os.getenv("START_MFG_VALUE", "Start Manufacturing").strip()
+AUTO_CLEAR_START_MFG_ON_INCREASE = os.getenv("AUTO_CLEAR_START_MFG_ON_INCREASE", "0") == "1"
 
 BADGE_READY = os.getenv("BADGE_READY", "Ready To Ship").strip()
 DELIVERY_READY = os.getenv("DELIVERY_READY", "2-5 Days Across India").strip()
@@ -492,6 +529,49 @@ def bump_sales_in(domain: str, token: str, product_gid: str, sales_total_node: d
     if errs:
         log_row("⚠️", "IN", "WARN", product_id=gid_num(product_gid), message=f"sales metafieldsSet errors: {errs}")
 
+# --- NEW: manual manufacturing flag helper ---
+def set_start_manufacturing_flag(domain: str, token: str, product_gid: str, value: str):
+    """
+    Sets custom.start_manufacturing to the given value (string).
+    If value == "", delete the metafield (keeps admin clean).
+    """
+    try:
+        mf_type = get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, MF_START_MFG_KEY) or "single_line_text_field"
+        if value:
+            mutation = """
+              mutation($mfs:[MetafieldsSetInput!]!){
+                metafieldsSet(metafields:$mfs){ userErrors{ field message } }
+              }"""
+            mfs = [{
+                "ownerId": product_gid,
+                "namespace": MF_NAMESPACE,
+                "key": MF_START_MFG_KEY,
+                "type": mf_type,
+                "value": value
+            }]
+            data = gql(domain, token, mutation, {"mfs": mfs})
+            errs = ((data.get("metafieldsSet") or {}).get("userErrors") or [])
+            if errs:
+                log_row("⚠️", "IN", "START_MFG_WARN", product_id=gid_num(product_gid), message=f"set errors: {errs}")
+            else:
+                log_row("🏁", "IN", "START_MFG_SET", product_id=gid_num(product_gid), message=f"{MF_NAMESPACE}.{MF_START_MFG_KEY}={value}")
+        else:
+            # fetch existing metafield id and delete if present
+            q = """
+              query($id:ID!){
+                node(id:$id){ ... on Product {
+                  mf: metafield(namespace:"%s", key:"%s"){ id }
+                }}}""" % (MF_NAMESPACE, MF_START_MFG_KEY)
+            data = gql(domain, token, q, {"id": product_gid})
+            mf = (((data or {}).get("node") or {}).get("mf") or {})
+            mf_id = mf.get("id")
+            if mf_id:
+                delm = "mutation($id:ID!){ metafieldDelete(input:{id:$id}){ userErrors{ message } } }"
+                gql(domain, token, delm, {"id": mf_id})
+                log_row("🧹", "IN", "START_MFG_CLEARED", product_id=gid_num(product_gid), message="deleted metafield")
+    except Exception as e:
+        log_row("⚠️", "IN", "START_MFG_ERROR", product_id=gid_num(product_gid), message=str(e))
+
 # --- temp discount helpers ---
 def ceil_to_step(value: float, step: int) -> float:
     if step <= 1: return math.ceil(value * 100) / 100.0
@@ -760,12 +840,25 @@ def scan_india_and_update(read_only: bool = False):
                 prev = _as_int_or_none(last_seen.get(pid))
                 if prev is None: prev = 0
 
+                # NEW: Auto-clear manual manufacturing flag if availability increased (optional)
+                if not read_only and AUTO_CLEAR_START_MFG_ON_INCREASE and avail > prev:
+                    try:
+                        set_start_manufacturing_flag(IN_DOMAIN, IN_TOKEN, p["id"], "")
+                    except Exception as e:
+                        log_row("⚠️", "IN", "START_MFG_WARN", product_id=pid, sku=sku, message=f"clear flag error: {e}")
+
                 if not read_only and avail < prev:
                     sold = prev - avail
                     bump_sales_in(IN_DOMAIN, IN_TOKEN, p["id"], p.get("salesTotal") or {}, p.get("salesDates") or {}, sold, today)
                     log_row("🧾➖", "IN", "SALES_BUMP", product_id=pid, sku=sku, delta=f"-{sold}", message=f"avail {prev}->{avail} (sold={sold})", title=title, before=str(prev), after=str(avail))
 
-                    # --- NEW: Notify manufacturing on drop (idempotent + retries)
+                    # NEW: set manual manufacturing trigger metafield
+                    try:
+                        set_start_manufacturing_flag(IN_DOMAIN, IN_TOKEN, p["id"], START_MFG_VALUE)
+                    except Exception as e:
+                        log_row("⚠️", "IN", "START_MFG_WARN", product_id=pid, sku=sku, message=f"set flag error: {e}")
+
+                    # --- Notify manufacturing (idempotent) via helper
                     try:
                         v0 = variants[0] if variants else {}
                         variant_id = gid_num(v0.get("id") or "")
