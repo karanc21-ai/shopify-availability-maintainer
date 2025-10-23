@@ -20,6 +20,10 @@ What this script does
    - (US→IN) Mirrors US decreases to IN stock (by SKU index) and syncs price-in-India metafield.
 
 2) Counters and Pixels:
+
+
+
+
    - Lightweight endpoints to record views/add-to-cart events and push rolling totals to metafields.
    - Maintains a daily CSV snapshot in IST.
    - Optional inventory polling to infer sales by availability drops.
