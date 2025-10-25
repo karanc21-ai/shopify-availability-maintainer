@@ -490,7 +490,7 @@ def set_product_metafields(domain: str, token: str, product_gid: str, badges_nod
             mf_inputs.append({"ownerId": product_gid, "namespace": MF_NAMESPACE, "key": MF_BADGES_KEY, "type": badges_type, "value": target_badge})
     else:
         if (badges_node or {}).get("id"):
-            delm = "mutation($metafields:[MetafieldDeleteInput!]!){ metafieldsDelete(metafields:$metafields){ deletedMetafieldIds userErrors{field message code} } }"
+            delm = "mutation($metafields:[MetafieldIdentifierInput!]!){ metafieldsDelete(metafields:$metafields){ deletedMetafields { key namespace ownerId } userErrors{ field message } } }"
             gql(domain, token, delm, {"metafields": [{"ownerId": product_gid, "namespace": MF_NAMESPACE, "key": MF_BADGES_KEY}]})
     mf_inputs.append({"ownerId": product_gid, "namespace": MF_NAMESPACE, "key": MF_DELIVERY_KEY, "type": delivery_type, "value": target_delivery})
     if mf_inputs:
@@ -570,7 +570,7 @@ def set_start_manufacturing_flag(domain: str, token: str, product_gid: str, valu
             mf = (((data or {}).get("node") or {}).get("mf") or {})
             mf_id = mf.get("id")
             if mf_id:
-                delm = "mutation($metafields:[MetafieldDeleteInput!]!){ metafieldsDelete(metafields:$metafields){ deletedMetafieldIds userErrors{ field message code } } }"
+                delm = "mutation($metafields:[MetafieldIdentifierInput!]!){ metafieldsDelete(metafields:$metafields){ deletedMetafields { key namespace ownerId } userErrors{ field message } } }"
                 gql(domain, token, delm, {"metafields": [{"ownerId": product_gid, "namespace": MF_NAMESPACE, "key": MF_START_MFG_KEY}]})
                 log_row("🧹", "IN", "START_MFG_CLEARED", product_id=gid_num(product_gid), message="deleted metafield")
     except Exception as e:
