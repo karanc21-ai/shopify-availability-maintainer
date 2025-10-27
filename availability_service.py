@@ -4,66 +4,32 @@
 """
 Unified Shopify app: Dual-site availability sync + Counters + Daily CSV (IST)
 
-What this script does
----------------------
-1) Scans your IN (and optionally US) Shopify stores by collection:
-   - Tracks per-product availability (sum of tracked variant quantities).
-   - On availability drop in IN:
-       • bumps sales counters & dates metafields,
-       • (NEW) sets custom.start_manufacturing="Start Manufacturing" so your team
-         can manually kick off manufacturing,
-       • optionally notifies a separate Manufacturing Handler app (App B),
-       • reverts temporary discounts,
-       • clamps negative inventory back to 0 if needed,
-       • updates "Ready To Ship" badge + India delivery timeline metafields,
-       • (optionally) moves products between ACTIVE <-> DRAFT on the IN shop,
-   - Mirrors US availability decreases back into IN inventory levels, if desired.
-   - Mirrors the "price in India" metafield to the US shop.
-   - (NEW) Mirrors "status_in_india" metafield to the US shop so US PDP can say
-     "ships from India, reaches US in ~10-12 days".
+This script:
+1) Scans India store (IN):
+   - Tracks availability per product using variant inventory.
+   - When availability drops:
+       • bumps sales counters & sale dates metafields,
+       • sets custom.start_manufacturing so ops can see it must be manufactured,
+       • notifies manufacturing_handler (App B),
+       • reverts temp discounts,
+       • clamps negative inventory back to 0,
+       • updates "Ready To Ship" badge and delivery_time metafields,
+       • (optional) flips product ACTIVE/DRAFT based on stock.
+   - Records, for each SKU, whether that product is "2-5 Days Across India" or "12-15 Days Across India".
+     We persist that map to disk for the US sync.
 
-2) Keeps a durable per-variant "last seen" availability, so we can diff stock
-   without relying on Shopify webhooks.
+2) Scans US store (US):
+   - Mirrors "price in India" into custom.priceinindia on US products.
+   - Mirrors the India readiness string into custom.status_in_india on US products.
+     That lets the US PDP say "in stock in India, reaches you in ~10-12 days".
+   - Only writes metafields if something changed.
+   - Sleeps ONLY if it actually wrote, reducing rate-limit pressure.
+   - Mirrors any US availability *drops* back into IN inventory (if MIRROR_US_INCREASES etc.), and can clamp.
 
-3) Maintains per-SKU counters:
-   - total units "sold" inferred from availability drops,
-   - first sale date / recent sale date,
-   - cumulative totals,
-   - etc.
-   These are written into metafields on IN products.
+3) Maintains per-SKU counters (views / ATC / sales) via lightweight /pixel/* endpoints.
+   Rolls them into a CSV once per IST day and stores daily snapshots.
 
-4) Tracks temp discount state + applies or reverts temporary discounts.
-
-5) Exposes:
-   - a scheduler loop (optional),
-   - debug endpoints (/diag, /health, /run-now, /flush-now, /rebuild-index),
-   - COUNTERS pixel endpoints (/pixel/view, /pixel/atc, /pixel/sale)
-     to increment views/add-to-cart/sales counters in memory, then flush them
-     periodically back to metafields and CSV in IST time.
-
-Environment variables (selected)
----------------------------------
-IN_DOMAIN, IN_TOKEN
-US_DOMAIN, US_TOKEN
-IN_COLLECTIONS, US_COLLECTIONS
-IN_LOCATION_ID, US_LOCATION_ID
-MF_NAMESPACE, MF_BADGES_KEY, MF_DELIVERY_KEY, MF_PRICEIN_KEY
-KEY_SALES, KEY_DATES
-KEY_VIEWS, KEY_ATC, KEY_TOTAL_SALES, KEY_SALE_DATES
-KEY_AGE_DAYS, KEY_DOB
-SPECIAL_STATUS_HANDLE, IN_CHANGE_STATUS
-MIRROR_US_INCREASES
-ONLY_ACTIVE_FOR_MAPPING
-USE_PRODUCT_CUSTOM_SKU
-CLAMP_AVAIL_TO_ZERO
-RUN_EVERY_MIN, ENABLE_SCHEDULER
-SLEEP_BETWEEN_PRODUCTS_MS, SLEEP_BETWEEN_PAGES_MS, SLEEP_BETWEEN_SHOPS_MS
-MUTATION_SLEEP_SEC
-ROUND_STEP_INR, ROUND_STEP_USD
-BADGE_READY, DELIVERY_READY, DELIVERY_MTO
-MF_START_MFG_KEY (default "start_manufacturing")
-START_MFG_VALUE  (default "Start Manufacturing")
-AUTO_CLEAR_START_MFG_ON_INCREASE (default "0" -> disabled)
+4) Provides /run-now, /rebuild-index, /diag, /health HTTP endpoints.
 """
 
 import os
@@ -83,11 +49,14 @@ from pathlib import Path
 
 import requests
 from flask import Flask, request, jsonify, make_response, send_file
+
 from mfg_notify import notify_mfg_sale
+
 
 # =============================== CONFIG (ENV) ===============================
 
 API_VERSION = os.getenv("API_VERSION", "2024-10").strip()
+
 PIXEL_SHARED_SECRET = os.getenv("PIXEL_SHARED_SECRET", "").strip()
 if not PIXEL_SHARED_SECRET:
     raise SystemExit("PIXEL_SHARED_SECRET required")
@@ -113,47 +82,46 @@ US_TOKEN = os.getenv("US_TOKEN", "").strip()
 US_COLLECTIONS = [c.strip() for c in os.getenv("US_COLLECTIONS", "").split(",") if c.strip()]
 US_LOCATION_ID = int(os.getenv("US_LOCATION_ID", "0") or "0")
 
-# ---- Availability metafields ----
-MF_NAMESPACE = os.getenv("MF_NAMESPACE", "custom").strip()
-MF_BADGES_KEY = os.getenv("MF_BADGES_KEY", "badges").strip()
-MF_DELIVERY_KEY = os.getenv("MF_DELIVERY_KEY", "delivery_time").strip()
-MF_PRICEIN_KEY = os.getenv("MF_PRICEIN_KEY", "priceinindia").strip()  # on US product
+# ---- Metafields / keys ----
+MF_NAMESPACE      = os.getenv("MF_NAMESPACE", "custom").strip()
+MF_BADGES_KEY     = os.getenv("MF_BADGES_KEY", "badges").strip()
+MF_DELIVERY_KEY   = os.getenv("MF_DELIVERY_KEY", "delivery_time").strip()
+MF_PRICEIN_KEY    = os.getenv("MF_PRICEIN_KEY", "priceinindia").strip()  # used on US
+TEMP_DISC_KEY     = os.getenv("TEMP_DISC_KEY", "temp_discount_active").strip()  # Integer metafield on IN
 
-KEY_SALES = os.getenv("KEY_SALES", "sales_total").strip()
-KEY_DATES = os.getenv("KEY_DATES", "sale_dates").strip()
+KEY_SALES         = os.getenv("KEY_SALES", "sales_total").strip()
+KEY_DATES         = os.getenv("KEY_DATES", "sale_dates").strip()
 
-# Counters metafields
-KEY_VIEWS = os.getenv("KEY_VIEWS", "view_counts").strip()
-KEY_ATC = os.getenv("KEY_ATC", "atc_counts").strip()
-KEY_TOTAL_SALES = os.getenv("KEY_TOTAL_SALES", "sales_counts").strip()
-KEY_SALE_DATES = os.getenv("KEY_SALE_DATES", "sale_dates").strip()
+KEY_VIEWS         = os.getenv("KEY_VIEWS", "view_counts").strip()
+KEY_ATC           = os.getenv("KEY_ATC", "atc_counts").strip()
+KEY_TOTAL_SALES   = os.getenv("KEY_TOTAL_SALES", "sales_counts").strip()
+KEY_SALE_DATES    = os.getenv("KEY_SALE_DATES", "sale_dates").strip()
 
-# Age metafields
-KEY_AGE_DAYS = os.getenv("KEY_AGE_DAYS", "age_days").strip()
-KEY_DOB = os.getenv("KEY_DOB", "dob").strip()
+KEY_AGE_DAYS      = os.getenv("KEY_AGE_DAYS", "age_days").strip()
+KEY_DOB           = os.getenv("KEY_DOB", "dob").strip()
 
-# --- Manufacturing trigger metafield (manual gate) ---
-MF_START_MFG_KEY = os.getenv("MF_START_MFG_KEY", "start_manufacturing").strip()
-START_MFG_VALUE  = os.getenv("START_MFG_VALUE", "Start Manufacturing").strip()
+# --- Metafield for manufacturing signal ---
+MF_START_MFG_KEY  = os.getenv("MF_START_MFG_KEY", "start_manufacturing").strip()
+START_MFG_VALUE   = os.getenv("START_MFG_VALUE", "Start Manufacturing").strip()
 AUTO_CLEAR_START_MFG_ON_INCREASE = os.getenv("AUTO_CLEAR_START_MFG_ON_INCREASE", "0") == "1"
 
-BADGE_READY = os.getenv("BADGE_READY", "Ready To Ship").strip()
-DELIVERY_READY = os.getenv("DELIVERY_READY", "2-5 Days Across India").strip()
-DELIVERY_MTO = os.getenv("DELIVERY_MTO", "12-15 Days Across India").strip()
+# --- Badge + delivery text values for India ---
+BADGE_READY       = os.getenv("BADGE_READY", "Ready To Ship").strip()
+DELIVERY_READY    = os.getenv("DELIVERY_READY", "2-5 Days Across India").strip()
+DELIVERY_MTO      = os.getenv("DELIVERY_MTO", "12-15 Days Across India").strip()
 
-# ---- Behavior toggles (Dual-site) ----
-USE_PRODUCT_CUSTOM_SKU = os.getenv("USE_PRODUCT_CUSTOM_SKU", "1") == "1"
-ONLY_ACTIVE_FOR_MAPPING = os.getenv("ONLY_ACTIVE_FOR_MAPPING", "1") == "1"
-MIRROR_US_INCREASES = os.getenv("MIRROR_US_INCREASES", "0") == "1"
-CLAMP_AVAIL_TO_ZERO = os.getenv("CLAMP_AVAIL_TO_ZERO", "1") == "1"
+# ---- Behavior toggles ----
+USE_PRODUCT_CUSTOM_SKU   = os.getenv("USE_PRODUCT_CUSTOM_SKU", "1") == "1"
+ONLY_ACTIVE_FOR_MAPPING  = os.getenv("ONLY_ACTIVE_FOR_MAPPING", "1") == "1"
+MIRROR_US_INCREASES      = os.getenv("MIRROR_US_INCREASES", "0") == "1"
+CLAMP_AVAIL_TO_ZERO      = os.getenv("CLAMP_AVAIL_TO_ZERO", "1") == "1"
 
-# ---- Discount rounding steps ----
-ROUND_STEP_INR = int(os.getenv("DISCOUNT_ROUND_STEP_INR", "5"))
-ROUND_STEP_USD = int(os.getenv("DISCOUNT_ROUND_STEP_USD", "5"))
+ROUND_STEP_INR           = int(os.getenv("DISCOUNT_ROUND_STEP_INR", "5"))
+ROUND_STEP_USD           = int(os.getenv("DISCOUNT_ROUND_STEP_USD", "5"))
 
-# ---- Counters app: Admin host/token (single-host counters target) ----
-ADMIN_HOST = os.getenv("ADMIN_HOST", IN_DOMAIN or "silver-rudradhan.myshopify.com")
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", IN_TOKEN)
+# ---- Counters app: Admin host/token (for polling/inventory watcher) ----
+ADMIN_HOST   = os.getenv("ADMIN_HOST", IN_DOMAIN or "silver-rudradhan.myshopify.com")
+ADMIN_TOKEN  = os.getenv("ADMIN_TOKEN", IN_TOKEN)
 if not ADMIN_TOKEN:
     raise SystemExit("ADMIN_TOKEN (or IN_TOKEN) required for counters")
 ADMIN_TOKENS: Dict[str, str] = {ADMIN_HOST: ADMIN_TOKEN}
@@ -162,50 +130,57 @@ SHOPIFY_WEBHOOK_SECRET = os.getenv("SHOPIFY_WEBHOOK_SECRET", "").strip()
 if not SHOPIFY_WEBHOOK_SECRET:
     print("[WARN] SHOPIFY_WEBHOOK_SECRET not set; /webhook/products_create verification will fail.")
 
-# ---- Counters app: polling + pixel hosts ----
-INVENTORY_POLL_SEC = int(os.getenv("INVENTORY_POLL_SEC", "0"))  # 0 disables availability polling
-AVAIL_POLL_PRODUCT_IDS: Set[str] = set(s.strip() for s in (os.getenv("AVAIL_POLL_PRODUCT_IDS","") or "").split(",") if s.strip())
+# ---- Counters app polling ----
+INVENTORY_POLL_SEC = int(os.getenv("INVENTORY_POLL_SEC", "0"))
+AVAIL_POLL_PRODUCT_IDS: Set[str] = set(
+    s.strip() for s in (os.getenv("AVAIL_POLL_PRODUCT_IDS", "") or "").split(",") if s.strip()
+)
 
-ALLOWED_PIXEL_HOSTS = set(h.strip().lower() for h in (os.getenv("ALLOWED_PIXEL_HOSTS","silver-rudradhan.myshopify.com").split(",")))
-# IP ignore list for pixels (comma-separated single IPs or CIDRs)
+ALLOWED_PIXEL_HOSTS = set(
+    h.strip().lower()
+    for h in (os.getenv("ALLOWED_PIXEL_HOSTS","silver-rudradhan.myshopify.com").split(","))
+)
+
+# IP ignore list for pixel counters
 IGNORE_IPS_ENV = [s.strip() for s in os.getenv("IGNORE_IPS", "").split(",")] if os.getenv("IGNORE_IPS") else []
 
-# ---- App A -> App B Manufacturing notifier (NEW) ----
-ENABLE_MFG_NOTIFY = os.getenv("ENABLE_MFG_NOTIFY", "1") == "1"
-B_ENDPOINT_URL = os.getenv("B_ENDPOINT_URL", "").strip()  # e.g. https://manufacturing-handler.onrender.com/manufacturing/start
-A_TO_B_SHARED_SECRET = os.getenv("A_TO_B_SHARED_SECRET", "").strip()
-SOURCE_SITE = os.getenv("SOURCE_SITE", "IN").strip()
+# ---- Manufacturing handler bridge (App A -> App B) ----
+ENABLE_MFG_NOTIFY      = os.getenv("ENABLE_MFG_NOTIFY", "1") == "1"
+B_ENDPOINT_URL         = os.getenv("B_ENDPOINT_URL", "").strip()
+A_TO_B_SHARED_SECRET   = os.getenv("A_TO_B_SHARED_SECRET", "").strip()
+SOURCE_SITE            = os.getenv("SOURCE_SITE", "IN").strip()  # "IN" or "US" etc.
 
-# ---- Server & persistence ----
+# ---- Paths / persistence ----
 DATA_DIR = os.getenv("DATA_DIR", ".").rstrip("/")
 os.makedirs(DATA_DIR, exist_ok=True)
+
 PORT = int(os.getenv("PORT", "10000"))
 FLUSH_INTERVAL_SEC = int(os.getenv("FLUSH_INTERVAL_SEC", "5"))
 LOG_TO_STDOUT = os.getenv("LOG_TO_STDOUT", "1") == "1"
-# quiet toggle for push logs
 QUIET_PUSH = os.getenv("QUIET_PUSH", "0") == "1"
 
 def p(*parts): return os.path.join(DATA_DIR, *parts)
 
-# Dual-site persistence
-IN_LAST_SEEN = p("in_last_seen.json")
-US_LAST_SEEN = p("us_last_seen.json")
-STATE_PATH = p("dual_state.json")
-IN_SKU_INDEX = p("in_sku_index.json")
-IN_DELIVERY_MAP = p("in_delivery_map.json")  # SKU -> delivery_time for USA sync
-LOG_CSV = p("dual_sync_log.csv")
-LOG_JSONL = p("dual_sync_log.jsonl")
-DISC_STATE = p("discount_state.json")
+# "last seen" / index persistence
+IN_LAST_SEEN   = p("in_last_seen.json")
+US_LAST_SEEN   = p("us_last_seen.json")
+STATE_PATH     = p("dual_state.json")
+IN_SKU_INDEX   = p("in_sku_index.json")
+IN_DELIVERY_MAP = p("in_delivery_map.json")  # NEW: SKU -> "2-5 Days..." / "12-15 Days..."
+LOG_CSV        = p("dual_sync_log.csv")
+LOG_JSONL      = p("dual_sync_log.jsonl")
+DISC_STATE     = p("discount_state.json")
 
-# Counters persistence
-EVENTS_CSV = p("events.csv")
-ATC_CSV    = p("atc_events.csv")
-VIEWS_JSON = p("view_counts.json")
-ATC_JSON   = p("atc_counts.json")
-SALES_JSON = p("sales_counts.json")
+# counters persistence
+EVENTS_CSV      = p("events.csv")
+ATC_CSV         = p("atc_events.csv")
+VIEWS_JSON      = p("view_counts.json")
+ATC_JSON        = p("atc_counts.json")
+SALES_JSON      = p("sales_counts.json")
 SALE_DATES_JSON = p("sale_dates.json")
-AGE_JSON   = p("age_days.json")
-DOB_CACHE_JSON = p("dob_cache.json")
+AGE_JSON        = p("age_days.json")
+DOB_CACHE_JSON  = p("dob_cache.json")
+
 
 # ======================================================================
 # ========================= LOW-LEVEL HELPERS ==========================
@@ -218,8 +193,7 @@ def hdr(token: str) -> dict:
     }
 
 def _backoff_delay(attempt: int, base: float = 0.5, mx: float = 10.0) -> float:
-    # simple jittered exponential backoff
-    import random
+    # jittered exponential backoff for throttling
     return min(mx, base * (2 ** (attempt-1))) + random.random() * 0.2
 
 def gql(domain: str, token: str, query: str, variables: dict = None) -> dict:
@@ -227,7 +201,12 @@ def gql(domain: str, token: str, query: str, variables: dict = None) -> dict:
     last_err = None
     for attempt in range(1, 8):
         try:
-            r = requests.post(url, headers=hdr(token), json={"query": query, "variables": variables or {}}, timeout=60)
+            r = requests.post(
+                url,
+                headers=hdr(token),
+                json={"query": query, "variables": variables or {}},
+                timeout=60
+            )
             if r.status_code in (429,) or r.status_code >= 500:
                 time.sleep(_backoff_delay(attempt, base=0.4))
                 continue
@@ -235,6 +214,7 @@ def gql(domain: str, token: str, query: str, variables: dict = None) -> dict:
                 raise RuntimeError(f"GraphQL HTTP {r.status_code}: {r.text}")
             data = r.json()
             if data.get("errors"):
+                # retry if throttled
                 if any((e.get("extensions") or {}).get("code", "").upper() == "THROTTLED" for e in data["errors"]):
                     time.sleep(_backoff_delay(attempt, base=0.4))
                     continue
@@ -247,7 +227,11 @@ def gql(domain: str, token: str, query: str, variables: dict = None) -> dict:
 
 def rest_adjust_inventory(domain: str, token: str, inventory_item_id: int, location_id: int, delta: int) -> None:
     url = f"https://{domain}/admin/api/{API_VERSION}/inventory_levels/adjust.json"
-    payload = {"inventory_item_id": int(inventory_item_id),"location_id": int(location_id), "available_adjustment": int(delta)}
+    payload = {
+        "inventory_item_id": int(inventory_item_id),
+        "location_id": int(location_id),
+        "available_adjustment": int(delta)
+    }
     last_err = None
     for attempt in range(1, 6):
         r = requests.post(url, headers=hdr(token), json=payload, timeout=30)
@@ -259,7 +243,8 @@ def rest_adjust_inventory(domain: str, token: str, inventory_item_id: int, locat
             time.sleep(_backoff_delay(attempt))
             continue
         return
-    if last_err: raise last_err
+    if last_err:
+        raise last_err
 
 def rest_get_variant(domain: str, token: str, variant_id_num: int) -> dict:
     url = f"https://{domain}/admin/api/{API_VERSION}/variants/{variant_id_num}.json"
@@ -282,7 +267,8 @@ def rest_update_variant_price(domain: str, token: str, variant_id_num: int, pric
             time.sleep(_backoff_delay(attempt, base=0.2))
             continue
         return
-    if last_err: raise last_err
+    if last_err:
+        raise last_err
 
 def now_ist():
     return datetime.now(timezone(timedelta(hours=5, minutes=30)))
@@ -300,20 +286,20 @@ def gid_num(gid: str) -> str:
     # convert gid://shopify/Product/123456789 -> "123456789"
     try:
         return gid.rsplit("/", 1)[-1]
-    except:
+    except Exception:
         return str(gid)
 
 def _as_int_or_none(x) -> Optional[int]:
     try:
         return int(x)
-    except:
+    except Exception:
         return None
 
 def load_json(path: str, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except:
+    except Exception:
         return default
 
 def save_json(path: str, obj) -> None:
@@ -326,7 +312,10 @@ def ensure_log_header():
     if not os.path.exists(LOG_CSV):
         with open(LOG_CSV, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow(["ts","shop","note","product_id","variant_id","sku","before","after","delta","title","message","collections"])
+            w.writerow([
+                "ts","shop","note","product_id","variant_id","sku","before","after",
+                "delta","title","message","collections"
+            ])
 
 def log_row(
     emoji_phase: str,
@@ -343,13 +332,14 @@ def log_row(
     after: str = "",
     collections: str = ""
 ):
-    # write CSV
     ensure_log_header()
     ts = now_ist_str()
     with open(LOG_CSV, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow([ts, shop, note, product_id, variant_id, sku, before, after, delta, title, message, collections])
-    # write JSONL
+        w.writerow([
+            ts, shop, note, product_id, variant_id, sku,
+            before, after, delta, title, message, collections
+        ])
     row = {
         "ts": ts,
         "shop": shop, "note": note,
@@ -363,11 +353,16 @@ def log_row(
         "message": message,
         "collections": collections,
     }
-    if extra: row.update(extra)
+    if extra:
+        row.update(extra)
     with open(LOG_JSONL, "a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
     if LOG_TO_STDOUT:
-        human = f"{emoji_phase} {shop} {note} [SKU {sku}] pid={product_id} vid={variant_id} {before}→{after} Δ{delta} “{title}” — {message}"
+        human = (
+            f"{emoji_phase} {shop} {note} [SKU {sku}] "
+            f"pid={product_id} vid={variant_id} {before}→{after} "
+            f"Δ{delta} “{title}” — {message}"
+        )
         print(human, flush=True)
 
 # -------- IP tools (pixel) --------
@@ -375,7 +370,8 @@ def _parse_networks(items: List[str]):
     nets = []
     for s in items:
         s = (s or "").strip()
-        if not s: continue
+        if not s:
+            continue
         try:
             if "/" in s:
                 nets.append(ipaddress.ip_network(s, strict=False))
@@ -388,7 +384,6 @@ def _parse_networks(items: List[str]):
 IGNORE_NETS = _parse_networks(IGNORE_IPS_ENV)
 
 def is_ignored_ip(ip_str: str) -> bool:
-    # True if the IP is in the IGNORE list
     try:
         ip_obj = ipaddress.ip_address(ip_str)
         for net in IGNORE_NETS:
@@ -397,6 +392,7 @@ def is_ignored_ip(ip_str: str) -> bool:
         return False
     except Exception:
         return False
+
 
 # ========================= AVAILABILITY & METAFIELDS =========================
 
@@ -409,14 +405,14 @@ def compute_product_availability(variants: List[dict], include_untracked: bool) 
         if include_untracked or tracked:
             counted = True
             total += qty
-    # If none of the variants were counted, treat availability as 0
+    # If none counted, treat availability as 0
     return int(total if counted else 0)
 
 def desired_state(avail: int) -> Tuple[str, str, str]:
     """
-    Return tuple of (badge, display_badge, delivery_time_value) based on availability
+    Return tuple of (badge, display_badge, delivery_time_value) based on availability.
     - If avail >= 1 => "Ready To Ship" & "2-5 Days Across India"
-    - else         => "" (no badge) & "12-15 Days Across India"
+    - else          => "" (no badge) & "12-15 Days Across India"
     """
     if avail >= 1:
         return BADGE_READY, BADGE_READY, DELIVERY_READY
@@ -424,9 +420,6 @@ def desired_state(avail: int) -> Tuple[str, str, str]:
         return "", BADGE_READY, DELIVERY_MTO
 
 def update_product_status(domain: str, token: str, product_gid: str, new_status: str) -> bool:
-    """
-    new_status is "ACTIVE" or "DRAFT"
-    """
     q = """
     mutation($id:ID!, $status:ProductStatus!){
       productUpdate(input:{id:$id,status:$status}){
@@ -448,11 +441,14 @@ def set_product_metafields(domain: str, token: str, product_gid: str,
                            new_badge: str, new_dtime: str) -> None:
     """
     Writes two metafields (badges_key, delivery_key) on a product.
+    Only writes if changed.
     """
     mf_badge_type = (badges_node or {}).get("type") or \
-        get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, MF_BADGES_KEY) or "single_line_text_field"
+        get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, MF_BADGES_KEY) \
+        or "single_line_text_field"
     mf_dtime_type = (dtime_node or {}).get("type") or \
-        get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, MF_DELIVERY_KEY) or "single_line_text_field"
+        get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, MF_DELIVERY_KEY) \
+        or "single_line_text_field"
 
     current_badge = ((badges_node or {}).get("value") or "").strip()
     current_dtime = ((dtime_node or {}).get("value") or "").strip()
@@ -491,29 +487,43 @@ def set_product_metafields(domain: str, token: str, product_gid: str,
         data = gql(domain, token, mutation, {"mfs": mfs})
         errs = ((data.get("metafieldsSet") or {}).get("userErrors") or [])
         if errs:
-            log_row("⚠️", domain, "SET_FAIL", product_id=gid_num(product_gid), message=str(errs))
+            log_row("⚠️", domain, "SET_FAIL",
+                    product_id=gid_num(product_gid),
+                    message=str(errs))
         else:
-            log_row("🏷️", domain, "SET_OK", product_id=gid_num(product_gid), message="updated badge/delivery")
+            log_row("🏷️", domain, "SET_OK",
+                    product_id=gid_num(product_gid),
+                    message="updated badge/delivery")
     except Exception as e:
-        log_row("⚠️", domain, "SET_ERR", product_id=gid_num(product_gid), message=str(e))
+        log_row("⚠️", domain, "SET_ERR",
+                product_id=gid_num(product_gid),
+                message=str(e))
     time.sleep(MUTATION_SLEEP_SEC)
 
-def bump_sales_in(domain: str, token: str, product_gid: str, sales_node: dict, dates_node: dict, sold_qty: int, today: str):
+def bump_sales_in(domain: str, token: str, product_gid: str,
+                  sales_node: dict, dates_node: dict,
+                  sold_qty: int, today: str):
     """
-    Increment 'sales_total' metafield and append today's date to 'sale_dates' metafield
+    Increment 'sales_total' metafield and append today's date
+    to 'sale_dates' metafield.
     """
     sold_qty = int(sold_qty or 0)
-    if sold_qty <= 0: return
+    if sold_qty <= 0:
+        return
     old_total = int((sales_node or {}).get("value") or "0")
     new_total = old_total + sold_qty
 
     old_dates_raw = (dates_node or {}).get("value") or ""
     dates_list = [d.strip() for d in old_dates_raw.split(",") if d.strip()]
     dates_list.append(today)
-    new_dates_val = ",".join(dates_list[-50:])  # clamp length
+    new_dates_val = ",".join(dates_list[-50:])  # clamp
 
-    mf_sales_type = (sales_node or {}).get("type") or get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, KEY_SALES) or "single_line_text_field"
-    mf_dates_type = (dates_node or {}).get("type") or get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, KEY_DATES) or "single_line_text_field"
+    mf_sales_type = (sales_node or {}).get("type") \
+        or get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, KEY_SALES) \
+        or "single_line_text_field"
+    mf_dates_type = (dates_node or {}).get("type") \
+        or get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, KEY_DATES) \
+        or "single_line_text_field"
 
     mutation = """
     mutation($mfs:[MetafieldsSetInput!]!){
@@ -535,24 +545,36 @@ def bump_sales_in(domain: str, token: str, product_gid: str, sales_node: dict, d
             "key": KEY_DATES,
             "type": mf_dates_type,
             "value": new_dates_val,
-        }
+        },
     ]
     try:
         data = gql(domain, token, mutation, {"mfs": mfs})
         errs = ((data.get("metafieldsSet") or {}).get("userErrors") or [])
         if errs:
-            log_row("⚠️", "IN", "SALES_BUMP_FAIL", product_id=gid_num(product_gid), delta=str(sold_qty), message=str(errs))
+            log_row("⚠️", "IN", "SALES_BUMP_FAIL",
+                    product_id=gid_num(product_gid),
+                    delta=str(sold_qty),
+                    message=str(errs))
         else:
-            log_row("🧾", "IN", "SALES_BUMP_OK", product_id=gid_num(product_gid), delta=str(sold_qty), message=f"+{sold_qty} sold")
+            log_row("🧾", "IN", "SALES_BUMP_OK",
+                    product_id=gid_num(product_gid),
+                    delta=str(sold_qty),
+                    message=f"+{sold_qty} sold")
     except Exception as e:
-        log_row("⚠️", "IN", "SALES_BUMP_ERR", product_id=gid_num(product_gid), delta=str(sold_qty), message=str(e))
+        log_row("⚠️", "IN", "SALES_BUMP_ERR",
+                product_id=gid_num(product_gid),
+                delta=str(sold_qty),
+                message=str(e))
     time.sleep(MUTATION_SLEEP_SEC)
 
 def set_start_manufacturing_flag(domain: str, token: str, product_gid: str, flag_value: str):
     """
     Writes/clears custom.start_manufacturing metafield.
     """
-    mf_type = get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, MF_START_MFG_KEY) or "single_line_text_field"
+    mf_type = get_mf_def_type(
+        domain, token, "PRODUCT", MF_NAMESPACE, MF_START_MFG_KEY
+    ) or "single_line_text_field"
+
     mutation = """
     mutation($mfs:[MetafieldsSetInput!]!){
       metafieldsSet(metafields:$mfs){
@@ -570,15 +592,24 @@ def set_start_manufacturing_flag(domain: str, token: str, product_gid: str, flag
         data = gql(domain, token, mutation, {"mfs": mfs})
         errs = ((data.get("metafieldsSet") or {}).get("userErrors") or [])
         if errs:
-            log_row("⚠️", "IN", "START_MFG_FAIL", product_id=gid_num(product_gid), message=str(errs))
+            log_row("⚠️", "IN", "START_MFG_FAIL",
+                    product_id=gid_num(product_gid),
+                    message=str(errs))
         else:
             if flag_value:
-                log_row("🏁", "IN", "START_MFG_SET", product_id=gid_num(product_gid), message="flag set")
+                log_row("🏁", "IN", "START_MFG_SET",
+                        product_id=gid_num(product_gid),
+                        message="flag set")
             else:
-                log_row("🧼", "IN", "START_MFG_CLR", product_id=gid_num(product_gid), message="flag cleared")
+                log_row("🧼", "IN", "START_MFG_CLR",
+                        product_id=gid_num(product_gid),
+                        message="flag cleared")
     except Exception as e:
-        log_row("⚠️", "IN", "START_MFG_ERR", product_id=gid_num(product_gid), message=str(e))
+        log_row("⚠️", "IN", "START_MFG_ERR",
+                product_id=gid_num(product_gid),
+                message=str(e))
     time.sleep(MUTATION_SLEEP_SEC)
+
 
 # ========================= TEMP DISCOUNT HELPERS =========================
 
@@ -596,7 +627,7 @@ def load_disc_state() -> dict:
     try:
         with open(DISC_STATE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except:
+    except Exception:
         return {}
 
 def save_disc_state(state: dict) -> None:
@@ -609,13 +640,13 @@ def disc_key(shop_tag: str, product_id: int, variant_id: int) -> str:
     return f"{shop_tag}:{product_id}:{variant_id}"
 
 def parse_percent(v: str) -> int:
-    # expects e.g. "10" for 10%
     try:
         return int(str(v).strip())
-    except:
+    except Exception:
         return 0
 
-def set_temp_discount_percent(shop_tag: str, domain: str, token: str, product_node: dict, percent: int):
+def set_temp_discount_percent(shop_tag: str, domain: str, token: str,
+                              product_node: dict, percent: int):
     """
     Update variant prices using REST, track original price in DISC_STATE.
     """
@@ -624,44 +655,65 @@ def set_temp_discount_percent(shop_tag: str, domain: str, token: str, product_no
     disc_state = load_disc_state()
     changed_any = False
     step = discount_round_step_for_domain(domain)
+
     for v in ((product_node.get("variants") or {}).get("nodes") or []):
         vid = gid_num(v.get("id"))
         sku = v.get("sku") or ""
-        cur_price = float(rest_get_variant(domain, token, int(vid)).get("price") or 0.0)
+        cur_price = float(
+            rest_get_variant(domain, token, int(vid)).get("price") or 0.0
+        )
         key = disc_key(shop_tag, pid, vid)
         entry = disc_state.get(key)
 
         if percent <= 0:
-            # revert logic handled separately
+            # "percent <=0" case is revert logic handled elsewhere
             continue
 
         try:
             if not entry:
-                # first time applying discount
-                entry = {"original_price": cur_price, "applied_percent": percent}
+                entry = {
+                    "original_price": cur_price,
+                    "applied_percent": percent
+                }
                 disc_state[key] = entry
 
             last_applied = int(entry.get("applied_percent") or 0)
             original = float(entry.get("original_price") or 0.0)
 
             if last_applied != percent:
-                new_price = ceil_to_step(original * (1.0 - (percent / 100.0)), step)
+                new_price = ceil_to_step(
+                    original * (1.0 - (percent / 100.0)),
+                    step
+                )
                 if new_price > 0 and abs(new_price - cur_price) >= 0.01:
-                    rest_update_variant_price(domain, token, int(vid), str(int(new_price)))
+                    rest_update_variant_price(
+                        domain, token, int(vid), str(int(new_price))
+                    )
                     changed_any = True
-                    log_row("🏷️", "DISC", "APPLIED", product_id=pid, variant_id=vid, sku=sku, title=title, message=f"Price {cur_price} → {new_price} (step {step})")
+                    log_row("🏷️", "DISC", "APPLIED",
+                            product_id=pid,
+                            variant_id=vid,
+                            sku=sku,
+                            title=title,
+                            message=f"Price {cur_price} → {new_price} (step {step})")
                     time.sleep(MUTATION_SLEEP_SEC)
                 entry["applied_percent"] = percent
         except Exception as e:
-            log_row("⚠️", "DISC", "WARN", product_id=pid, variant_id=vid, sku=sku, message=f"Apply discount error: {e}")
+            log_row("⚠️", "DISC", "WARN",
+                    product_id=pid,
+                    variant_id=vid,
+                    sku=sku,
+                    message=f"Apply discount error: {e}")
+
     if changed_any or percent > 0:
         save_disc_state(disc_state)
 
-def maybe_apply_temp_discount_for_product(shop_tag: str, domain: str, token: str, product_node: dict, avail: int):
+def maybe_apply_temp_discount_for_product(shop_tag: str, domain: str, token: str,
+                                          product_node: dict, avail: int):
     """
-    Check product_node.tdisc metafield e.g. "10" meaning 10%.
+    Check product_node.tdisc metafield (Integer metafield "temp_discount_active").
     If >0 => apply discount %.
-    If ==0 => revert any discount.
+    If ==0 => revert discount.
     """
     pid = gid_num(product_node["id"])
     title = product_node.get("title") or ""
@@ -673,45 +725,71 @@ def maybe_apply_temp_discount_for_product(shop_tag: str, domain: str, token: str
         try:
             set_temp_discount_percent(shop_tag, domain, token, product_node, percent)
         except Exception as e:
-            log_row("⚠️", "DISC", "WARN", product_id=pid, sku=sku, title=title, message=f"Apply discount pass error: {e}")
+            log_row("⚠️", "DISC", "WARN",
+                    product_id=pid,
+                    sku=sku,
+                    title=title,
+                    message=f"Apply discount pass error: {e}")
         return
 
-    # else revert
+    # else percent == 0 => revert
     try:
         revert_temp_discount_for_product(shop_tag, domain, token, product_node)
     except Exception as e:
-        log_row("⚠️", "DISC", "WARN", product_id=pid, sku=sku, title=title, message=f"Revert discount pass error: {e}")
+        log_row("⚠️", "DISC", "WARN",
+                product_id=pid,
+                sku=sku,
+                title=title,
+                message=f"Revert discount pass error: {e}")
 
-def revert_temp_discount_for_product(shop_tag: str, domain: str, token: str, product_node: dict):
+def revert_temp_discount_for_product(shop_tag: str, domain: str, token: str,
+                                     product_node: dict):
     pid = gid_num(product_node["id"])
     title = product_node.get("title") or ""
     sku = (((product_node.get("metafield") or {}).get("value")) or "").strip()
     disc_state = load_disc_state()
     changed_any = False
+
     for v in ((product_node.get("variants") or {}).get("nodes") or []):
         vid = gid_num(v.get("id"))
         key = disc_key(shop_tag, pid, vid)
         orig = disc_state.get(key)
-        if not orig: continue
+        if not orig:
+            continue
         try:
             original_price = float(orig.get("original_price"))
-            rest_update_variant_price(domain, token, int(vid), str(int(original_price)))
+            rest_update_variant_price(
+                domain, token, int(vid), str(int(original_price))
+            )
             changed_any = True
-            log_row("↩️", "DISC", "REVERTED", product_id=pid, variant_id=vid, sku=sku, title=title, message=f"Restored price to {original_price}")
+            log_row("↩️", "DISC", "REVERTED",
+                    product_id=pid,
+                    variant_id=vid,
+                    sku=sku,
+                    title=title,
+                    message=f"Restored price to {original_price}")
             time.sleep(MUTATION_SLEEP_SEC)
             disc_state.pop(key, None)
         except Exception as e:
-            log_row("⚠️", "DISC", "WARN", product_id=pid, variant_id=vid, sku=sku, message=f"Revert discount error: {e}")
+            log_row("⚠️", "DISC", "WARN",
+                    product_id=pid,
+                    variant_id=vid,
+                    sku=sku,
+                    message=f"Revert discount error: {e}")
     if changed_any:
         save_disc_state(disc_state)
 
-# --- priceinindia helpers (US) ---
+
+# --- Helpers for priceinindia/status_in_india sync on US ---
+
 def normalize_price_for_meta(value_rupees: float, meta_type: str) -> str:
+    """
+    We persist priceinindia as an integer string (rounded).
+    """
     try:
         v_int = int(round(float(value_rupees)))
-    except:
+    except Exception:
         v_int = 0
-    # store as integer string
     return str(v_int)
 
 def sync_priceinindia_for_us_product(
@@ -725,10 +803,10 @@ def sync_priceinindia_for_us_product(
       2. custom.status_in_india
 
     Behaviour:
-    - Figure out the desired values from India for this SKU.
-    - Compare to current metafields on the US product node.
-    - Only send metafieldsSet if there's an actual diff.
-    - Only sleep if we wrote something (rate limit safety).
+    - Work out what each value *should* be based on India data.
+    - Compare to current metafields on this US product (pricein, statusIndia).
+    - Only write metafields if changed.
+    - Only sleep if we wrote (reduces throttling).
     """
 
     if not idx:
@@ -737,10 +815,9 @@ def sync_priceinindia_for_us_product(
     wrote_anything = False
     pid_us = gid_num(us_product_node["id"])
 
-    # Resolve SKU on US product
+    # Resolve SKU on US product: prefer custom.sku metafield, fall back to first variant SKU.
     sku = (((us_product_node.get("metafield") or {}).get("value")) or "").strip()
     if not sku:
-        # fallback to first variant SKU if metafield missing
         try:
             first_var = ((us_product_node.get("variants") or {}).get("nodes") or [])[0]
             sku = (first_var.get("sku") or "").strip()
@@ -812,7 +889,7 @@ def sync_priceinindia_for_us_product(
             status_changed = True
 
     # --------------------------
-    # BUILD ONE metafieldsSet CALL IF NEEDED
+    # BUILD ONE metafieldsSet CALL IF ANYTHING CHANGED
     # --------------------------
     mfs_inputs = []
 
@@ -866,21 +943,27 @@ def sync_priceinindia_for_us_product(
                     message=f"sync error: {e}")
 
     # --------------------------
-    # THROTTLE ONLY IF WE WROTE
+    # THROTTLE ONLY IF WE ACTUALLY WROTE
     # --------------------------
     if wrote_anything:
         time.sleep(0.55)
 
+
 # ========================= INDEX BUILDER (IN) =========================
 
 def build_in_sku_index():
+    """
+    Build an index of SKU -> { product_id, inventory_item_id, variant_id, title, status } for IN shop.
+    Only ACTIVE products are included if ONLY_ACTIVE_FOR_MAPPING=1.
+    """
     index: Dict[str, Dict[str, Any]] = {}
     for handle in IN_COLLECTIONS:
         cursor = None
         while True:
             data = gql(IN_DOMAIN, IN_TOKEN, QUERY_COLLECTION_PAGE_IN, {"handle": handle, "cursor": cursor})
             coll = data.get("collectionByHandle")
-            if not coll: break
+            if not coll:
+                break
             prods = ((coll.get("products") or {}).get("nodes") or [])
             pageInfo = ((coll.get("products") or {}).get("pageInfo") or {})
             for p in prods:
@@ -888,38 +971,55 @@ def build_in_sku_index():
                 if ONLY_ACTIVE_FOR_MAPPING and status != "ACTIVE":
                     continue
                 sku = (((p.get("metafield") or {}).get("value")) or "").strip()
-                if not sku: continue
+                if not sku:
+                    continue
                 variants = ((p.get("variants") or {}).get("nodes") or [])
-                if not variants: continue
+                if not variants:
+                    continue
                 v0 = variants[0]
                 inv_item_gid = (((v0.get("inventoryItem") or {}).get("id")) or "")
-                if not inv_item_gid: continue
+                if not inv_item_gid:
+                    continue
                 inv_item_id = int(gid_num(inv_item_gid) or "0")
                 variant_id = int(gid_num(v0.get("id") or "") or "0")
-                index[sku] = {"product_id": gid_num(p["id"]), "inventory_item_id": inv_item_id, "variant_id": variant_id, "title": p.get("title") or "", "status": status}
+                index[sku] = {
+                    "product_id": gid_num(p["id"]),
+                    "inventory_item_id": inv_item_id,
+                    "variant_id": variant_id,
+                    "title": p.get("title") or "",
+                    "status": status,
+                }
             if pageInfo.get("hasNextPage"):
                 cursor = pageInfo.get("endCursor")
             else:
                 break
     save_json(IN_SKU_INDEX, index)
-    log_row("🗂️", "IN", "INDEX_BUILT", message=f"entries={len(index)}")
+    log_row("🗂️", "IN", "INDEX_BUILT",
+            message=f"entries={len(index)}")
+
 
 # ========================= MFG NOTIFIER (NEW) =========================
 
 def _mfg_hmac_b64(secret: str, raw: bytes) -> str:
     import hashlib, hmac, base64
-    return base64.b64encode(hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).digest()).decode()
+    return base64.b64encode(
+        hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).digest()
+    ).decode()
 
 def send_to_manufacturing(*, sku: str, delta: int, before: int, after: int,
-                          product_id: str = "", variant_id: str = "", title: str = "") -> None:
-    """Send signed JSON to App B when availability drops in IN (robust)."""
+                          product_id: str = "", variant_id: str = "",
+                          title: str = "") -> None:
+    """
+    Low-level manufacturing notify (not used directly anymore;
+    we switched to notify_mfg_sale()).
+    """
     if not ENABLE_MFG_NOTIFY:
         return
     if not (B_ENDPOINT_URL and A_TO_B_SHARED_SECRET):
-        print("[MFG] skipped (missing B_ENDPOINT_URL or A_TO_B_SHARED_SECRET)", flush=True)
+        print("[MFG] skipped (missing B_ENDPOINT_URL or A_TO_B_SHARED_SECRET)",
+              flush=True)
         return
 
-    from datetime import datetime
     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     sku_compact = (sku or "").replace(" ", "")
     idem = f"{SOURCE_SITE}-{ts}-{sku_compact}-{after}"
@@ -938,25 +1038,33 @@ def send_to_manufacturing(*, sku: str, delta: int, before: int, after: int,
         "idempotency_key": idem,
     }
 
-    body_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    body_bytes = json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
     sig = _mfg_hmac_b64(A_TO_B_SHARED_SECRET, body_bytes)
 
     try:
         resp = requests.post(
             B_ENDPOINT_URL,
-            headers={"Content-Type":"application/json","X-APP-AUTH":sig},
+            headers={
+                "Content-Type": "application/json",
+                "X-APP-AUTH": sig
+            },
             data=body_bytes,
             timeout=10
         )
         if resp.status_code >= 400:
-            print(f"[MFG] notify HTTP {resp.status_code}: {resp.text}", flush=True)
+            print(f"[MFG] notify HTTP {resp.status_code}: {resp.text}",
+                  flush=True)
         else:
-            print(f"[MFG] notify OK sku={sku} delta={delta} {before}->{after}", flush=True)
+            print(f"[MFG] notify OK sku={sku} delta={delta} {before}->{after}",
+                  flush=True)
     except Exception as e:
         print(f"[MFG] notify error: {e}", flush=True)
 
-# ========================= GraphQL Fragments / Queries =========================
-# NOTE: We alias metafields so we can read/write them cleanly in code.
+
+# ========================= GraphQL Queries =========================
+# We alias metafields in queries so code can access them predictably.
 
 QUERY_COLLECTION_PAGE_IN = f"""
 query ($handle:String!, $cursor:String) {{
@@ -967,12 +1075,36 @@ query ($handle:String!, $cursor:String) {{
         id
         status
         title
+
         metafield(namespace:"{MF_NAMESPACE}", key:"sku"){{ value }}
-        tdisc: metafield(namespace:"{MF_NAMESPACE}", key:"{TEMP_DISC_KEY}"){{ id value type }}
-        badges: metafield(namespace:"{MF_NAMESPACE}", key:"{MF_BADGES_KEY}"){{ id value type }}
-        dtime:  metafield(namespace:"{MF_NAMESPACE}", key:"{MF_DELIVERY_KEY}"){{ id value type }}
-        salesTotal: metafield(namespace:"{MF_NAMESPACE}", key:"{KEY_SALES}"){{ id value type }}
-        salesDates: metafield(namespace:"{MF_NAMESPACE}", key:"{KEY_DATES}"){{ id value type }}
+
+        tdisc: metafield(namespace:"{MF_NAMESPACE}", key:"{TEMP_DISC_KEY}"){{
+          id
+          value
+          type
+        }}
+
+        badges: metafield(namespace:"{MF_NAMESPACE}", key:"{MF_BADGES_KEY}"){{
+          id
+          value
+          type
+        }}
+        dtime: metafield(namespace:"{MF_NAMESPACE}", key:"{MF_DELIVERY_KEY}"){{
+          id
+          value
+          type
+        }}
+        salesTotal: metafield(namespace:"{MF_NAMESPACE}", key:"{KEY_SALES}"){{
+          id
+          value
+          type
+        }}
+        salesDates: metafield(namespace:"{MF_NAMESPACE}", key:"{KEY_DATES}"){{
+          id
+          value
+          type
+        }}
+
         variants(first: 100){{
           nodes{{
             id
@@ -996,10 +1128,27 @@ query ($handle:String!, $cursor:String) {{
       nodes{{
         id
         title
+
         metafield(namespace:"{MF_NAMESPACE}", key:"sku"){{ value }}
-        tdisc: metafield(namespace:"{MF_NAMESPACE}", key:"{TEMP_DISC_KEY}"){{ id value type }}
-        pricein: metafield(namespace:"{MF_NAMESPACE}", key:"{MF_PRICEIN_KEY}"){{ id value type }}
-        statusIndia: metafield(namespace:"{MF_NAMESPACE}", key:"status_in_india"){{ id value type }}
+
+        tdisc: metafield(namespace:"{MF_NAMESPACE}", key:"{TEMP_DISC_KEY}"){{
+          id
+          value
+          type
+        }}
+
+        pricein: metafield(namespace:"{MF_NAMESPACE}", key:"{MF_PRICEIN_KEY}"){{
+          id
+          value
+          type
+        }}
+
+        statusIndia: metafield(namespace:"{MF_NAMESPACE}", key:"status_in_india"){{
+          id
+          value
+          type
+        }}
+
         variants(first: 100){{
           nodes{{
             id
@@ -1014,23 +1163,40 @@ query ($handle:String!, $cursor:String) {{
 }}
 """
 
-# Metafield definition cache
+# metafield definition cache (to avoid re-querying types constantly)
 _MF_DEF_CACHE: Dict[Tuple[str, str, str], str] = {}
 
-def get_mf_def_type(domain: str, token: str, owner_type: str, namespace: str, key: str) -> str:
+def get_mf_def_type(domain: str, token: str, owner_type: str,
+                    namespace: str, key: str) -> str:
     ck = (owner_type, namespace, key)
-    if ck in _MF_DEF_CACHE: return _MF_DEF_CACHE[ck]
+    if ck in _MF_DEF_CACHE:
+        return _MF_DEF_CACHE[ck]
     q = """
     query($ownerType:MetafieldOwnerType!, $ns:String!, $key:String!){
-      metafieldDefinitions(first:1, ownerType:$ownerType, namespace:$ns, key:$key){
-        edges{ node{ id type{ name } } }
+      metafieldDefinitions(first:1,
+                           ownerType:$ownerType,
+                           namespace:$ns,
+                           key:$key){
+        edges{
+          node{
+            id
+            type{ name }
+          }
+        }
       }
     }"""
-    data = gql(domain, token, q, {"ownerType": owner_type, "ns": namespace, "key": key})
+    data = gql(domain, token, q, {
+        "ownerType": owner_type,
+        "ns": namespace,
+        "key": key
+    })
     edges = (((data.get("metafieldDefinitions") or {}).get("edges")) or [])
-    tname = ((((edges[0] if edges else {}).get("node") or {}).get("type") or {}).get("name")) or ""
+    tname = (
+        (((edges[0] if edges else {}).get("node") or {}).get("type") or {})
+    ).get("name") or ""
     _MF_DEF_CACHE[ck] = tname or "single_line_text_field"
     return _MF_DEF_CACHE[ck]
+
 
 # ========================= INDIA / USA SCANNERS =========================
 
@@ -1039,190 +1205,413 @@ SPECIAL_STATUS_HANDLE = os.getenv("SPECIAL_STATUS_HANDLE", "").strip()
 IN_CHANGE_STATUS = (os.getenv("IN_CHANGE_STATUS", "0") == "1")
 
 def scan_india_and_update(read_only: bool = False):
+    """
+    Walk through IN collections:
+    - Update discounts.
+    - Detect stock drops, log sales, set manufacturing flag, notify B.
+    - Update metafields.badges / metafields.delivery_time.
+    - Build/refresh delivery_idx[SKU] = "2-5 Days..." / "12-15 Days..."
+      and persist to in_delivery_map.json for the US sync.
+    """
     last_seen: Dict[str, int] = load_json(IN_LAST_SEEN, {})
     today = today_ist_str()
 
-    # Map SKU -> latest delivery_time ("2-5 Days Across India" / "12-15 Days Across India")
-    delivery_idx: Dict[str, str] = load_json(IN_DELIVERY_MAP, {})  # persists across pages
+    # we'll accumulate SKU->delivery_time here; we load the old file in case
+    # products appear in multiple collections
+    delivery_idx: Dict[str, str] = load_json(IN_DELIVERY_MAP, {})
+
     for handle in IN_COLLECTIONS:
         cursor = None
         while True:
-            data = gql(IN_DOMAIN, IN_TOKEN, QUERY_COLLECTION_PAGE_IN, {"handle": handle, "cursor": cursor})
+            data = gql(IN_DOMAIN, IN_TOKEN, QUERY_COLLECTION_PAGE_IN,
+                       {"handle": handle, "cursor": cursor})
             coll = data.get("collectionByHandle")
             if not coll:
-                log_row("⚠️", "IN", "WARN", message=f"Collection not found: {handle}")
+                log_row("⚠️", "IN", "WARN",
+                        message=f"Collection not found: {handle}")
                 break
+
             prods = ((coll.get("products") or {}).get("nodes") or [])
             pageInfo = ((coll.get("products") or {}).get("pageInfo") or {})
+
             for p in prods:
                 pid = gid_num(p["id"])
                 title = p.get("title") or ""
                 status = (p.get("status") or "").upper()
                 sku = (((p.get("metafield") or {}).get("value")) or "").strip()
+
                 variants = ((p.get("variants") or {}).get("nodes") or [])
-                avail = compute_product_availability(variants, IN_INCLUDE_UNTRACKED)
+                avail = compute_product_availability(
+                    variants, IN_INCLUDE_UNTRACKED
+                )
+
+                # Apply / revert discounts based on tdisc metafield
                 if not read_only:
-                    try: maybe_apply_temp_discount_for_product("IN", IN_DOMAIN, IN_TOKEN, p, avail)
-                    except Exception as e: log_row("⚠️", "DISC", "WARN", product_id=pid, sku=sku, message=f"Apply discount pass error: {e}")
-                prev = _as_int_or_none(last_seen.get(pid))
-                if prev is None: prev = 0
-
-                # NEW: Auto-clear manual manufacturing flag if availability increased (optional)
-                if not read_only and AUTO_CLEAR_START_MFG_ON_INCREASE and avail > prev:
                     try:
-                        set_start_manufacturing_flag(IN_DOMAIN, IN_TOKEN, p["id"], "")
+                        maybe_apply_temp_discount_for_product(
+                            "IN", IN_DOMAIN, IN_TOKEN, p, avail
+                        )
                     except Exception as e:
-                        log_row("⚠️", "IN", "START_MFG_WARN", product_id=pid, sku=sku, message=f"clear flag error: {e}")
+                        log_row("⚠️", "DISC", "WARN",
+                                product_id=pid,
+                                sku=sku,
+                                message=f"Apply discount pass error: {e}")
 
+                prev = _as_int_or_none(last_seen.get(pid))
+                if prev is None:
+                    prev = 0
+
+                # Optional auto-clear manufacturing flag if stock increased
+                if (not read_only
+                    and AUTO_CLEAR_START_MFG_ON_INCREASE
+                    and avail > prev):
+                    try:
+                        set_start_manufacturing_flag(
+                            IN_DOMAIN, IN_TOKEN, p["id"], ""
+                        )
+                    except Exception as e:
+                        log_row("⚠️", "IN", "START_MFG_WARN",
+                                product_id=pid,
+                                sku=sku,
+                                message=f"clear flag error: {e}")
+
+                # Availability DROP => treat as sales
                 if not read_only and avail < prev:
                     sold = prev - avail
-                    bump_sales_in(IN_DOMAIN, IN_TOKEN, p["id"], p.get("salesTotal") or {}, p.get("salesDates") or {}, sold, today)
-                    log_row("🧾➖", "IN", "SALES_BUMP", product_id=pid, sku=sku, delta=str(sold), title=title, message=f"({prev}->{avail}) (sold={sold})", before=str(prev), after=str(avail))
 
-                    # NEW: set manual manufacturing trigger metafield
+                    bump_sales_in(
+                        IN_DOMAIN, IN_TOKEN,
+                        p["id"],
+                        p.get("salesTotal") or {},
+                        p.get("salesDates") or {},
+                        sold,
+                        today
+                    )
+                    log_row("🧾➖", "IN", "SALES_BUMP",
+                            product_id=pid,
+                            sku=sku,
+                            delta=str(sold),
+                            title=title,
+                            message=f"({prev}->{avail}) (sold={sold})",
+                            before=str(prev),
+                            after=str(avail))
+
+                    # Set manufacturing flag
                     try:
-                        set_start_manufacturing_flag(IN_DOMAIN, IN_TOKEN, p["id"], START_MFG_VALUE)
+                        set_start_manufacturing_flag(
+                            IN_DOMAIN, IN_TOKEN, p["id"], START_MFG_VALUE
+                        )
                     except Exception as e:
-                        log_row("⚠️", "IN", "START_MFG_WARN", product_id=pid, sku=sku, message=f"set flag error: {e}")
+                        log_row("⚠️", "IN", "START_MFG_WARN",
+                                product_id=pid,
+                                sku=sku,
+                                message=f"set flag error: {e}")
 
-                    # --- Notify manufacturing via helper
+                    # Notify manufacturing handler (App B)
                     try:
                         v0 = variants[0] if variants else {}
                         variant_id = gid_num(v0.get("id") or "")
                         sku_eff = (sku or v0.get("sku") or "").strip()
 
-                        print(f'[MFG] DROP DETECTED site={SOURCE_SITE} sku="{sku_eff}" {prev}->{avail} delta={avail - prev}', flush=True)
+                        print(
+                            f'[MFG] DROP DETECTED site={SOURCE_SITE} '
+                            f'sku="{sku_eff}" {prev}->{avail} '
+                            f'delta={avail - prev}',
+                            flush=True
+                        )
 
                         if ENABLE_MFG_NOTIFY and (avail < prev):
                             ok = notify_mfg_sale(
-                                endpoint_url=B_ENDPOINT_URL or None,          # use env if blank
-                                shared_secret=A_TO_B_SHARED_SECRET or None,   # use env if blank
-                                source_site=SOURCE_SITE,                      # "IN" or "US"
+                                endpoint_url=B_ENDPOINT_URL or None,
+                                shared_secret=A_TO_B_SHARED_SECRET or None,
+                                source_site=SOURCE_SITE,
                                 sku=sku_eff,
                                 product_id=str(pid),
                                 variant_id=str(variant_id or 0),
                                 prev_avail=int(prev),
                                 new_avail=int(avail),
                                 title=title or "",
-                                image_url=None,                               # optionally send CDN image
-                                body=None,                                    # optional custom text
+                                image_url=None,
+                                body=None,
                                 max_retries=4,
                             )
                             if not ok:
-                                print("[MFG] notify returned False (will rely on retries next scan)", flush=True)
+                                print(
+                                    "[MFG] notify returned False "
+                                    "(will rely on retries next scan)",
+                                    flush=True
+                                )
 
                     except Exception as e:
                         print(f"[MFG] invoke error: {e}", flush=True)
 
-                    try: revert_temp_discount_for_product("IN", IN_DOMAIN, IN_TOKEN, p)
-                    except Exception as e: log_row("⚠️", "DISC", "WARN", product_id=pid, sku=sku, message=f"Revert on sale error: {e}")
+                    # Revert temp discount after sale
+                    try:
+                        revert_temp_discount_for_product(
+                            "IN", IN_DOMAIN, IN_TOKEN, p
+                        )
+                    except Exception as e:
+                        log_row("⚠️", "DISC", "WARN",
+                                product_id=pid,
+                                sku=sku,
+                                message=f"Revert on sale error: {e}")
 
-                if not read_only and CLAMP_AVAIL_TO_ZERO and avail < 0 and variants:
-                    inv_item_gid = (((variants[0].get("inventoryItem") or {}).get("id")) or "")
+                # Clamp negatives to zero if configured
+                if (not read_only
+                    and CLAMP_AVAIL_TO_ZERO
+                    and avail < 0
+                    and variants):
+                    inv_item_gid = (
+                        ((variants[0].get("inventoryItem") or {}).get("id"))
+                        or ""
+                    )
                     inv_item_id = int(gid_num(inv_item_gid) or "0")
                     try:
-                        rest_adjust_inventory(IN_DOMAIN, IN_TOKEN, inv_item_id, int(IN_LOCATION_ID), -avail)
-                        log_row("🧰0️⃣", "IN", "CLAMP_TO_ZERO", product_id=pid, sku=sku, title=title, message=f"inventory_item_id={inv_item_id}", before=str(avail), after="0")
+                        rest_adjust_inventory(
+                            IN_DOMAIN, IN_TOKEN,
+                            inv_item_id,
+                            int(IN_LOCATION_ID),
+                            -avail
+                        )
+                        log_row("🧰0️⃣", "IN", "CLAMP_TO_ZERO",
+                                product_id=pid,
+                                sku=sku,
+                                title=title,
+                                message=f"inventory_item_id={inv_item_id}",
+                                before=str(avail),
+                                after="0")
                         avail = 0
                     except Exception as e:
-                        log_row("⚠️", "IN", "WARN", product_id=pid, sku=sku, message=f"Clamp error: {e}")
+                        log_row("⚠️", "IN", "WARN",
+                                product_id=pid,
+                                sku=sku,
+                                message=f"Clamp error: {e}")
 
+                # Desired metafield state for India PDP
                 _, target_badge, target_delivery = desired_state(avail)
-                # Remember delivery_time for this SKU for USA sync
+
+                # Track delivery status for this SKU for USA sync:
                 if sku:
                     delivery_idx[sku] = target_delivery
-                if not read_only:
-                    set_product_metafields(IN_DOMAIN, IN_TOKEN, p["id"], p.get("badges") or {}, p.get("dtime") or {}, target_badge, target_delivery)
 
-                if (not read_only) and IN_CHANGE_STATUS and SPECIAL_STATUS_HANDLE and (handle == SPECIAL_STATUS_HANDLE):
+                # Update India product metafields (badge + delivery_time)
+                if not read_only:
+                    set_product_metafields(
+                        IN_DOMAIN,
+                        IN_TOKEN,
+                        p["id"],
+                        p.get("badges") or {},
+                        p.get("dtime") or {},
+                        target_badge,
+                        target_delivery
+                    )
+
+                # Optionally flip ACTIVE/DRAFT if this is a special collection
+                if (not read_only
+                    and IN_CHANGE_STATUS
+                    and SPECIAL_STATUS_HANDLE
+                    and (handle == SPECIAL_STATUS_HANDLE)):
                     if avail < 1 and status == "ACTIVE":
-                        ok = update_product_status(IN_DOMAIN, IN_TOKEN, p["id"], "DRAFT")
-                        log_row("🛑", "IN", "STATUS_TO_DRAFT", product_id=pid, sku=sku, delta=str(avail), title=title, message=f"handle={handle}")
+                        ok = update_product_status(
+                            IN_DOMAIN, IN_TOKEN, p["id"], "DRAFT"
+                        )
+                        log_row("🛑", "IN", "STATUS_TO_DRAFT",
+                                product_id=pid,
+                                sku=sku,
+                                delta=str(avail),
+                                title=title,
+                                message=f"handle={handle}")
                     elif avail >= 1 and status == "DRAFT":
-                        ok = update_product_status(IN_DOMAIN, IN_TOKEN, p["id"], "ACTIVE")
-                        log_row("✅", "IN", "STATUS_TO_ACTIVE", product_id=pid, sku=sku, delta=str(avail), title=title, message=f"handle={handle}")
+                        ok = update_product_status(
+                            IN_DOMAIN, IN_TOKEN, p["id"], "ACTIVE"
+                        )
+                        log_row("✅", "IN", "STATUS_TO_ACTIVE",
+                                product_id=pid,
+                                sku=sku,
+                                delta=str(avail),
+                                title=title,
+                                message=f"handle={handle}")
 
                 last_seen[pid] = max(0, int(avail))
                 sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
+
+            # end products loop
+
             save_json(IN_LAST_SEEN, last_seen)
             save_json(IN_DELIVERY_MAP, delivery_idx)
             sleep_ms(SLEEP_BETWEEN_PAGES_MS)
+
             if pageInfo.get("hasNextPage"):
                 cursor = pageInfo.get("endCursor")
             else:
                 break
 
 def scan_usa_and_mirror_to_india(read_only: bool = False):
+    """
+    Walk through US collections:
+    - Apply/revert temp discounts (US side) based on metafield.
+    - Sync custom.priceinindia and custom.status_in_india from India data,
+      but only if changed (conditional write).
+    - Mirror US stock *drops* back into India's inventory if configured.
+    - Clamp negatives on US.
+    """
     last_seen: Dict[str, int] = load_json(US_LAST_SEEN, {})
     in_index: Dict[str, Any] = load_json(IN_SKU_INDEX, {})
     delivery_idx: Dict[str, str] = load_json(IN_DELIVERY_MAP, {})
+
     for handle in US_COLLECTIONS:
         cursor = None
         while True:
-            data = gql(US_DOMAIN, US_TOKEN, QUERY_COLLECTION_PAGE_US, {"handle": handle, "cursor": cursor})
+            data = gql(US_DOMAIN, US_TOKEN, QUERY_COLLECTION_PAGE_US,
+                       {"handle": handle, "cursor": cursor})
             coll = data.get("collectionByHandle")
-            if not coll: break
+            if not coll:
+                break
+
             prods = ((coll.get("products") or {}).get("nodes") or [])
             pageInfo = ((coll.get("products") or {}).get("pageInfo") or {})
+
             for p in prods:
                 p_sku = (((p.get("metafield") or {}).get("value")) or "").strip()
                 title = p.get("title") or ""
+
+                # Calculate US total avail (sum of variants)
                 us_avail = 0
                 for v0 in ((p.get("variants") or {}).get("nodes") or []):
                     us_avail += int(v0.get("inventoryQuantity") or 0)
+
+                # US temp discounts
                 if not read_only:
-                    try: maybe_apply_temp_discount_for_product("US", US_DOMAIN, US_TOKEN, p, us_avail)
-                    except Exception as e: log_row("⚠️", "DISC", "WARN", product_id=gid_num(p["id"]), message=f"US apply discount pass error: {e}")
+                    try:
+                        maybe_apply_temp_discount_for_product(
+                            "US", US_DOMAIN, US_TOKEN, p, us_avail
+                        )
+                    except Exception as e:
+                        log_row("⚠️", "DISC", "WARN",
+                                product_id=gid_num(p["id"]),
+                                message=f"US apply discount pass error: {e}")
+
+                # Sync priceinindia + status_in_india to US metafields
                 if not read_only and p_sku and p_sku in in_index:
-                    try: sync_priceinindia_for_us_product(p, in_index.get(p_sku), delivery_idx.get(p_sku))
-                    except Exception as e: log_row("⚠️", "US", "PRICEINDIA_WARN", product_id=gid_num(p["id"]), sku=p_sku, message=f"sync error: {e}")
+                    try:
+                        sync_priceinindia_for_us_product(
+                            p,
+                            in_index.get(p_sku),
+                            delivery_idx.get(p_sku)
+                        )
+                    except Exception as e:
+                        log_row("⚠️", "US", "PRICEINDIA_WARN",
+                                product_id=gid_num(p["id"]),
+                                sku=p_sku,
+                                message=f"sync error: {e}")
+
+                # Mirror US availability drops back into IN (per variant)
                 for v in ((p.get("variants") or {}).get("nodes") or []):
                     vid = gid_num(v.get("id"))
                     raw_sku = v.get("sku") or p_sku
                     sku_exact = (raw_sku or "").strip()
                     qty = int(v.get("inventoryQuantity") or 0)
+
                     prev = _as_int_or_none(last_seen.get(vid))
                     if prev is None:
                         last_seen[vid] = qty
                         continue
+
                     delta = qty - int(prev)
                     if delta == 0:
                         last_seen[vid] = qty
                         continue
+
+                    # qty increased in US
                     if delta > 0:
                         if not MIRROR_US_INCREASES:
-                            log_row("🙅‍♂️➕", "US→IN", "IGNORE_INCREASE", variant_id=vid, sku=sku_exact, before=str(prev), after=str(qty), message="us>in increase; mirroring disabled")
+                            log_row("🙅‍♂️➕", "US→IN", "IGNORE_INCREASE",
+                                    variant_id=vid,
+                                    sku=sku_exact,
+                                    before=str(prev),
+                                    after=str(qty),
+                                    message="us>in increase; mirroring disabled")
                             last_seen[vid] = qty
                             continue
+
+                    # qty decreased in US (delta < 0)
                     if not read_only and delta < 0 and sku_exact:
-                        idx = in_index.get(sku_exact)
-                        if not idx:
-                            log_row("⚠️", "US→IN", "WARN_SKU", variant_id=vid, sku=sku_exact, delta=str(delta), title=title, message="No matching SKU in India index")
+                        idx_info = in_index.get(sku_exact)
+                        if not idx_info:
+                            log_row("⚠️", "US→IN", "WARN_SKU",
+                                    variant_id=vid,
+                                    sku=sku_exact,
+                                    delta=str(delta),
+                                    title=title,
+                                    message="No matching SKU in India index")
                         else:
-                            in_inv_item_id = int(idx.get("inventory_item_id") or 0)
-                            # Mirror the delta back to India location
+                            in_inv_item_id = int(idx_info.get("inventory_item_id") or 0)
                             try:
-                                rest_adjust_inventory(IN_DOMAIN, IN_TOKEN, int(in_inv_item_id), int(IN_LOCATION_ID), int(delta))
-                                log_row("🔁", "US→IN", "MIRROR", variant_id=vid, sku=sku_exact, delta=str(delta), title=title, message=f"Mirrored {delta} to IN inv_item_id={in_inv_item_id}")
+                                rest_adjust_inventory(
+                                    IN_DOMAIN,
+                                    IN_TOKEN,
+                                    int(in_inv_item_id),
+                                    int(IN_LOCATION_ID),
+                                    int(delta)
+                                )
+                                log_row("🔁", "US→IN", "MIRROR",
+                                        variant_id=vid,
+                                        sku=sku_exact,
+                                        delta=str(delta),
+                                        title=title,
+                                        message=f"Mirrored {delta} to IN inv_item_id={in_inv_item_id}")
                             except Exception as e:
-                                log_row("⚠️", "US→IN", "WARN", variant_id=vid, sku=sku_exact, delta=str(delta), title=title, message=f"Mirror error: {e}")
-                        # clamp US if negative
-                        if not read_only and CLAMP_AVAIL_TO_ZERO and qty < 0:
+                                log_row("⚠️", "US→IN", "WARN",
+                                        variant_id=vid,
+                                        sku=sku_exact,
+                                        delta=str(delta),
+                                        title=title,
+                                        message=f"Mirror error: {e}")
+
+                        # clamp US negative inventory to zero if configured
+                        if (not read_only
+                            and CLAMP_AVAIL_TO_ZERO
+                            and qty < 0):
                             try:
-                                inv_item_gid = (((v.get("inventoryItem") or {}).get("id")) or "")
-                                rest_adjust_inventory(US_DOMAIN, US_TOKEN, int(gid_num(inv_item_gid)), int(US_LOCATION_ID), -qty)
-                                log_row("🧰0️⃣", "US", "CLAMP_TO_ZERO", variant_id=vid, sku=sku_exact, title=title, message=f"inventory_item_id={gid_num(inv_item_gid)}", before=str(qty), after="0")
+                                inv_item_gid = (
+                                    ((v.get("inventoryItem") or {}).get("id"))
+                                    or ""
+                                )
+                                rest_adjust_inventory(
+                                    US_DOMAIN,
+                                    US_TOKEN,
+                                    int(gid_num(inv_item_gid)),
+                                    int(US_LOCATION_ID),
+                                    -qty
+                                )
+                                log_row("🧰0️⃣", "US", "CLAMP_TO_ZERO",
+                                        variant_id=vid,
+                                        sku=sku_exact,
+                                        title=title,
+                                        message=f"inventory_item_id={gid_num(inv_item_gid)}",
+                                        before=str(qty),
+                                        after="0")
                                 qty = 0
                             except Exception as e:
-                                log_row("⚠️", "US→IN", "WARN", variant_id=vid, sku=sku_exact, title=title, message=f"US clamp error: {e}")
+                                log_row("⚠️", "US→IN", "WARN",
+                                        variant_id=vid,
+                                        sku=sku_exact,
+                                        title=title,
+                                        message=f"US clamp error: {e}")
+
                     last_seen[vid] = qty
                     sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
+
+            # end products loop
+
             save_json(US_LAST_SEEN, last_seen)
             sleep_ms(SLEEP_BETWEEN_PAGES_MS)
+
             if pageInfo.get("hasNextPage"):
                 cursor = pageInfo.get("endCursor")
             else:
                 break
+
 
 # ========================= COUNTERS & DAILY CSV =========================
 
@@ -1230,7 +1619,7 @@ def _load_json(path: str, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except:
+    except Exception:
         return default
 
 def _save_json(path: str, obj) -> None:
@@ -1270,10 +1659,12 @@ def _ensure_daily_csv_header(path: str):
     if not os.path.exists(path):
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow(["date","sku","views","atc","sales","last_sale_date","age_days","dob"])
+            w.writerow([
+                "date","sku","views","atc","sales",
+                "last_sale_date","age_days","dob"
+            ])
 
 def _write_daily_csv_for_date(path: str, st: dict, date_str: str):
-    # flush counters out to rows in a CSV (IST date)
     views = st.get("views", {})
     atc = st.get("atc", {})
     sales = st.get("sales", {})
@@ -1282,7 +1673,14 @@ def _write_daily_csv_for_date(path: str, st: dict, date_str: str):
     dob_cache = st.get("dob_cache", {})
 
     rows = []
-    all_skus = set(views.keys()) | set(atc.keys()) | set(sales.keys()) | set(sale_dates.keys()) | set(age_days.keys()) | set(dob_cache.keys())
+    all_skus = (
+        set(views.keys())
+        | set(atc.keys())
+        | set(sales.keys())
+        | set(sale_dates.keys())
+        | set(age_days.keys())
+        | set(dob_cache.keys())
+    )
     for sku in sorted(all_skus):
         rows.append([
             date_str,
@@ -1296,7 +1694,6 @@ def _write_daily_csv_for_date(path: str, st: dict, date_str: str):
         ])
 
     _ensure_daily_csv_header(path)
-
     with open(path, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         for row in rows:
@@ -1313,7 +1710,6 @@ def _reset_today_counters(st: dict):
 def _rollover_if_needed(st: dict, csv_path: str):
     cur = _ist_today_date_str()
     if st.get("date") != cur:
-        # day changed in IST => flush previous day to CSV, reset
         prev_date = st.get("date")
         _write_daily_csv_for_date(csv_path, st, prev_date)
         _reset_today_counters(st)
@@ -1327,15 +1723,16 @@ def daily_csv_worker():
 def to_iso8601(ts: float) -> str:
     return datetime.utcfromtimestamp(ts).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def record_counter_event(kind: str, sku: str, ip_addr: str = "", user_agent: str = ""):
+def record_counter_event(kind: str, sku: str,
+                         ip_addr: str = "", user_agent: str = ""):
     """
     kind in {"view","atc","sale"}.
-    We'll store per-SKU counters in memory (JSON files),
+    We'll store per-SKU counters in JSON,
     plus last sale date if kind=="sale".
     """
-    if not sku: return
+    if not sku:
+        return
 
-    # check for ignored IP
     if ip_addr and is_ignored_ip(ip_addr):
         return
 
@@ -1349,12 +1746,13 @@ def record_counter_event(kind: str, sku: str, ip_addr: str = "", user_agent: str
         st["sale_dates"][sku] = _ist_today_date_str()
     _save_today_state(st)
 
+
 # ========================= AVAILABILITY POLLER (COUNTERS APP) =========================
 
 def GET_VARIANT_AVAIL(domain: str, token: str, product_id: str) -> Dict[str, int]:
     """
-    Return { variant_id: qty } for a product_id by GraphQL single product query.
-    We'll do a small partial query.
+    Return { variant_id: qty } for a product_id using a small partial query.
+    We skip untracked variants.
     """
     q = f"""
     query($id:ID!){{
@@ -1386,27 +1784,30 @@ def GET_VARIANT_AVAIL(domain: str, token: str, product_id: str) -> Dict[str, int
 
 def _availability_poll_once():
     """
-    Poll inventory for specific product IDs (INVENTORY_POLL_SEC >0).
+    Poll inventory for specific product IDs (INVENTORY_POLL_SEC > 0).
     If we detect a drop in any tracked variant, record that drop as a "sale"
-    in counters JSON.
+    in the counters JSON.
     """
     if INVENTORY_POLL_SEC <= 0:
         return
 
     st = _load_today_state()
-    # We'll re-use last_seen map for US_LAST_SEEN style store, but let's keep separate:
     polled_cache = load_json(STATE_PATH, {})
     changed_any = False
+
     for product_id in AVAIL_POLL_PRODUCT_IDS:
         if not product_id:
             continue
-        live_map = GET_VARIANT_AVAIL(ADMIN_HOST, ADMIN_TOKENS[ADMIN_HOST], product_id)
+        live_map = GET_VARIANT_AVAIL(
+            ADMIN_HOST,
+            ADMIN_TOKENS[ADMIN_HOST],
+            product_id
+        )
         old_map = polled_cache.get(product_id, {})
         for vid, qty in live_map.items():
             old_qty = int(old_map.get(vid, qty))
             if qty < old_qty:
                 sold = old_qty - qty
-                # increment counters
                 sku_placeholder = f"{product_id}:{vid}"
                 st["sales"][sku_placeholder] = st["sales"].get(sku_placeholder, 0) + sold
                 st["sale_dates"][sku_placeholder] = _ist_today_date_str()
@@ -1414,7 +1815,7 @@ def _availability_poll_once():
         polled_cache[product_id] = live_map
 
     if changed_any:
-        _save_json(STATE_PATH, polled_cache)
+        save_json(STATE_PATH, polled_cache)
         _save_today_state(st)
 
 def availability_poller():
@@ -1424,6 +1825,7 @@ def availability_poller():
         except Exception as e:
             print(f"[POLL] error: {e}", file=sys.stderr)
         time.sleep(max(1, INVENTORY_POLL_SEC))
+
 
 # ========================= FLASK APP =========================
 
@@ -1477,7 +1879,7 @@ def rebuild_index():
 @app.route("/run-now", methods=["POST"])
 def run_now():
     """
-    Force a single scan cycle (IN then US).
+    Force one full scan (IN -> US) + counters roll.
     """
     try:
         run_cycle()
@@ -1485,61 +1887,62 @@ def run_now():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+
 # --- pixel endpoints (view/atc/sale) with shared-secret auth ---
 
 def verify_hmac(raw_body: bytes, sent_sig_b64: str, secret: str) -> bool:
     try:
-        expected = base64.b64encode(hmac.new(secret.encode("utf-8"), raw_body, digestmod="sha256").digest()).decode()
+        expected = base64.b64encode(
+            hmac.new(secret.encode("utf-8"), raw_body, digestmod="sha256").digest()
+        ).decode()
         return hmac.compare_digest(expected, sent_sig_b64 or "")
     except Exception:
         return False
 
 @app.route("/pixel/view", methods=["POST", "OPTIONS"])
-def products_create():
+def pixel_view():
     if request.method == "OPTIONS":
         return _cors(make_response())
-    # verify HMAC
     sig = request.headers.get("X-Signature", "")
     body = request.data or b""
     if not verify_hmac(body, sig, PIXEL_SHARED_SECRET):
-        return _cors(make_response(jsonify({"ok": False, "error":"bad-signature"}), 403))
-    # parse
+        return _cors(make_response(jsonify({"ok": False, "error": "bad-signature"}), 403))
     try:
         payload = json.loads(body.decode("utf-8"))
-    except:
+    except Exception:
         payload = {}
     shop_domain = (payload.get("shop_domain") or "").strip().lower()
     sku = (payload.get("sku") or "").strip()
     ip_addr = request.remote_addr or ""
-    ua = request.headers.get("User-Agent","")
+    ua = request.headers.get("User-Agent", "")
     if shop_domain not in ALLOWED_PIXEL_HOSTS:
         return _cors(make_response(jsonify({"ok": False, "error":"forbidden-shop"}), 403))
     record_counter_event("view", sku, ip_addr, ua)
     return _cors(make_response(jsonify({"ok": True})))
 
 @app.route("/pixel/atc", methods=["POST", "OPTIONS"])
-def flusher():
+def pixel_atc():
     if request.method == "OPTIONS":
         return _cors(make_response())
     sig = request.headers.get("X-Signature", "")
     body = request.data or b""
     if not verify_hmac(body, sig, PIXEL_SHARED_SECRET):
-        return _cors(make_response(jsonify({"ok": False, "error":"bad-signature"}), 403))
+        return _cors(make_response(jsonify({"ok": False, "error": "bad-signature"}), 403))
     try:
         payload = json.loads(body.decode("utf-8"))
-    except:
+    except Exception:
         payload = {}
     shop_domain = (payload.get("shop_domain") or "").strip().lower()
     sku = (payload.get("sku") or "").strip()
     ip_addr = request.remote_addr or ""
-    ua = request.headers.get("User-Agent","")
+    ua = request.headers.get("User-Agent", "")
     if shop_domain not in ALLOWED_PIXEL_HOSTS:
         return _cors(make_response(jsonify({"ok": False, "error":"forbidden-shop"}), 403))
     record_counter_event("atc", sku, ip_addr, ua)
     return _cors(make_response(jsonify({"ok": True})))
 
 @app.route("/pixel/sale", methods=["POST", "OPTIONS"])
-def flush_once():
+def pixel_sale():
     if request.method == "OPTIONS":
         return _cors(make_response())
     sig = request.headers.get("X-Signature", "")
@@ -1548,7 +1951,7 @@ def flush_once():
         return _cors(make_response(jsonify({"ok": False, "error":"bad-signature"}), 403))
     try:
         payload = json.loads(body.decode("utf-8"))
-    except:
+    except Exception:
         payload = {}
     shop_domain = (payload.get("shop_domain") or "").strip().lower()
     sku = (payload.get("sku") or "").strip()
@@ -1559,13 +1962,14 @@ def flush_once():
     record_counter_event("sale", sku, ip_addr, ua)
     return _cors(make_response(jsonify({"ok": True})))
 
+
 # ========================= SCHEDULER =========================
 
 def load_state() -> dict:
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
-    except:
+    except Exception:
         return {}
 
 def save_state(st: dict):
@@ -1605,8 +2009,9 @@ def run_cycle():
 
 def scheduler_loop():
     """
-    If ENABLE_SCHEDULER=1, loop forever calling run_cycle() every RUN_EVERY_MIN.
-    Otherwise, just run a single cycle and serve the Flask app.
+    If ENABLE_SCHEDULER=1, loop forever calling run_cycle()
+    every RUN_EVERY_MIN. Otherwise we run once and then
+    just serve Flask.
     """
     if not ENABLE_SCHEDULER:
         print("[SCHED] Scheduler disabled, doing single run_cycle() then serving Flask.", flush=True)
@@ -1620,6 +2025,7 @@ def scheduler_loop():
         elapsed = time.time() - start_ts
         sleep_sec = max(1.0, (RUN_EVERY_MIN * 60) - elapsed)
         time.sleep(sleep_sec)
+
 
 # ========================= MAIN =========================
 
