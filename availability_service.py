@@ -69,6 +69,7 @@ SLEEP_BETWEEN_PRODUCTS_MS = int(os.getenv("SLEEP_BETWEEN_PRODUCTS_MS", "120"))
 SLEEP_BETWEEN_PAGES_MS = int(os.getenv("SLEEP_BETWEEN_PAGES_MS", "400"))
 SLEEP_BETWEEN_SHOPS_MS = int(os.getenv("SLEEP_BETWEEN_SHOPS_MS", "800"))
 MUTATION_SLEEP_SEC = float(os.getenv("MUTATION_SLEEP_SEC", "0.35"))
+SALES_DATES_FORCE_TYPE = os.getenv("SALES_DATES_FORCE_TYPE", "").strip()
 
 # ---- India shop (Dual-site) ----
 IN_DOMAIN = os.getenv("IN_DOMAIN", "").strip()
@@ -267,10 +268,36 @@ def rest_adjust_inventory(domain: str, token: str, inventory_item_id: int, locat
 
 def rest_get_variant(domain: str, token: str, variant_id_num: int) -> dict:
     url = f"https://{domain}/admin/api/{API_VERSION}/variants/{variant_id_num}.json"
-    r = requests.get(url, headers=hdr(token), timeout=30)
-    if r.status_code != 200:
-        raise RuntimeError(f"REST get variant {variant_id_num} {r.status_code}: {r.text}")
-    return r.json().get("variant") or {}
+    last_err = None
+    for attempt in range(1, 6):
+        r = requests.get(url, headers=hdr(token), timeout=30)
+
+        if r.status_code in (429,) or r.status_code >= 500:
+            # backoff and retry
+            last_err = RuntimeError(
+                f"REST get variant {variant_id_num} {r.status_code}: {r.text}"
+            )
+            time.sleep(_backoff_delay(attempt, base=0.4, mx=8.0))
+            continue
+
+        if r.status_code != 200:
+            last_err = RuntimeError(
+                f"REST get variant {variant_id_num} {r.status_code}: {r.text}"
+            )
+            time.sleep(_backoff_delay(attempt, base=0.4, mx=8.0))
+            continue
+
+        # success
+        data = r.json().get("variant") or {}
+        # throttle a bit after *each* successful call to keep us under ~2/sec
+        time.sleep(MUTATION_SLEEP_SEC)
+        return data
+
+    # if we fell out of loop
+    if last_err:
+        raise last_err
+    return {}
+
 
 def rest_update_variant_price(domain: str, token: str, variant_id_num: int, price: str) -> None:
     url = f"https://{domain}/admin/api/{API_VERSION}/variants/{variant_id_num}.json"
@@ -593,30 +620,77 @@ def set_product_metafields(
     time.sleep(MUTATION_SLEEP_SEC)
 
 
-def bump_sales_in(domain: str, token: str, product_gid: str,
-                  sales_node: dict, dates_node: dict,
-                  sold_qty: int, today: str):
+def bump_sales_in(
+    domain: str,
+    token: str,
+    product_gid: str,
+    sales_node: dict,
+    dates_node: dict,
+    sold_qty: int,
+    today: str,
+    sku_for_log: str = ""
+):
     """
-    Increment 'sales_total' metafield and append today's date
-    to 'sales_dates' metafield.
+    Increment sales_total by sold_qty and update the "last sale date" metafield.
+
+    Behaves differently based on metafield type:
+    - If KEY_DATES metafield type is 'date', we ONLY store today's date.
+    - If it's a list.* type, we store a JSON array of dates like ["2025-10-27", ...].
+    - Otherwise (string types), we keep comma-separated history.
+
+    sku_for_log is only for nicer logging.
     """
+
     sold_qty = int(sold_qty or 0)
     if sold_qty <= 0:
         return
+
+    # --- figure out types, respecting env override for dates ---
+    mf_sales_type = (
+        (sales_node or {}).get("type")
+        or get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, KEY_SALES)
+        or "single_line_text_field"
+    )
+
+    mf_dates_type = (
+        SALES_DATES_FORCE_TYPE
+        or (dates_node or {}).get("type")
+        or get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, KEY_DATES)
+        or "single_line_text_field"
+    )
+
+    # --- sales_total increment ---
     old_total = int((sales_node or {}).get("value") or "0")
     new_total = old_total + sold_qty
 
+    # --- build new value for KEY_DATES based on type ---
     old_dates_raw = (dates_node or {}).get("value") or ""
-    dates_list = [d.strip() for d in old_dates_raw.split(",") if d.strip()]
-    dates_list.append(today)
-    new_dates_val = ",".join(dates_list[-50:])  # clamp
 
-    mf_sales_type = (sales_node or {}).get("type") \
-        or get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, KEY_SALES) \
-        or "single_line_text_field"
-    mf_dates_type = (dates_node or {}).get("type") \
-        or get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, KEY_DATES) \
-        or "single_line_text_field"
+    if mf_dates_type == "date":
+        # Shopify wants a single YYYY-MM-DD string
+        new_dates_val = today
+
+    elif mf_dates_type.startswith("list."):
+        # Shopify wants a JSON array string for list.* types
+        # Start from existing data if it looks like JSON, otherwise wrap
+        try:
+            existing_list = json.loads(old_dates_raw) if old_dates_raw.strip() else []
+            if not isinstance(existing_list, list):
+                existing_list = []
+        except Exception:
+            existing_list = []
+
+        existing_list.append(today)
+        # keep only last 50
+        existing_list = existing_list[-50:]
+        new_dates_val = json.dumps(existing_list, ensure_ascii=False)
+
+    else:
+        # treat as plain text string, keep comma history like before
+        dates_list = [d.strip() for d in old_dates_raw.split(",") if d.strip()]
+        dates_list.append(today)
+        dates_list = dates_list[-50:]
+        new_dates_val = ",".join(dates_list)
 
     mutation = """
     mutation($mfs:[MetafieldsSetInput!]!){
@@ -624,6 +698,7 @@ def bump_sales_in(domain: str, token: str, product_gid: str,
         userErrors{ field message }
       }
     }"""
+
     mfs = [
         {
             "ownerId": product_gid,
@@ -640,25 +715,43 @@ def bump_sales_in(domain: str, token: str, product_gid: str,
             "value": new_dates_val,
         },
     ]
+
     try:
         data = gql(domain, token, mutation, {"mfs": mfs})
         errs = ((data.get("metafieldsSet") or {}).get("userErrors") or [])
         if errs:
-            log_row("⚠️", "IN", "SALES_BUMP_FAIL",
-                    product_id=gid_num(product_gid),
-                    delta=str(sold_qty),
-                    message=str(errs))
-        else:
-            log_row("🧾", "IN", "SALES_BUMP_OK",
-                    product_id=gid_num(product_gid),
-                    delta=str(sold_qty),
-                    message=f"+{sold_qty} sold")
-    except Exception as e:
-        log_row("⚠️", "IN", "SALES_BUMP_ERR",
+            log_row(
+                "⚠️",
+                "IN",
+                "SALES_BUMP_FAIL",
                 product_id=gid_num(product_gid),
+                sku=sku_for_log,
                 delta=str(sold_qty),
-                message=str(e))
+                message=str(errs),
+            )
+        else:
+            log_row(
+                "🧾",
+                "IN",
+                "SALES_BUMP_OK",
+                product_id=gid_num(product_gid),
+                sku=sku_for_log,
+                delta=str(sold_qty),
+                message=f"+{sold_qty} sold",
+            )
+    except Exception as e:
+        log_row(
+            "⚠️",
+            "IN",
+            "SALES_BUMP_ERR",
+            product_id=gid_num(product_gid),
+            sku=sku_for_log,
+            delta=str(sold_qty),
+            message=str(e),
+        )
+
     time.sleep(MUTATION_SLEEP_SEC)
+
 
 def set_start_manufacturing_flag(domain: str, token: str, product_gid: str, flag_value: str):
     """
@@ -1368,7 +1461,8 @@ def scan_india_and_update(read_only: bool = False):
                         p.get("salesTotal") or {},
                         p.get("salesDates") or {},
                         sold,
-                        today
+                        today,
+                        sku_for_log=sku
                     )
                     log_row("🧾➖", "IN", "SALES_BUMP",
                             product_id=pid,
