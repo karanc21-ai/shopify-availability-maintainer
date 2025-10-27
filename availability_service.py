@@ -457,45 +457,53 @@ def update_product_status(domain: str, token: str, product_gid: str, new_status:
 
 def _encode_value_for_type(mf_type: str, raw_str: str) -> str:
     """
-    Given the metafield type string (e.g. 'single_line_text_field' or 'list.single_line_text_field')
-    and the human value we WANT ('Ready To Ship' or '2-5 Days Across India' or ''),
-    return the string we actually must send to Shopify in metafieldsSet.
+    Convert a human value like "Ready To Ship" or "2-5 Days Across India"
+    into what Shopify expects for that metafield type.
 
     Rules:
-    - list.* types must be valid JSON array string. e.g. '["Ready To Ship"]' or '[]'
-    - scalar types are just the raw string.
+    - If it's a list.* metafield type (e.g. list.single_line_text_field),
+      Shopify wants a JSON array string. So:
+        ""            -> "[]"
+        "Ready To Ship" -> "["Ready To Ship"]"
+    - Otherwise (scalar types), it's just the plain string.
     """
     mf_type = (mf_type or "").strip()
     val = (raw_str or "").strip()
 
     if mf_type.startswith("list."):
         if val == "":
-            # clear list: send an empty JSON array
             return "[]"
-        # single element list
         return json.dumps([val], ensure_ascii=False)
     else:
-        # scalar metafield types take a bare string
         return val
 
 
-def set_product_metafields(domain: str, token: str, product_gid: str,
-                           badges_node: dict, dtime_node: dict,
-                           new_badge_human: str, new_dtime_human: str) -> None:
+def set_product_metafields(
+    domain: str,
+    token: str,
+    product_gid: str,
+    badges_node: dict,
+    dtime_node: dict,
+    new_badge_human: Optional[str],
+    new_dtime_human: str,
+    sku_for_log: str = ""
+) -> None:
     """
-    Writes two metafields on a product:
-      - custom.badges         (can be list.single_line_text_field on IN)
-      - custom.delivery_time  (usually single_line_text_field on IN)
+    Update product metafields on the India store:
 
-    We:
-    1. Resolve the correct metafield type for each (env override wins).
-    2. Encode the desired values according to that type.
-    3. Compare encoded values to current values from Shopify.
-    4. Only send metafieldsSet if something changed.
+    - custom.badges
+        ONLY if new_badge_human is not None.
+        If you pass None, we leave badges exactly as-is
+        and never overwrite marketing badges.
+
+    - custom.delivery_time
+        ALWAYS managed, because US PDP messaging depends on this
+        (we mirror it to status_in_india in the US shop).
+
+    sku_for_log is only to show SKU in log_row().
     """
 
-    # --- resolve types ---
-    # badges
+    # Resolve metafield types. We respect your env overrides first.
     mf_badge_type = (
         BADGES_FORCE_TYPE
         or (badges_node or {}).get("type")
@@ -503,7 +511,6 @@ def set_product_metafields(domain: str, token: str, product_gid: str,
         or "single_line_text_field"
     )
 
-    # delivery_time
     mf_dtime_type = (
         DELIVERY_FORCE_TYPE
         or (dtime_node or {}).get("type")
@@ -511,27 +518,27 @@ def set_product_metafields(domain: str, token: str, product_gid: str,
         or "single_line_text_field"
     )
 
-    # --- current stored values on Shopify ---
+    # What's currently stored
     current_badge_raw = ((badges_node or {}).get("value") or "").strip()
     current_dtime_raw = ((dtime_node or {}).get("value") or "").strip()
 
-    # --- desired encoded values (what metafieldsSet must send) ---
-    want_badge_encoded = _encode_value_for_type(mf_badge_type, new_badge_human)
-    want_dtime_encoded = _encode_value_for_type(mf_dtime_type, new_dtime_human)
-
     mfs = []
 
-    # badge metafield: only push if different
-    if want_badge_encoded != current_badge_raw:
-        mfs.append({
-            "ownerId": product_gid,
-            "namespace": MF_NAMESPACE,
-            "key": MF_BADGES_KEY,
-            "type": mf_badge_type,
-            "value": want_badge_encoded,
-        })
+    # badges metafield (custom.badges)
+    # only if caller explicitly provided a value (not None)
+    if new_badge_human is not None:
+        want_badge_encoded = _encode_value_for_type(mf_badge_type, new_badge_human)
+        if want_badge_encoded != current_badge_raw:
+            mfs.append({
+                "ownerId": product_gid,
+                "namespace": MF_NAMESPACE,
+                "key": MF_BADGES_KEY,
+                "type": mf_badge_type,
+                "value": want_badge_encoded,
+            })
 
-    # delivery_time metafield: only push if different
+    # delivery_time metafield (custom.delivery_time)
+    want_dtime_encoded = _encode_value_for_type(mf_dtime_type, new_dtime_human)
     if want_dtime_encoded != current_dtime_raw:
         mfs.append({
             "ownerId": product_gid,
@@ -541,7 +548,7 @@ def set_product_metafields(domain: str, token: str, product_gid: str,
             "value": want_dtime_encoded,
         })
 
-    # If nothing changed, skip call entirely.
+    # Nothing changed? Then don't hit Shopify at all.
     if not mfs:
         return
 
@@ -556,19 +563,35 @@ def set_product_metafields(domain: str, token: str, product_gid: str,
         data = gql(domain, token, mutation, {"mfs": mfs})
         errs = ((data.get("metafieldsSet") or {}).get("userErrors") or [])
         if errs:
-            log_row("⚠️", domain, "SET_FAIL",
-                    product_id=gid_num(product_gid),
-                    message=str(errs))
-        else:
-            log_row("🏷️", domain, "SET_OK",
-                    product_id=gid_num(product_gid),
-                    message="updated badge/delivery")
-    except Exception as e:
-        log_row("⚠️", domain, "SET_ERR",
+            log_row(
+                "⚠️",
+                domain,
+                "SET_FAIL",
                 product_id=gid_num(product_gid),
-                message=str(e))
+                sku=sku_for_log,
+                message=str(errs),
+            )
+        else:
+            log_row(
+                "🏷️",
+                domain,
+                "SET_OK",
+                product_id=gid_num(product_gid),
+                sku=sku_for_log,
+                message="updated badge/delivery",
+            )
+    except Exception as e:
+        log_row(
+            "⚠️",
+            domain,
+            "SET_ERR",
+            product_id=gid_num(product_gid),
+            sku=sku_for_log,
+            message=str(e),
+        )
 
     time.sleep(MUTATION_SLEEP_SEC)
+
 
 def bump_sales_in(domain: str, token: str, product_gid: str,
                   sales_node: dict, dates_node: dict,
