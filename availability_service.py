@@ -682,6 +682,7 @@ def sync_priceinindia_for_us_product(us_product_node: dict, idx: dict):
     if not in_variant_id: return
     try:
         var = rest_get_variant(IN_DOMAIN, IN_TOKEN, int(in_variant_id))
+        time.sleep(0.51)
         in_price = float(var.get("price") or 0.0)
     except Exception as e:
         log_row("⚠️", "US", "PRICEINDIA_WARN", product_id=pid_us, sku=sku, message=f"read IN price error: {e}")
