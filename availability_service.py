@@ -73,6 +73,9 @@ MUTATION_SLEEP_SEC = float(os.getenv("MUTATION_SLEEP_SEC", "0.35"))
 # ---- India shop (Dual-site) ----
 IN_DOMAIN = os.getenv("IN_DOMAIN", "").strip()
 IN_TOKEN = os.getenv("IN_TOKEN", "").strip()
+BADGES_FORCE_TYPE = os.getenv("BADGES_FORCE_TYPE", "").strip()
+DELIVERY_FORCE_TYPE = os.getenv("DELIVERY_FORCE_TYPE", "").strip()
+
 
 # IMPORTANT:
 # Respect existing env var names.
@@ -452,44 +455,93 @@ def update_product_status(domain: str, token: str, product_gid: str, new_status:
     except Exception:
         return False
 
+def _encode_value_for_type(mf_type: str, raw_str: str) -> str:
+    """
+    Given the metafield type string (e.g. 'single_line_text_field' or 'list.single_line_text_field')
+    and the human value we WANT ('Ready To Ship' or '2-5 Days Across India' or ''),
+    return the string we actually must send to Shopify in metafieldsSet.
+
+    Rules:
+    - list.* types must be valid JSON array string. e.g. '["Ready To Ship"]' or '[]'
+    - scalar types are just the raw string.
+    """
+    mf_type = (mf_type or "").strip()
+    val = (raw_str or "").strip()
+
+    if mf_type.startswith("list."):
+        if val == "":
+            # clear list: send an empty JSON array
+            return "[]"
+        # single element list
+        return json.dumps([val], ensure_ascii=False)
+    else:
+        # scalar metafield types take a bare string
+        return val
+
+
 def set_product_metafields(domain: str, token: str, product_gid: str,
                            badges_node: dict, dtime_node: dict,
-                           new_badge: str, new_dtime: str) -> None:
+                           new_badge_human: str, new_dtime_human: str) -> None:
     """
-    Writes two metafields (badges_key, delivery_key) on a product.
-    Only writes if changed.
+    Writes two metafields on a product:
+      - custom.badges         (can be list.single_line_text_field on IN)
+      - custom.delivery_time  (usually single_line_text_field on IN)
+
+    We:
+    1. Resolve the correct metafield type for each (env override wins).
+    2. Encode the desired values according to that type.
+    3. Compare encoded values to current values from Shopify.
+    4. Only send metafieldsSet if something changed.
     """
-    mf_badge_type = (badges_node or {}).get("type") or \
-        get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, MF_BADGES_KEY) \
-        or "single_line_text_field"
-    mf_dtime_type = (dtime_node or {}).get("type") or \
-        get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, MF_DELIVERY_KEY) \
-        or "single_line_text_field"
 
-    current_badge = ((badges_node or {}).get("value") or "").strip()
-    current_dtime = ((dtime_node or {}).get("value") or "").strip()
+    # --- resolve types ---
+    # badges
+    mf_badge_type = (
+        BADGES_FORCE_TYPE
+        or (badges_node or {}).get("type")
+        or get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, MF_BADGES_KEY)
+        or "single_line_text_field"
+    )
 
-    want_badge = (new_badge or "").strip()
-    want_dtime = (new_dtime or "").strip()
+    # delivery_time
+    mf_dtime_type = (
+        DELIVERY_FORCE_TYPE
+        or (dtime_node or {}).get("type")
+        or get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, MF_DELIVERY_KEY)
+        or "single_line_text_field"
+    )
+
+    # --- current stored values on Shopify ---
+    current_badge_raw = ((badges_node or {}).get("value") or "").strip()
+    current_dtime_raw = ((dtime_node or {}).get("value") or "").strip()
+
+    # --- desired encoded values (what metafieldsSet must send) ---
+    want_badge_encoded = _encode_value_for_type(mf_badge_type, new_badge_human)
+    want_dtime_encoded = _encode_value_for_type(mf_dtime_type, new_dtime_human)
 
     mfs = []
-    if want_badge != current_badge:
+
+    # badge metafield: only push if different
+    if want_badge_encoded != current_badge_raw:
         mfs.append({
             "ownerId": product_gid,
             "namespace": MF_NAMESPACE,
             "key": MF_BADGES_KEY,
             "type": mf_badge_type,
-            "value": want_badge
+            "value": want_badge_encoded,
         })
-    if want_dtime != current_dtime:
+
+    # delivery_time metafield: only push if different
+    if want_dtime_encoded != current_dtime_raw:
         mfs.append({
             "ownerId": product_gid,
             "namespace": MF_NAMESPACE,
             "key": MF_DELIVERY_KEY,
             "type": mf_dtime_type,
-            "value": want_dtime
+            "value": want_dtime_encoded,
         })
 
+    # If nothing changed, skip call entirely.
     if not mfs:
         return
 
@@ -499,6 +551,7 @@ def set_product_metafields(domain: str, token: str, product_gid: str,
         userErrors{ field message }
       }
     }"""
+
     try:
         data = gql(domain, token, mutation, {"mfs": mfs})
         errs = ((data.get("metafieldsSet") or {}).get("userErrors") or [])
@@ -514,6 +567,7 @@ def set_product_metafields(domain: str, token: str, product_gid: str,
         log_row("⚠️", domain, "SET_ERR",
                 product_id=gid_num(product_gid),
                 message=str(e))
+
     time.sleep(MUTATION_SLEEP_SEC)
 
 def bump_sales_in(domain: str, token: str, product_gid: str,
