@@ -73,13 +73,24 @@ MUTATION_SLEEP_SEC = float(os.getenv("MUTATION_SLEEP_SEC", "0.35"))
 # ---- India shop (Dual-site) ----
 IN_DOMAIN = os.getenv("IN_DOMAIN", "").strip()
 IN_TOKEN = os.getenv("IN_TOKEN", "").strip()
-IN_COLLECTIONS = [c.strip() for c in os.getenv("IN_COLLECTIONS", "").split(",") if c.strip()]
+
+# IMPORTANT:
+# Respect existing env var names.
+# Use IN_COLLECTION_HANDLES if set (your production var),
+# fallback to IN_COLLECTIONS only if IN_COLLECTION_HANDLES is missing.
+_in_coll_env = os.getenv("IN_COLLECTION_HANDLES", os.getenv("IN_COLLECTIONS", ""))
+IN_COLLECTIONS = [c.strip() for c in _in_coll_env.split(",") if c.strip()]
+
 IN_LOCATION_ID = int(os.getenv("IN_LOCATION_ID", "0") or "0")
 
 # ---- US shop (Dual-site) ----
 US_DOMAIN = os.getenv("US_DOMAIN", "").strip()
 US_TOKEN = os.getenv("US_TOKEN", "").strip()
-US_COLLECTIONS = [c.strip() for c in os.getenv("US_COLLECTIONS", "").split(",") if c.strip()]
+
+# Same treatment for US:
+_us_coll_env = os.getenv("US_COLLECTION_HANDLES", os.getenv("US_COLLECTIONS", ""))
+US_COLLECTIONS = [c.strip() for c in _us_coll_env.split(",") if c.strip()]
+
 US_LOCATION_ID = int(os.getenv("US_LOCATION_ID", "0") or "0")
 
 # ---- Metafields / keys ----
@@ -90,7 +101,7 @@ MF_PRICEIN_KEY    = os.getenv("MF_PRICEIN_KEY", "priceinindia").strip()  # used 
 TEMP_DISC_KEY     = os.getenv("TEMP_DISC_KEY", "temp_discount_active").strip()  # Integer metafield on IN
 
 KEY_SALES         = os.getenv("KEY_SALES", "sales_total").strip()
-KEY_DATES         = os.getenv("KEY_DATES", "sale_dates").strip()
+KEY_DATES         = os.getenv("KEY_DATES", "sales_dates").strip()
 
 KEY_VIEWS         = os.getenv("KEY_VIEWS", "view_counts").strip()
 KEY_ATC           = os.getenv("KEY_ATC", "atc_counts").strip()
@@ -150,6 +161,11 @@ B_ENDPOINT_URL         = os.getenv("B_ENDPOINT_URL", "").strip()
 A_TO_B_SHARED_SECRET   = os.getenv("A_TO_B_SHARED_SECRET", "").strip()
 SOURCE_SITE            = os.getenv("SOURCE_SITE", "IN").strip()  # "IN" or "US" etc.
 
+# ---- Other feature toggles from env (we don't always use them here, but we keep them so names stay stable)
+IN_INCLUDE_UNTRACKED = (os.getenv("IN_INCLUDE_UNTRACKED", "1") == "1")
+IN_CHANGE_STATUS = (os.getenv("IN_CHANGE_STATUS", "0") == "1")
+SPECIAL_STATUS_HANDLE = os.getenv("SPECIAL_STATUS_HANDLE", "").strip()
+
 # ---- Paths / persistence ----
 DATA_DIR = os.getenv("DATA_DIR", ".").rstrip("/")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -166,7 +182,7 @@ IN_LAST_SEEN   = p("in_last_seen.json")
 US_LAST_SEEN   = p("us_last_seen.json")
 STATE_PATH     = p("dual_state.json")
 IN_SKU_INDEX   = p("in_sku_index.json")
-IN_DELIVERY_MAP = p("in_delivery_map.json")  # NEW: SKU -> "2-5 Days..." / "12-15 Days..."
+IN_DELIVERY_MAP = p("in_delivery_map.json")  # SKU -> "2-5 Days..." / "12-15 Days..."
 LOG_CSV        = p("dual_sync_log.csv")
 LOG_JSONL      = p("dual_sync_log.jsonl")
 DISC_STATE     = p("discount_state.json")
@@ -505,7 +521,7 @@ def bump_sales_in(domain: str, token: str, product_gid: str,
                   sold_qty: int, today: str):
     """
     Increment 'sales_total' metafield and append today's date
-    to 'sale_dates' metafield.
+    to 'sales_dates' metafield.
     """
     sold_qty = int(sold_qty or 0)
     if sold_qty <= 0:
@@ -998,7 +1014,7 @@ def build_in_sku_index():
             message=f"entries={len(index)}")
 
 
-# ========================= MFG NOTIFIER (NEW) =========================
+# ========================= MFG NOTIFIER =========================
 
 def _mfg_hmac_b64(secret: str, raw: bytes) -> str:
     import hashlib, hmac, base64
@@ -1009,10 +1025,6 @@ def _mfg_hmac_b64(secret: str, raw: bytes) -> str:
 def send_to_manufacturing(*, sku: str, delta: int, before: int, after: int,
                           product_id: str = "", variant_id: str = "",
                           title: str = "") -> None:
-    """
-    Low-level manufacturing notify (not used directly anymore;
-    we switched to notify_mfg_sale()).
-    """
     if not ENABLE_MFG_NOTIFY:
         return
     if not (B_ENDPOINT_URL and A_TO_B_SHARED_SECRET):
@@ -1064,7 +1076,6 @@ def send_to_manufacturing(*, sku: str, delta: int, before: int, after: int,
 
 
 # ========================= GraphQL Queries =========================
-# We alias metafields in queries so code can access them predictably.
 
 QUERY_COLLECTION_PAGE_IN = f"""
 query ($handle:String!, $cursor:String) {{
@@ -1163,7 +1174,7 @@ query ($handle:String!, $cursor:String) {{
 }}
 """
 
-# metafield definition cache (to avoid re-querying types constantly)
+# metafield definition cache
 _MF_DEF_CACHE: Dict[Tuple[str, str, str], str] = {}
 
 def get_mf_def_type(domain: str, token: str, owner_type: str,
@@ -1200,10 +1211,6 @@ def get_mf_def_type(domain: str, token: str, owner_type: str,
 
 # ========================= INDIA / USA SCANNERS =========================
 
-IN_INCLUDE_UNTRACKED = (os.getenv("IN_INCLUDE_UNTRACKED", "1") == "1")
-SPECIAL_STATUS_HANDLE = os.getenv("SPECIAL_STATUS_HANDLE", "").strip()
-IN_CHANGE_STATUS = (os.getenv("IN_CHANGE_STATUS", "0") == "1")
-
 def scan_india_and_update(read_only: bool = False):
     """
     Walk through IN collections:
@@ -1216,8 +1223,7 @@ def scan_india_and_update(read_only: bool = False):
     last_seen: Dict[str, int] = load_json(IN_LAST_SEEN, {})
     today = today_ist_str()
 
-    # we'll accumulate SKU->delivery_time here; we load the old file in case
-    # products appear in multiple collections
+    # load old delivery map so we don't lose SKUs when scanning multiple collections
     delivery_idx: Dict[str, str] = load_json(IN_DELIVERY_MAP, {})
 
     for handle in IN_COLLECTIONS:
@@ -1411,26 +1417,28 @@ def scan_india_and_update(read_only: bool = False):
                     and IN_CHANGE_STATUS
                     and SPECIAL_STATUS_HANDLE
                     and (handle == SPECIAL_STATUS_HANDLE)):
-                    if avail < 1 and status == "ACTIVE":
-                        ok = update_product_status(
-                            IN_DOMAIN, IN_TOKEN, p["id"], "DRAFT"
-                        )
-                        log_row("🛑", "IN", "STATUS_TO_DRAFT",
-                                product_id=pid,
-                                sku=sku,
-                                delta=str(avail),
-                                title=title,
-                                message=f"handle={handle}")
-                    elif avail >= 1 and status == "DRAFT":
-                        ok = update_product_status(
-                            IN_DOMAIN, IN_TOKEN, p["id"], "ACTIVE"
-                        )
-                        log_row("✅", "IN", "STATUS_TO_ACTIVE",
-                                product_id=pid,
-                                sku=sku,
-                                delta=str(avail),
-                                title=title,
-                                message=f"handle={handle}")
+                    if avail < 1:
+                        if status == "ACTIVE":
+                            ok = update_product_status(
+                                IN_DOMAIN, IN_TOKEN, p["id"], "DRAFT"
+                            )
+                            log_row("🛑", "IN", "STATUS_TO_DRAFT",
+                                    product_id=pid,
+                                    sku=sku,
+                                    delta=str(avail),
+                                    title=title,
+                                    message=f"handle={handle}")
+                    else:
+                        if status == "DRAFT":
+                            ok = update_product_status(
+                                IN_DOMAIN, IN_TOKEN, p["id"], "ACTIVE"
+                            )
+                            log_row("✅", "IN", "STATUS_TO_ACTIVE",
+                                    product_id=pid,
+                                    sku=sku,
+                                    delta=str(avail),
+                                    title=title,
+                                    message=f"handle={handle}")
 
                 last_seen[pid] = max(0, int(avail))
                 sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
@@ -1452,7 +1460,7 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
     - Apply/revert temp discounts (US side) based on metafield.
     - Sync custom.priceinindia and custom.status_in_india from India data,
       but only if changed (conditional write).
-    - Mirror US stock *drops* back into India's inventory if configured.
+    - Mirror US stock *drops* back into IN's inventory if configured.
     - Clamp negatives on US.
     """
     last_seen: Dict[str, int] = load_json(US_LAST_SEEN, {})
@@ -1475,7 +1483,7 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
                 p_sku = (((p.get("metafield") or {}).get("value")) or "").strip()
                 title = p.get("title") or ""
 
-                # Calculate US total avail (sum of variants)
+                # Calculate US total avail
                 us_avail = 0
                 for v0 in ((p.get("variants") or {}).get("nodes") or []):
                     us_avail += int(v0.get("inventoryQuantity") or 0)
@@ -1534,7 +1542,7 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
                             last_seen[vid] = qty
                             continue
 
-                    # qty decreased in US (delta < 0)
+                    # qty decreased in US
                     if not read_only and delta < 0 and sku_exact:
                         idx_info = in_index.get(sku_exact)
                         if not idx_info:
@@ -1727,8 +1735,6 @@ def record_counter_event(kind: str, sku: str,
                          ip_addr: str = "", user_agent: str = ""):
     """
     kind in {"view","atc","sale"}.
-    We'll store per-SKU counters in JSON,
-    plus last sale date if kind=="sale".
     """
     if not sku:
         return
@@ -1750,10 +1756,6 @@ def record_counter_event(kind: str, sku: str,
 # ========================= AVAILABILITY POLLER (COUNTERS APP) =========================
 
 def GET_VARIANT_AVAIL(domain: str, token: str, product_id: str) -> Dict[str, int]:
-    """
-    Return { variant_id: qty } for a product_id using a small partial query.
-    We skip untracked variants.
-    """
     q = f"""
     query($id:ID!){{
       product(id:$id){{
@@ -1783,11 +1785,6 @@ def GET_VARIANT_AVAIL(domain: str, token: str, product_id: str) -> Dict[str, int
     return result
 
 def _availability_poll_once():
-    """
-    Poll inventory for specific product IDs (INVENTORY_POLL_SEC > 0).
-    If we detect a drop in any tracked variant, record that drop as a "sale"
-    in the counters JSON.
-    """
     if INVENTORY_POLL_SEC <= 0:
         return
 
@@ -1878,9 +1875,6 @@ def rebuild_index():
 
 @app.route("/run-now", methods=["POST"])
 def run_now():
-    """
-    Force one full scan (IN -> US) + counters roll.
-    """
     try:
         run_cycle()
         return jsonify({"ok": True, "ts": now_ist_str()})
@@ -2030,6 +2024,17 @@ def scheduler_loop():
 # ========================= MAIN =========================
 
 if __name__ == "__main__":
+    # Build India SKU index once at boot so US sync has something to read,
+    # and so you immediately see 🗂️ IN INDEX_BUILT in logs.
+    try:
+        if IN_DOMAIN and IN_TOKEN and IN_COLLECTIONS:
+            build_in_sku_index()
+    except Exception as e:
+        print(f"[BOOT] build_in_sku_index error: {e}", flush=True)
+
+    # Start background scheduler thread
     t = threading.Thread(target=scheduler_loop, daemon=True)
     t.start()
+
+    # Serve Flask with dev server (Render is currently calling python directly)
     app.run(host="0.0.0.0", port=PORT)
