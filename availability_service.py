@@ -456,14 +456,29 @@ def compute_product_availability(variants: List[dict], include_untracked: bool) 
 
 def desired_state(avail: int) -> Tuple[str, str, str]:
     """
-    Return tuple of (badge, display_badge, delivery_time_value) based on availability.
-    - If avail >= 1 => "Ready To Ship" & "2-5 Days Across India"
-    - else          => "" (no badge) & "12-15 Days Across India"
+    Given current availability 'avail' for a product in India,
+    decide what we *want* to show.
+
+    Returns a 3-tuple:
+      (target_delivery, target_badge, target_delivery_for_map)
+    - target_delivery:      what to put in custom.delivery_time
+    - target_badge:         what to put in custom.badges ("Ready To Ship" or "")
+    - target_delivery_for_map: same string we save in in_delivery_map.json
+      (used for US status_in_india sync)
     """
-    if avail >= 1:
-        return BADGE_READY, BADGE_READY, DELIVERY_READY
+    if avail > 0:
+        return (
+            "2-5 Days Across India",   # delivery_time
+            "Ready To Ship",           # badges
+            "2-5 Days Across India"    # delivery map for US
+        )
     else:
-        return "", BADGE_READY, DELIVERY_MTO
+        return (
+            "12-15 Days Across India", # delivery_time
+            "",                        # badges cleared
+            "12-15 Days Across India"  # delivery map for US
+        )
+
 
 def update_product_status(domain: str, token: str, product_gid: str, new_status: str) -> bool:
     q = """
