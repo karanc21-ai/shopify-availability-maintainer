@@ -456,28 +456,28 @@ def compute_product_availability(variants: List[dict], include_untracked: bool) 
 
 def desired_state(avail: int) -> Tuple[str, str, str]:
     """
-    Given current availability 'avail' for a product in India,
-    decide what we *want* to show.
+    Decide what messaging we want for this SKU given current India availability.
 
-    Returns a 3-tuple:
-      (target_delivery, target_badge, target_delivery_for_map)
-    - target_delivery:      what to put in custom.delivery_time
-    - target_badge:         what to put in custom.badges ("Ready To Ship" or "")
-    - target_delivery_for_map: same string we save in in_delivery_map.json
-      (used for US status_in_india sync)
+    Returns:
+      target_delivery            -> goes to custom.delivery_time on IN product
+      target_badge               -> goes to custom.badges on IN product
+      target_delivery_for_map    -> stored in delivery_idx[sku] for US sync
     """
     if avail > 0:
+        # We physically have stock in India
         return (
             "2-5 Days Across India",   # delivery_time
             "Ready To Ship",           # badges
-            "2-5 Days Across India"    # delivery map for US
+            "2-5 Days Across India",   # value that US will mirror
         )
     else:
+        # We do NOT currently have stock in India
         return (
             "12-15 Days Across India", # delivery_time
             "",                        # badges cleared
-            "12-15 Days Across India"  # delivery map for US
+            "12-15 Days Across India", # value that US will mirror
         )
+
 
 
 def update_product_status(domain: str, token: str, product_gid: str, new_status: str) -> bool:
@@ -1579,24 +1579,30 @@ def scan_india_and_update(read_only: bool = False):
                                 sku=sku,
                                 message=f"Clamp error: {e}")
 
-                # Desired metafield state for India PDP
-                _, target_badge, target_delivery = desired_state(avail)
+                # ---------------------------------------------------------
+                # Desired metafield state for India PDP + US sync
+                # ---------------------------------------------------------
+                ### CHANGED: unpack all three values in the right order
+                target_delivery, target_badge, target_delivery_for_map = desired_state(avail)
 
-                # Track delivery status for this SKU for USA sync:
+                # Track delivery status for this SKU for USA sync
                 if sku:
+                    ### CHANGED: use target_delivery_for_map (not target_delivery directly)
                     delivery_idx[sku] = target_delivery_for_map
 
-                # Update India product metafields (badge + delivery_time)
+                # Update India product metafields (badges + delivery_time)
                 if not read_only:
+                    ### CHANGED: we pass target_badge so that "Ready To Ship"
+                    ### is cleared when stock is gone, and restored when stock returns.
                     set_product_metafields(
                         IN_DOMAIN,
                         IN_TOKEN,
                         p["id"],
                         p.get("badges") or {},
                         p.get("dtime") or {},
-                        target_badge,               # leave badges alone           
-                        target_delivery,
-                        sku_for_log=sku     # <- NEW: include SKU in log rows
+                        target_badge,         # "Ready To Ship" or "" (clear)
+                        target_delivery,      # "2-5 Days..." or "12-15 Days..."
+                        sku_for_log=sku
                     )
 
                 # Optionally flip ACTIVE/DRAFT if this is a special collection
@@ -1640,6 +1646,7 @@ def scan_india_and_update(read_only: bool = False):
                 cursor = pageInfo.get("endCursor")
             else:
                 break
+
 
 def scan_usa_and_mirror_to_india(read_only: bool = False):
     """
