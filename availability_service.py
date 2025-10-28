@@ -1594,7 +1594,7 @@ def scan_india_and_update(read_only: bool = False):
                         p["id"],
                         p.get("badges") or {},
                         p.get("dtime") or {},
-                        None,               # leave badges alone           
+                        target_badge,               # leave badges alone           
                         target_delivery,
                         sku_for_log=sku     # <- NEW: include SKU in log rows
                     )
