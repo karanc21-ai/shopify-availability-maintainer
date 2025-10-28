@@ -1584,7 +1584,7 @@ def scan_india_and_update(read_only: bool = False):
 
                 # Track delivery status for this SKU for USA sync:
                 if sku:
-                    delivery_idx[sku] = target_delivery
+                    delivery_idx[sku] = target_delivery_for_map
 
                 # Update India product metafields (badge + delivery_time)
                 if not read_only:
