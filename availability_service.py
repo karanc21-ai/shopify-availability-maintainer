@@ -245,6 +245,58 @@ def gql(domain: str, token: str, query: str, variables: dict = None) -> dict:
             time.sleep(_backoff_delay(attempt, base=0.4))
     raise RuntimeError(str(last_err) if last_err else "GraphQL throttled/5xx repeatedly")
 
+def now_iso_ist() -> str:
+    # IST for your ops view; you already import datetime/timezone/timedelta
+    return datetime.now(timezone(timedelta(hours=5, minutes=30))).isoformat(timespec="seconds")
+
+def mark_just_sold_rts(product_gid: str):
+    """Stamp that this product was RTS just before it sold out."""
+    mutation = (
+        "mutation($mfs:[MetafieldsSetInput!]!){ "
+        "metafieldsSet(metafields:$mfs){ userErrors{ field message } } }"
+    )
+    mfs_inputs = [
+        {
+            "ownerId": product_gid,
+            "namespace": MF_NAMESPACE,
+            "key": "was_ready_to_ship",
+            "type": "single_line_text_field",
+            "value": "1",
+        },
+        {
+            "ownerId": product_gid,
+            "namespace": MF_NAMESPACE,
+            "key": "was_ready_at",
+            "type": "single_line_text_field",
+            "value": now_iso_ist(),
+        },
+    ]
+    gql(IN_DOMAIN, IN_TOKEN, mutation, {"mfs": mfs_inputs})
+
+def clear_just_sold_rts(product_gid: str):
+    """Clear RTS stamp when stock is back > 0 (or if you ever need to reset)."""
+    mutation = (
+        "mutation($mfs:[MetafieldsSetInput!]!){ "
+        "metafieldsSet(metafields:$mfs){ userErrors{ field message } } }"
+    )
+    mfs_inputs = [
+        {
+            "ownerId": product_gid,
+            "namespace": MF_NAMESPACE,
+            "key": "was_ready_to_ship",
+            "type": "single_line_text_field",
+            "value": "",
+        },
+        {
+            "ownerId": product_gid,
+            "namespace": MF_NAMESPACE,
+            "key": "was_ready_at",
+            "type": "single_line_text_field",
+            "value": "",
+        },
+    ]
+    gql(IN_DOMAIN, IN_TOKEN, mutation, {"mfs": mfs_inputs})
+
 def rest_adjust_inventory(domain: str, token: str, inventory_item_id: int, location_id: int, delta: int) -> None:
     url = f"https://{domain}/admin/api/{API_VERSION}/inventory_levels/adjust.json"
     payload = {
@@ -1515,8 +1567,6 @@ def scan_india_and_update(read_only: bool = False):
                 if prev is None:
                     prev = 0
 
-               
-
                 # Availability DROP => treat as sales
                 if not read_only and avail < prev:
                     sold = prev - avail
@@ -1539,16 +1589,31 @@ def scan_india_and_update(read_only: bool = False):
                             before=str(prev),
                             after=str(avail))
 
-                    # Set manufacturing flag
+                    # If it just dropped to OOS from >0, stamp "was RTS"
                     try:
-                        set_start_manufacturing_flag(
-                            IN_DOMAIN, IN_TOKEN, p["id"], START_MFG_VALUE
-                        )
+                        if prev > 0 and avail <= 0:
+                            mark_just_sold_rts(p["id"])
+                            log_row("🕑", "IN", "JUST_SOLD_RTS",
+                                    product_id=pid, sku=sku,
+                                    message="Stamped was_ready_to_ship=1")
+                    except NameError:
+                        log_row("⚠️", "IN", "JUST_SOLD_RTS_WARN",
+                                product_id=pid, sku=sku,
+                                message="mark_just_sold_rts() not defined")
                     except Exception as e:
-                        log_row("⚠️", "IN", "START_MFG_WARN",
-                                product_id=pid,
-                                sku=sku,
-                                message=f"set flag error: {e}")
+                        log_row("⚠️", "IN", "JUST_SOLD_RTS_WARN",
+                                product_id=pid, sku=sku, message=str(e))
+
+                    # (DISABLED) Set manufacturing flag
+                    # try:
+                    #     set_start_manufacturing_flag(
+                    #         IN_DOMAIN, IN_TOKEN, p["id"], START_MFG_VALUE
+                    #     )
+                    # except Exception as e:
+                    #     log_row("⚠️", "IN", "START_MFG_WARN",
+                    #             product_id=pid,
+                    #             sku=sku,
+                    #             message=f"set flag error: {e}")
 
                     # Notify manufacturing handler (App B)
                     try:
@@ -1641,6 +1706,24 @@ def scan_india_and_update(read_only: bool = False):
                     ### CHANGED: use target_delivery_for_map (not target_delivery directly)
                     delivery_idx[sku] = target_delivery_for_map
 
+                # Clear the RTS stamp only after ≥1 day AND only if stock is back > 0
+                if not read_only:
+                    try:
+                        if avail > 0:
+                            # requires helper; safe if missing
+                            if rts_stamp_is_older_than(p["id"], days=1):
+                                clear_just_sold_rts(p["id"])
+                                log_row("🧹", "IN", "JUST_SOLD_RTS_CLEARED",
+                                        product_id=pid, sku=sku,
+                                        message="Cleared RTS stamp after ≥1 day")
+                    except NameError:
+                        log_row("⚠️", "IN", "JUST_SOLD_RTS_CLR_WARN",
+                                product_id=pid, sku=sku,
+                                message="rts_stamp_is_older_than()/clear_just_sold_rts() not defined")
+                    except Exception as e:
+                        log_row("⚠️", "IN", "JUST_SOLD_RTS_CLR_WARN",
+                                product_id=pid, sku=sku, message=str(e))
+
                 # Update India product metafields (badges + delivery_time)
                 if not read_only:
                     ### CHANGED: we pass target_badge so that "Ready To Ship"
@@ -1697,7 +1780,6 @@ def scan_india_and_update(read_only: bool = False):
                 cursor = pageInfo.get("endCursor")
             else:
                 break
-
 
 def scan_usa_and_mirror_to_india(read_only: bool = False):
     """
