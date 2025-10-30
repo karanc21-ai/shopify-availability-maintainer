@@ -992,6 +992,50 @@ def normalize_price_for_meta(value_rupees: float, meta_type: str) -> str:
     except Exception:
         v_int = 0
     return str(v_int)
+def compute_us_price_from_rupees(priceinindia_rupees: float) -> float:
+    """
+    US price formula (round up to nearest 5):
+        roundup(((priceindia/85*1.55)+50)/5)*5
+    """
+    try:
+        r = float(priceinindia_rupees)
+    except Exception:
+        r = 0.0
+    usd = (r / 85.0) * 1.55 + 50.0
+    # round up to nearest 5
+    return ceil_to_step(usd, 5)
+
+def update_us_variant_prices_from_rupees(us_product_node: dict, priceinindia_rupees: float):
+    """
+    For the given US product node, compute target USD using the formula and
+    update ALL variants' `price` via REST if needed.
+    """
+    target_price = compute_us_price_from_rupees(priceinindia_rupees)
+    # extract all variant GIDs from the GraphQL product node
+    variants = ((us_product_node.get("variants") or {}).get("nodes") or [])
+    if not variants:
+        return
+
+    # Optional: read SKU for logging (prefer metafield custom.SKU if present)
+    sku = ((((us_product_node.get("metafield") or {}).get("value")) or "").strip()
+           or ((variants[0].get("sku") or "").strip()))
+
+    for v in variants:
+        vid_gid = v.get("id") or ""
+        vid = gid_num(vid_gid)
+        try:
+            # Push the same US price to every variant
+            rest_update_variant_price(US_DOMAIN, US_TOKEN, int(vid), f"{target_price:.2f}")
+            log_row("💵", "US", "PRICE_PUSH",
+                    variant_id=vid,
+                    sku=sku,
+                    message=f"set={target_price:.2f} from priceinindia={priceinindia_rupees}")
+            time.sleep(MUTATION_SLEEP_SEC)
+        except Exception as e:
+            log_row("⚠️", "US", "PRICE_PUSH_WARN",
+                    variant_id=vid,
+                    sku=sku,
+                    message=str(e))
 
 def sync_priceinindia_for_us_product(
     us_product_node: dict,
@@ -1034,6 +1078,7 @@ def sync_priceinindia_for_us_product(
     desired_price_val = None
     price_changed = False
     price_mf_type = None
+    in_price = None  # keep for later variant-price push
 
     if in_variant_id:
         try:
@@ -1131,6 +1176,24 @@ def sync_priceinindia_for_us_product(
                             product_id=pid_us,
                             sku=sku,
                             message=f"Set US {MF_NAMESPACE}.{MF_PRICEIN_KEY} = {desired_price_val}")
+
+                    # NEW: push actual US variant prices from rupee base using your formula
+                    # roundup(((priceindia/85*1.55)+50)/5)*5
+                    if in_price is not None:
+                        try:
+                            update_all_us_variant_prices(us_product_node, float(in_price))
+                        except NameError:
+                            # helper not present yet — avoid breaking the run
+                            log_row("⚠️", "US", "PRICE_PUSH_AFTER_META_WARN",
+                                    product_id=pid_us,
+                                    sku=sku,
+                                    message="update_all_us_variant_prices() not defined")
+                        except Exception as e:
+                            log_row("⚠️", "US", "PRICE_PUSH_AFTER_META_WARN",
+                                    product_id=pid_us,
+                                    sku=sku,
+                                    message=str(e))
+
                 if status_changed:
                     log_row("📦", "US", "STATUSINDIA_SET",
                             product_id=pid_us,
@@ -1147,7 +1210,7 @@ def sync_priceinindia_for_us_product(
     # THROTTLE ONLY IF WE ACTUALLY WROTE
     # --------------------------
     if wrote_anything:
-        time.sleep(0.55)
+        time.sleep(0.75)
 
 
 # ========================= INDEX BUILDER (IN) =========================
