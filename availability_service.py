@@ -245,8 +245,10 @@ def gql(domain: str, token: str, query: str, variables: dict = None) -> dict:
             time.sleep(_backoff_delay(attempt, base=0.4))
     raise RuntimeError(str(last_err) if last_err else "GraphQL throttled/5xx repeatedly")
 
+# --- RTS stamp helpers (stick for ≥1 day) ---
+
 def now_iso_ist() -> str:
-    # IST for your ops view; you already import datetime/timezone/timedelta
+    # ISO-8601 with +05:30 offset (IST)
     return datetime.now(timezone(timedelta(hours=5, minutes=30))).isoformat(timespec="seconds")
 
 def mark_just_sold_rts(product_gid: str):
@@ -260,21 +262,21 @@ def mark_just_sold_rts(product_gid: str):
             "ownerId": product_gid,
             "namespace": MF_NAMESPACE,
             "key": "was_ready_to_ship",
-            "type": "single_line_text_field",
+            "type": "single_line_text_field",   # using string "1"/"" as agreed
             "value": "1",
         },
         {
             "ownerId": product_gid,
             "namespace": MF_NAMESPACE,
             "key": "was_ready_at",
-            "type": "single_line_text_field",
+            "type": "single_line_text_field",   # ISO string timestamp
             "value": now_iso_ist(),
         },
     ]
     gql(IN_DOMAIN, IN_TOKEN, mutation, {"mfs": mfs_inputs})
 
 def clear_just_sold_rts(product_gid: str):
-    """Clear RTS stamp when stock is back > 0 (or if you ever need to reset)."""
+    """Clear the RTS stamp (only call after ≥1 day)."""
     mutation = (
         "mutation($mfs:[MetafieldsSetInput!]!){ "
         "metafieldsSet(metafields:$mfs){ userErrors{ field message } } }"
@@ -296,6 +298,36 @@ def clear_just_sold_rts(product_gid: str):
         },
     ]
     gql(IN_DOMAIN, IN_TOKEN, mutation, {"mfs": mfs_inputs})
+
+def get_rts_stamp_time(product_gid: str) -> Optional[datetime]:
+    """Read custom.was_ready_at and parse to aware datetime; None if missing/unparseable."""
+    try:
+        q = (
+            "query($id:ID!,$ns:String!){"
+            "  product(id:$id){"
+            "    wasReadyAt: metafield(namespace:$ns, key:\"was_ready_at\"){ value }"
+            "  }"
+            "}"
+        )
+        data = gql(IN_DOMAIN, IN_TOKEN, q, {"id": product_gid, "ns": MF_NAMESPACE})
+        s = ((((data.get("product") or {}).get("wasReadyAt") or {}).get("value")) or "").strip()
+        if not s:
+            return None
+        # fromisoformat handles offsets like +05:30
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+def rts_stamp_is_older_than(product_gid: str, days: int = 1) -> bool:
+    """True if custom.was_ready_at exists and is at least `days` old."""
+    t = get_rts_stamp_time(product_gid)
+    if not t:
+        return False
+    try:
+        now = datetime.now(timezone(t.utcoffset() or timedelta(hours=5, minutes=30)))
+    except Exception:
+        now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+    return (now - t) >= timedelta(days=days)
 
 def rest_adjust_inventory(domain: str, token: str, inventory_item_id: int, location_id: int, delta: int) -> None:
     url = f"https://{domain}/admin/api/{API_VERSION}/inventory_levels/adjust.json"
