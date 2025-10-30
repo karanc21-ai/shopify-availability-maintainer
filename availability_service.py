@@ -1046,42 +1046,42 @@ def normalize_price_for_meta(value_rupees: float, meta_type: str) -> str:
     return str(v_int)
 def compute_us_price_from_rupees(priceinindia_rupees: float) -> float:
     """
-    US price formula (round up to nearest 5):
-        roundup(((priceindia/85*1.55)+50)/5)*5
+    Formula: roundup(((priceindia/85*1.55)+50)/5)*5
+    Uses existing ceil_to_step(...) to round up to nearest 5.
     """
     try:
         r = float(priceinindia_rupees)
     except Exception:
         r = 0.0
     usd = (r / 85.0) * 1.55 + 50.0
-    # round up to nearest 5
     return ceil_to_step(usd, 5)
 
-def update_us_variant_prices_from_rupees(us_product_node: dict, priceinindia_rupees: float):
+def update_all_us_variant_prices(us_product_node: dict, priceinindia_rupees: float):
     """
-    For the given US product node, compute target USD using the formula and
-    update ALL variants' `price` via REST if needed.
+    Set ALL US variants' REST price to the computed USD target.
+    Uses: rest_update_variant_price, US_DOMAIN, US_TOKEN, MUTATION_SLEEP_SEC, log_row, gid_num
     """
-    target_price = compute_us_price_from_rupees(priceinindia_rupees)
-    # extract all variant GIDs from the GraphQL product node
+    target = compute_us_price_from_rupees(priceinindia_rupees)
     variants = ((us_product_node.get("variants") or {}).get("nodes") or [])
     if not variants:
         return
 
-    # Optional: read SKU for logging (prefer metafield custom.SKU if present)
+    # prefer custom.SKU metafield for logs, fallback to first variant sku
     sku = ((((us_product_node.get("metafield") or {}).get("value")) or "").strip()
-           or ((variants[0].get("sku") or "").strip()))
+           or (variants[0].get("sku") or "").strip())
 
     for v in variants:
         vid_gid = v.get("id") or ""
+        if not vid_gid:
+            continue
         vid = gid_num(vid_gid)
         try:
-            # Push the same US price to every variant
-            rest_update_variant_price(US_DOMAIN, US_TOKEN, int(vid), f"{target_price:.2f}")
+            # push same price across ALL variants
+            rest_update_variant_price(US_DOMAIN, US_TOKEN, int(vid), f"{target:.2f}")
             log_row("💵", "US", "PRICE_PUSH",
                     variant_id=vid,
                     sku=sku,
-                    message=f"set={target_price:.2f} from priceinindia={priceinindia_rupees}")
+                    message=f"set={target:.2f} from priceinindia={priceinindia_rupees}")
             time.sleep(MUTATION_SLEEP_SEC)
         except Exception as e:
             log_row("⚠️", "US", "PRICE_PUSH_WARN",
