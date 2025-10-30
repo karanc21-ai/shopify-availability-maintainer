@@ -1515,19 +1515,7 @@ def scan_india_and_update(read_only: bool = False):
                 if prev is None:
                     prev = 0
 
-                # Optional auto-clear manufacturing flag if stock increased
-                if (not read_only
-                    and AUTO_CLEAR_START_MFG_ON_INCREASE
-                    and avail > prev):
-                    try:
-                        set_start_manufacturing_flag(
-                            IN_DOMAIN, IN_TOKEN, p["id"], ""
-                        )
-                    except Exception as e:
-                        log_row("⚠️", "IN", "START_MFG_WARN",
-                                product_id=pid,
-                                sku=sku,
-                                message=f"clear flag error: {e}")
+               
 
                 # Availability DROP => treat as sales
                 if not read_only and avail < prev:
