@@ -1238,6 +1238,90 @@ def get_mf_def_type(domain: str, token: str, owner_type: str,
     ).get("name") or ""
     _MF_DEF_CACHE[ck] = tname or "single_line_text_field"
     return _MF_DEF_CACHE[ck]
+# --- RTS stamp helpers (stick for ≥1 day) ---
+from datetime import datetime, timezone, timedelta
+
+def now_iso_ist() -> str:
+    # ISO-8601 with +05:30 offset (IST)
+    return datetime.now(timezone(timedelta(hours=5, minutes=30))).isoformat(timespec="seconds")
+
+def mark_just_sold_rts(product_gid: str):
+    """Stamp that this product was RTS just before it sold out."""
+    mutation = (
+        "mutation($mfs:[MetafieldsSetInput!]!){ "
+        "metafieldsSet(metafields:$mfs){ userErrors{ field message } } }"
+    )
+    mfs_inputs = [
+        {
+            "ownerId": product_gid,
+            "namespace": MF_NAMESPACE,
+            "key": "was_ready_to_ship",
+            "type": "single_line_text_field",   # storing "1" / ""
+            "value": "1",
+        },
+        {
+            "ownerId": product_gid,
+            "namespace": MF_NAMESPACE,
+            "key": "was_ready_at",
+            "type": "single_line_text_field",   # ISO timestamp string
+            "value": now_iso_ist(),
+        },
+    ]
+    gql(IN_DOMAIN, IN_TOKEN, mutation, {"mfs": mfs_inputs})
+
+def clear_just_sold_rts(product_gid: str):
+    """Clear the RTS stamp (only call after ≥1 day)."""
+    mutation = (
+        "mutation($mfs:[MetafieldsSetInput!]!){ "
+        "metafieldsSet(metafields:$mfs){ userErrors{ field message } } }"
+    )
+    mfs_inputs = [
+        {
+            "ownerId": product_gid,
+            "namespace": MF_NAMESPACE,
+            "key": "was_ready_to_ship",
+            "type": "single_line_text_field",
+            "value": "",
+        },
+        {
+            "ownerId": product_gid,
+            "namespace": MF_NAMESPACE,
+            "key": "was_ready_at",
+            "type": "single_line_text_field",
+            "value": "",
+        },
+    ]
+    gql(IN_DOMAIN, IN_TOKEN, mutation, {"mfs": mfs_inputs})
+
+def get_rts_stamp_time(product_gid: str):
+    """Read custom.was_ready_at; return aware datetime or None."""
+    try:
+        q = (
+            "query($id:ID!,$ns:String!){"
+            "  product(id:$id){"
+            "    wasReadyAt: metafield(namespace:$ns, key:\"was_ready_at\"){ value }"
+            "  }"
+            "}"
+        )
+        data = gql(IN_DOMAIN, IN_TOKEN, q, {"id": product_gid, "ns": MF_NAMESPACE})
+        s = ((((data.get("product") or {}).get("wasReadyAt") or {}).get("value")) or "").strip()
+        if not s:
+            return None
+        # handles offsets like +05:30
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+def rts_stamp_is_older_than(product_gid: str, days: int = 1) -> bool:
+    """True if custom.was_ready_at exists and is at least `days` old."""
+    t = get_rts_stamp_time(product_gid)
+    if not t:
+        return False
+    try:
+        now = datetime.now(timezone(t.utcoffset() or timedelta(hours=5, minutes=30)))
+    except Exception:
+        now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+    return (now - t) >= timedelta(days=days)
 
 
 # ========================= INDIA / USA SCANNERS =========================
