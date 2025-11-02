@@ -1554,42 +1554,76 @@ def verify_hmac(raw_body: bytes, sent_sig_b64: str, secret: str) -> bool:
 def pixel_view():
     if request.method == "OPTIONS":
         return _cors(make_response())
-    sig = request.headers.get("X-Signature", "")
+
     body = request.data or b""
-    if not verify_hmac(body, sig, PIXEL_SHARED_SECRET):
+    sig = request.headers.get("X-Signature", "")
+    key = request.args.get("key", "")
+
+    # Accept either HMAC header OR shared ?key
+    hmac_ok = verify_hmac(body, sig, PIXEL_SHARED_SECRET)
+    key_ok  = (key == PIXEL_SHARED_SECRET)
+    if not (hmac_ok or key_ok):
         return _cors(make_response(jsonify({"ok": False, "error": "bad-signature"}), 403))
+
     try:
         payload = json.loads(body.decode("utf-8"))
     except Exception:
         payload = {}
-    shop_domain = (payload.get("shop_domain") or "").strip().lower()
+
+    # Host allowlist (normalized, without 'www.')
+    shop_domain = (payload.get("shop_domain") or "").strip().lower().replace("www.", "")
+    if ALLOWED_PIXEL_HOSTS and shop_domain not in ALLOWED_PIXEL_HOSTS:
+        return _cors(make_response(jsonify({"ok": False, "error":"forbidden-shop"}), 403))
+
     sku = (payload.get("sku") or "").strip()
+    if not sku:
+        return _cors(make_response(jsonify({"ok": False, "error":"missing-sku"}), 400))
+
     ip_addr = request.remote_addr or ""
     ua = request.headers.get("User-Agent", "")
-    if shop_domain not in ALLOWED_PIXEL_HOSTS:
-        return _cors(make_response(jsonify({"ok": False, "error":"forbidden-shop"}), 403))
+
+    # Increment today's in-memory JSON state (persisted to disk)
     record_counter_event("view", sku, ip_addr, ua)
+    print(f"[PIXEL] product view sku={sku}", flush=True)
+
     return _cors(make_response(jsonify({"ok": True})))
+
 
 @app.route("/pixel/atc", methods=["POST", "OPTIONS"])
 def pixel_atc():
     if request.method == "OPTIONS":
         return _cors(make_response())
-    sig = request.headers.get("X-Signature", "")
+
     body = request.data or b""
-    if not verify_hmac(body, sig, PIXEL_SHARED_SECRET):
+    sig = request.headers.get("X-Signature", "")
+    key = request.args.get("key", "")
+
+    hmac_ok = verify_hmac(body, sig, PIXEL_SHARED_SECRET)
+    key_ok  = (key == PIXEL_SHARED_SECRET)
+    if not (hmac_ok or key_ok):
         return _cors(make_response(jsonify({"ok": False, "error": "bad-signature"}), 403))
+
     try:
         payload = json.loads(body.decode("utf-8"))
     except Exception:
         payload = {}
-    shop_domain = (payload.get("shop_domain") or "").strip().lower()
+
+    shop_domain = (payload.get("shop_domain") or "").strip().lower().replace("www.", "")
+    if ALLOWED_PIXEL_HOSTS and shop_domain not in ALLOWED_PIXEL_HOSTS:
+        return _cors(make_response(jsonify({"ok": False, "error":"forbidden-shop"}), 403))
+
     sku = (payload.get("sku") or "").strip()
+    qty = int(payload.get("qty") or 1)
+    if not sku:
+        return _cors(make_response(jsonify({"ok": False, "error":"missing-sku"}), 400))
+
     ip_addr = request.remote_addr or ""
     ua = request.headers.get("User-Agent", "")
-    if shop_domain not in ALLOWED_PIXEL_HOSTS:
-        return _cors(make_response(jsonify({"ok": False, "error":"forbidden-shop"}), 403))
+
+    # One event per add (qty is stored separately in your CSV rollup logic if needed)
     record_counter_event("atc", sku, ip_addr, ua)
+    print(f"[PIXEL] atc sku={sku} qty={qty}", flush=True)
+
     return _cors(make_response(jsonify({"ok": True})))
 
 @app.route("/pixel/sale", methods=["POST", "OPTIONS"])
