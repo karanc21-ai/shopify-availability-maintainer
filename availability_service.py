@@ -1616,7 +1616,6 @@ def pixel_sale():
 # === COLLECTION VIEWS (IN) ENDPOINT + FLUSHER ===
 # Pixel endpoint to accept collection_viewed from Customer Events
 @app.route("/pixel/collection", methods=["POST", "OPTIONS"])
-@app.route("/pixel/collection", methods=["POST", "OPTIONS"])
 def pixel_collection():
     if request.method == "OPTIONS":
         return _cors(make_response())
