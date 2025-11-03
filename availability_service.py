@@ -103,6 +103,9 @@ KEY_VIEWS = os.getenv("KEY_VIEWS", "views_total").strip()
 KEY_ATC = os.getenv("KEY_ATC", "added_to_cart_total").strip()
 KEY_AGE = os.getenv("KEY_AGE", "age_in_days").strip()
 KEY_DOB = os.getenv("KEY_DOB", "dob").strip()
+MF_WAS_RTS_KEY   = os.getenv("MF_WAS_RTS_KEY", "was_ready_to_ship").strip()
+MF_WAS_RTS_AT    = os.getenv("MF_WAS_RTS_AT",  "was_ready_at").strip()
+AUTO_CLEAR_WAS_RTS_ON_RESTOCK = os.getenv("AUTO_CLEAR_WAS_RTS_ON_RESTOCK", "1") == "1"
 # NEW: Collection views metafield key on Collection owner
 KEY_COLLECTION_VIEWS = os.getenv("KEY_COLLECTION_VIEWS", "collection_views_total").strip()
 
@@ -614,6 +617,51 @@ def set_start_manufacturing_flag(domain: str, token: str, product_gid: str, valu
     except Exception as e:
         log_row("⚠️", "IN", "START_MFG_ERROR", product_id=gid_num(product_gid), message=str(e))
 
+def set_was_ready_flags(domain: str, token: str, product_gid: str, *, ready_value: str, at_iso: str):
+    """
+    Writes:
+      custom.was_ready_to_ship = ready_value (string)
+      custom.was_ready_at      = at_iso       (string)   # you defined this as single-line string too
+    """
+    try:
+        t_ready  = get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, MF_WAS_RTS_KEY) or "single_line_text_field"
+        t_ready_at = get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, MF_WAS_RTS_AT) or "single_line_text_field"
+
+        mutation = """
+          mutation($mfs:[MetafieldsSetInput!]!){
+            metafieldsSet(metafields:$mfs){
+              userErrors { field message }
+            }
+          }"""
+        mfs = [
+            {"ownerId": product_gid, "namespace": MF_NAMESPACE, "key": MF_WAS_RTS_KEY, "type": t_ready,   "value": str(ready_value)},
+            {"ownerId": product_gid, "namespace": MF_NAMESPACE, "key": MF_WAS_RTS_AT,  "type": t_ready_at,"value": str(at_iso)},
+        ]
+        data = gql(domain, token, mutation, {"mfs": mfs})
+        errs = ((data.get("metafieldsSet") or {}).get("userErrors") or [])
+        if errs:
+            log_row("⚠️", "IN", "WAS_RTS_WARN", product_id=gid_num(product_gid), message=f"metafieldsSet errors: {errs}")
+        else:
+            log_row("⏱️", "IN", "WAS_RTS_SET", product_id=gid_num(product_gid), message=f"{MF_NAMESPACE}.{MF_WAS_RTS_KEY}={ready_value}, {MF_NAMESPACE}.{MF_WAS_RTS_AT}={at_iso}")
+    except Exception as e:
+        log_row("⚠️", "IN", "WAS_RTS_ERROR", product_id=gid_num(product_gid), message=str(e))
+def clear_was_ready_flags(domain: str, token: str, product_gid: str):
+    try:
+        delm = """
+          mutation($ids:[MetafieldIdentifierInput!]!){
+            metafieldsDelete(metafields:$ids){
+              userErrors{ field message }
+            }
+          }"""
+        ids = [
+            {"ownerId": product_gid, "namespace": MF_NAMESPACE, "key": MF_WAS_RTS_KEY},
+            {"ownerId": product_gid, "namespace": MF_NAMESPACE, "key": MF_WAS_RTS_AT},
+        ]
+        gql(domain, token, delm, {"metafields": ids})
+        log_row("🧹", "IN", "WAS_RTS_CLEARED", product_id=gid_num(product_gid), message="deleted was_ready_* metafields")
+    except Exception as e:
+        log_row("⚠️", "IN", "WAS_RTS_CLEAR_WARN", product_id=gid_num(product_gid), message=str(e))
+
 # --- temp discount helpers ---
 def ceil_to_step(value: float, step: int) -> float:
     if step <= 1: return math.ceil(value * 100) / 100.0
@@ -872,10 +920,13 @@ def scan_india_and_update(read_only: bool = False):
                 variants = ((p.get("variants") or {}).get("nodes") or [])
                 avail = compute_product_availability(variants, IN_INCLUDE_UNTRACKED)
                 if not read_only:
-                    try: maybe_apply_temp_discount_for_product("IN", IN_DOMAIN, IN_TOKEN, p, avail)
-                    except Exception as e: log_row("⚠️", "DISC", "WARN", product_id=pid, sku=sku, message=f"Apply discount pass error: {e}")
+                    try:
+                        maybe_apply_temp_discount_for_product("IN", IN_DOMAIN, IN_TOKEN, p, avail)
+                    except Exception as e:
+                        log_row("⚠️", "DISC", "WARN", product_id=pid, sku=sku, message=f"Apply discount pass error: {e}")
                 prev = _as_int_or_none(last_seen.get(pid))
-                if prev is None: prev = 0
+                if prev is None:
+                    prev = 0
 
                 # NEW: Auto-clear manual manufacturing flag if availability increased (optional)
                 if not read_only and AUTO_CLEAR_START_MFG_ON_INCREASE and avail > prev:
@@ -888,6 +939,19 @@ def scan_india_and_update(read_only: bool = False):
                     sold = prev - avail
                     bump_sales_in(IN_DOMAIN, IN_TOKEN, p["id"], p.get("salesTotal") or {}, p.get("salesDates") or {}, sold, today)
                     log_row("🧾➖", "IN", "SALES_BUMP", product_id=pid, sku=sku, delta=f"-{sold}", message=f"avail {prev}->{avail} (sold={sold})", title=title, before=str(prev), after=str(avail))
+
+                    # If it *was* Ready-To-Ship (prev > 0) and got sold, stamp the RTS proof fields
+                    try:
+                        if prev > 0:
+                            set_was_ready_flags(
+                                IN_DOMAIN, IN_TOKEN, p["id"],
+                                ready_value="yes",
+                                at_iso=now_ist().isoformat()
+                            )
+                    except Exception as e:
+                        log_row("⚠️", "IN", "WAS_RTS_WARN", product_id=pid, sku=sku, message=f"stamp error: {e}")
+
+                    # (keep your existing lines below: set_start_manufacturing_flag, notify_mfg_sale, revert_temp_discount_for_product, etc.)
 
                     # NEW: set manual manufacturing trigger metafield
                     try:
@@ -924,8 +988,10 @@ def scan_india_and_update(read_only: bool = False):
                     except Exception as e:
                         print(f"[MFG] invoke error: {e}", flush=True)
 
-                    try: revert_temp_discount_for_product("IN", IN_DOMAIN, IN_TOKEN, p)
-                    except Exception as e: log_row("⚠️", "DISC", "WARN", product_id=pid, sku=sku, message=f"Revert on sale error: {e}")
+                    try:
+                        revert_temp_discount_for_product("IN", IN_DOMAIN, IN_TOKEN, p)
+                    except Exception as e:
+                        log_row("⚠️", "DISC", "WARN", product_id=pid, sku=sku, message=f"Revert on sale error: {e}")
 
                 if not read_only and CLAMP_AVAIL_TO_ZERO and avail < 0 and variants:
                     inv_item_gid = (((variants[0].get("inventoryItem") or {}).get("id")) or "")
