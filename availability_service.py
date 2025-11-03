@@ -919,11 +919,13 @@ def scan_india_and_update(read_only: bool = False):
                 sku = (((p.get("metafield") or {}).get("value")) or "").strip()
                 variants = ((p.get("variants") or {}).get("nodes") or [])
                 avail = compute_product_availability(variants, IN_INCLUDE_UNTRACKED)
+
                 if not read_only:
                     try:
                         maybe_apply_temp_discount_for_product("IN", IN_DOMAIN, IN_TOKEN, p, avail)
                     except Exception as e:
                         log_row("⚠️", "DISC", "WARN", product_id=pid, sku=sku, message=f"Apply discount pass error: {e}")
+
                 prev = _as_int_or_none(last_seen.get(pid))
                 if prev is None:
                     prev = 0
@@ -934,6 +936,13 @@ def scan_india_and_update(read_only: bool = False):
                         set_start_manufacturing_flag(IN_DOMAIN, IN_TOKEN, p["id"], "")
                     except Exception as e:
                         log_row("⚠️", "IN", "START_MFG_WARN", product_id=pid, sku=sku, message=f"clear flag error: {e}")
+
+                    # Optional: also clear was_ready_* fields when we restock
+                    if AUTO_CLEAR_WAS_RTS_ON_RESTOCK:
+                        try:
+                            clear_was_ready_flags(IN_DOMAIN, IN_TOKEN, p["id"])
+                        except Exception as e:
+                            log_row("⚠️", "IN", "WAS_RTS_CLEAR_WARN", product_id=pid, sku=sku, message=f"clear error: {e}")
 
                 if not read_only and avail < prev:
                     sold = prev - avail
@@ -950,8 +959,6 @@ def scan_india_and_update(read_only: bool = False):
                             )
                     except Exception as e:
                         log_row("⚠️", "IN", "WAS_RTS_WARN", product_id=pid, sku=sku, message=f"stamp error: {e}")
-
-                    # (keep your existing lines below: set_start_manufacturing_flag, notify_mfg_sale, revert_temp_discount_for_product, etc.)
 
                     # NEW: set manual manufacturing trigger metafield
                     try:
@@ -1017,6 +1024,7 @@ def scan_india_and_update(read_only: bool = False):
 
                 last_seen[pid] = max(0, int(avail))
                 sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
+
             save_json(IN_LAST_SEEN, last_seen)
             sleep_ms(SLEEP_BETWEEN_PAGES_MS)
             if pageInfo.get("hasNextPage"):
