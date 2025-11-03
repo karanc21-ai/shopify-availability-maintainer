@@ -1285,4 +1285,545 @@ def _compute_availability_from_variants(variants: list) -> int:
     return total if any_tracked else 0
 
 def _list_products_availability(limit_to_pids: Optional[Set[str]] = None) -> Dict[str, int]:
-    admin_host = list_
+    admin_host = list(ADMIN_TOKENS.keys())[0]
+    token = ADMIN_TOKENS[admin_host]
+    query = """
+      query($after: String) {
+        products(first: 200, after: $after) {
+          edges {
+            cursor
+            node {
+              id
+              variants(first: 100) {
+                nodes {
+                  inventoryQuantity
+                  inventoryItem { tracked }
+                }
+              }
+            }
+          }
+          pageInfo { hasNextPage }
+        }
+      }
+    """
+    out, after = {}, None
+    while True:
+        r = requests.post(f"https://{admin_host}/admin/api/{API_VERSION}/graphql.json", headers={"Content-Type":"application/json","X-Shopify-Access-Token":token}, json={"query": query, "variables": {"after": after}}, timeout=30)
+        j = r.json()
+        data = (j.get("data") or {}).get("products") or {}
+        edges = data.get("edges") or []
+        for e in edges:
+            n = e.get("node") or {}
+            gid = n.get("id") or ""
+            pid = gid.split("/")[-1] if gid else ""
+            if not pid: continue
+            if limit_to_pids and pid not in limit_to_pids: continue
+            total = _compute_availability_from_variants(((n.get("variants") or {}).get("nodes")) or [])
+            out[pid] = int(total)
+        if not data.get("pageInfo", {}).get("hasNextPage"): break
+        after = edges[-1]["cursor"] if edges else None
+        if not after: break
+    return out
+
+def _availability_seed_all():
+    current = _list_products_availability(AVAIL_POLL_PRODUCT_IDS if AVAIL_POLL_PRODUCT_IDS else None)
+    with lock:
+        last_avail.clear()
+        last_avail.update({k:int(v) for k,v in current.items()})
+    _persist_all()
+    return len(current)
+
+def _availability_poll_once():
+    today_date = datetime.now(timezone.utc).date()
+    date_str = today_date.isoformat()
+    current = _list_products_availability(AVAIL_POLL_PRODUCT_IDS if AVAIL_POLL_PRODUCT_IDS else None)
+    changed_sales = 0
+    with lock:
+        for pid, new_av in current.items():
+            old_av = int(last_avail.get(pid, new_av))
+            if new_av < old_av:
+                delta = old_av - new_av  # units sold
+                sales_counts[pid] = int(sales_counts.get(pid, 0)) + delta
+                sales_today[pid]  = int(sales_today.get(pid, 0)) + delta
+                sd = sale_dates[pid]
+                if date_str not in sd:
+                    sd.add(date_str)
+                    if len(sd) > 365:
+                        newest_sorted = sorted(sd)[-365:]
+                        sale_dates[pid] = set(newest_sorted)
+                dirty_sales.add((ADMIN_HOST, pid))
+                changed_sales += delta
+            last_avail[pid] = int(new_av)
+    if changed_sales:
+        _persist_all()
+    return changed_sales
+
+def availability_poller():
+    if INVENTORY_POLL_SEC <= 0:
+        return
+    if not last_avail:
+        try:
+            seeded = _availability_seed_all()
+            print(f"[AVAIL] seeded baseline for {seeded} product(s)")
+        except Exception as e:
+            print("[AVAIL] seed error:", e)
+    while True:
+        try:
+            sold = _availability_poll_once()
+            if sold:
+                print(f"[AVAIL] detected {sold} unit(s) sold across products (via availability drop)")
+        except Exception as e:
+            print("[AVAIL] poll error:", e)
+        time.sleep(max(10, INVENTORY_POLL_SEC))
+
+# ========================= FLASK APP & ENDPOINTS =========================
+
+app = Flask(__name__)
+
+def _cors(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Shopify-Topic, X-Shopify-Hmac-SHA256, X-Shopify-Shop-Domain, X-Forwarded-For, CF-Connecting-IP, True-Client-IP"
+    return resp
+
+@app.route("/health", methods=["GET"])
+def health():
+    return "ok", 200
+
+@app.route("/diag", methods=["GET"])
+def diag():
+    info = {
+        "api_version": API_VERSION,
+        "data_dir": DATA_DIR,
+        "in_domain": IN_DOMAIN, "us_domain": US_DOMAIN,
+        "in_collections": IN_COLLECTIONS, "us_collections": US_COLLECTIONS,
+        "run_every_min": RUN_EVERY_MIN, "scheduler_enabled": ENABLE_SCHEDULER,
+        "in_last_seen_count": len(load_json(IN_LAST_SEEN, {})),
+        "us_last_seen_count": len(load_json(US_LAST_SEEN, {})),
+        "index_entries": len(load_json(IN_SKU_INDEX, {})),
+        "use_product_custom_sku": USE_PRODUCT_CUSTOM_SKU,
+        "only_active_for_mapping": ONLY_ACTIVE_FOR_MAPPING,
+        "mirror_us_increases": MIRROR_US_INCREASES,
+        "clamp_avail_to_zero": CLAMP_AVAIL_TO_ZERO,
+        "round_step_inr": ROUND_STEP_INR, "round_step_usd": ROUND_STEP_USD,
+        "temp_discount_key": f"{MF_NAMESPACE}.{TEMP_DISC_KEY}",
+        "priceinindia_key": f"{MF_NAMESPACE}.{MF_PRICEIN_KEY}",
+        "initialized": load_json(STATE_PATH, {}).get("initialized", False),
+
+        # counters
+        "admin_host": ADMIN_HOST,
+        "inventory_poll_sec": INVENTORY_POLL_SEC,
+        "allowed_pixel_hosts": sorted(list(ALLOWED_PIXEL_HOSTS)),
+        "daily_csv": DAILY_CSV,
+
+        # manufacturing notifier
+        "mfg_notify_enabled": ENABLE_MFG_NOTIFY,
+        "b_endpoint": bool(B_ENDPOINT_URL),
+        "a_to_b_secret": bool(A_TO_B_SHARED_SECRET),
+        "source_site": SOURCE_SITE,
+    }
+    return _cors(jsonify(info)), 200
+# === PIXEL ENDPOINTS =========================================================
+@app.route("/track/product", methods=["POST", "OPTIONS"])
+def pixel_product():
+    if request.method == "OPTIONS":
+        return _cors(make_response())
+
+    # auth via ?key=SECRET (same as your existing pixels)
+    key = (request.args.get("key") or "").strip()
+    if key != PIXEL_SHARED_SECRET:
+        return _cors(make_response(("forbidden", 403)))
+
+    ip = get_client_ip(request)
+    if ip_is_ignored(ip):
+        return _cors(make_response(jsonify({"ok": True, "ignored": True})))
+
+    payload = request.get_json(silent=True) or {}
+    # Expecting: { ts, productId, handle, sessionId, userAgent, shop }
+    pid = str(payload.get("productId") or "").strip()
+    shop = normalize_host(payload.get("shop") or "")
+    handle = (payload.get("handle") or "").strip()
+
+    if not pid:
+        return _cors(make_response(jsonify({"ok": False, "error": "bad-payload"}), 400))
+
+    ts_iso = to_iso8601(payload.get("ts"))
+    with open(EVENTS_CSV, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([ts_iso, shop, pid, handle, payload.get("sessionId") or "", payload.get("userAgent") or ""])
+
+    with lock:
+        view_counts[pid] = int(view_counts.get(pid, 0)) + 1
+        views_today[pid] = int(views_today.get(pid, 0)) + 1
+        dirty_views.add((ADMIN_HOST, pid))
+    return _cors(make_response(jsonify({"ok": True})))
+
+@app.route("/track/atc", methods=["POST", "OPTIONS"])
+def pixel_atc():
+    if request.method == "OPTIONS":
+        return _cors(make_response())
+
+    key = (request.args.get("key") or "").strip()
+    if key != PIXEL_SHARED_SECRET:
+        return _cors(make_response(("forbidden", 403)))
+
+    ip = get_client_ip(request)
+    if ip_is_ignored(ip):
+        return _cors(make_response(jsonify({"ok": True, "ignored": True})))
+
+    payload = request.get_json(silent=True) or {}
+    pid = str(payload.get("productId") or "").strip()
+    qty = int(payload.get("qty") or 1)
+    shop = normalize_host(payload.get("shop") or "")
+    handle = (payload.get("handle") or "").strip()
+    if not pid:
+        return _cors(make_response(jsonify({"ok": False, "error": "bad-payload"}), 400))
+
+    ts_iso = to_iso8601(payload.get("ts"))
+    with open(ATC_CSV, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([ts_iso, shop, pid, qty, handle, payload.get("sessionId") or "", payload.get("userAgent") or "", ip])
+
+    with lock:
+        atc_counts[pid] = int(atc_counts.get(pid, 0)) + qty
+        atc_today[pid]  = int(atc_today.get(pid, 0)) + qty
+        dirty_atc.add((ADMIN_HOST, pid))
+    return _cors(make_response(jsonify({"ok": True})))
+
+@app.route("/pixel/collection", methods=["POST", "OPTIONS"])
+def pixel_collection():
+    if request.method == "OPTIONS":
+        return _cors(make_response())
+
+    # Allow either HMAC header or ?key= (kept simple to match your product/ATC pattern)
+    key = (request.args.get("key") or "").strip()
+    if key != PIXEL_SHARED_SECRET:
+        return _cors(make_response(("forbidden", 403)))
+
+    ip = get_client_ip(request)
+    if ip_is_ignored(ip):
+        return _cors(make_response(jsonify({"ok": True, "ignored": True})))
+
+    try:
+        payload = request.get_json(silent=True) or {}
+    except Exception:
+        payload = {}
+
+    shop_domain = normalize_host(payload.get("shop_domain") or "")
+    handle = (payload.get("collection_handle") or "").strip()
+
+    # optional host allow-list
+    if (not handle) or (shop_domain not in ALLOWED_PIXEL_HOSTS):
+        return _cors(make_response(jsonify({"ok": False, "error":"bad-payload"}), 400))
+
+    # Persist counts to disk JSON (collection → total views) and mark dirty
+    with lock:
+        cur = _load_json(COLLECTION_VIEWS_JSON, {})
+        cur[handle] = int(cur.get(handle, 0)) + 1
+        _save_json(COLLECTION_VIEWS_JSON, cur)
+        dirty_collections.add(handle)
+
+    return _cors(make_response(jsonify({"ok": True})))
+# === END PIXEL ENDPOINTS =====================================================
+
+@app.route("/debug/flush_now", methods=["POST","GET"])
+def debug_flush_now():
+    key = (request.args.get("key") or "").strip()
+    if key != PIXEL_SHARED_SECRET:
+        return "forbidden", 403
+    flush_once()
+    return "flushed", 200
+
+
+@app.route("/rebuild_index", methods=["POST"])
+def rebuild_index():
+    key = (request.args.get("key") or request.form.get("key") or "").strip()
+    if key != PIXEL_SHARED_SECRET:
+        return _cors(make_response(("forbidden", 403)))
+    build_in_sku_index()
+    return _cors(jsonify({"status": "ok", "entries": len(load_json(IN_SKU_INDEX, {}))})), 200
+
+@app.route("/run", methods=["POST"])
+def run_now():
+    key = (request.args.get("key") or request.form.get("key") or "").strip()
+    if key != PIXEL_SHARED_SECRET:
+        return _cors(make_response(("forbidden", 403)))
+    status = run_cycle()
+    return _cors(jsonify({"status": status})), 200 if status == "ok" else 409
+
+# ---- DOB / AGE endpoints ----
+def verify_hmac(req_body: bytes, header_hmac: str) -> bool:
+    try:
+        digest = hmac.new(key=SHOPIFY_WEBHOOK_SECRET.encode("utf-8"), msg=req_body, digestmod="sha256").digest()
+        expected = base64.b64encode(digest).decode("utf-8")
+        return hmac.compare_digest(expected, header_hmac or "")
+    except Exception:
+        return False
+
+@app.route("/webhook/products_create", methods=["POST"])
+def products_create():
+    h = request.headers.get("X-Shopify-Hmac-SHA256", "")
+    raw = request.get_data()
+    if not verify_hmac(raw, h): return "unauthorized", 401
+    shop_host_hdr = request.headers.get("X-Shopify-Shop-Domain", "").strip()
+    shop_host = normalize_host(shop_host_hdr)
+    if shop_host not in ADMIN_TOKENS: return "ok", 200
+    payload = request.get_json(silent=True) or {}
+    pid = str(payload.get("id") or "")
+    created_at = payload.get("created_at")
+    if not pid or not created_at: return "ok", 200
+    try: dob_date = datetime.fromisoformat(created_at.replace("Z","+00:00")).date()
+    except Exception: dob_date = datetime.now(timezone.utc).date()
+    dob_str = dob_date.isoformat()
+    admin_host = list(ADMIN_TOKENS.keys())[0]
+    token = ADMIN_TOKENS[admin_host]
+    ok = metafields_set(admin_host, token, [{"ownerId": f"gid://shopify/Product/{pid}","namespace": MF_NAMESPACE,"key": KEY_DOB,"type": "date","value": dob_str}])
+    if ok:
+        with lock:
+            dob_cache[pid] = dob_str
+            age_days[pid] = 0
+            dirty_age.add((shop_host, pid))
+    return "ok", 200
+
+# ========================= FLUSHER (push counters) =========================
+
+def get_collection_gid_by_handle(handle: str) -> Optional[str]:
+    """Return gid://shopify/Collection/<id> for a given collection handle."""
+    try:
+        admin_host = list(ADMIN_TOKENS.keys())[0]
+        token = ADMIN_TOKENS[admin_host]
+        query = """
+          query($handle:String!){
+            collectionByHandle(handle:$handle){ id }
+          }
+        """
+        r = requests.post(
+            f"https://{admin_host}/admin/api/{API_VERSION}/graphql.json",
+            headers={"Content-Type":"application/json","X-Shopify-Access-Token":token},
+            json={"query": query, "variables": {"handle": handle}},
+            timeout=20
+        )
+        j = r.json()
+        cid = (((j.get("data") or {}).get("collectionByHandle") or {}) or {}).get("id")
+        return cid or None
+    except Exception as e:
+        print(f"[COLL] lookup error for {handle}: {e}")
+        return None
+
+def flusher():
+    ADMIN_HOST_LOCAL = list(ADMIN_TOKENS.keys())[0]
+    TOKEN_LOCAL = ADMIN_TOKENS[ADMIN_HOST_LOCAL]
+    while True:
+        time.sleep(FLUSH_INTERVAL_SEC)
+        with lock:
+            if not (dirty_views or dirty_atc or dirty_sales or dirty_age or dirty_collections):
+                continue
+            to_push = {}
+            for (_shop, pid) in dirty_views: to_push.setdefault(pid, set()).add("views")
+            for (_shop, pid) in dirty_atc:   to_push.setdefault(pid, set()).add("atc")
+            for (_shop, pid) in dirty_sales: to_push.setdefault(pid, set()).add("sales")
+            for (_shop, pid) in dirty_age:   to_push.setdefault(pid, set()).add("age")
+            coll_handles = list(dirty_collections)
+            dirty_views.clear(); dirty_atc.clear(); dirty_sales.clear(); dirty_age.clear(); dirty_collections.clear()
+        mfs = []
+        # products
+        for pid, kinds in to_push.items():
+            if "views" in kinds:
+                mfs.append({"ownerId": f"gid://shopify/Product/{pid}", "namespace": MF_NAMESPACE, "key": KEY_VIEWS, "type": "number_integer", "value": str(int(view_counts.get(pid, 0)))})
+            if "atc" in kinds:
+                mfs.append({"ownerId": f"gid://shopify/Product/{pid}", "namespace": MF_NAMESPACE, "key": KEY_ATC, "type": "number_integer", "value": str(int(atc_counts.get(pid, 0)))})
+            if "sales" in kinds:
+                mfs.append({"ownerId": f"gid://shopify/Product/{pid}", "namespace": MF_NAMESPACE, "key": KEY_SALES, "type": "number_integer", "value": str(int(sales_counts.get(pid, 0)))})
+                dates = sorted(list(sale_dates.get(pid, set())))
+                mfs.append({"ownerId": f"gid://shopify/Product/{pid}", "namespace": MF_NAMESPACE, "key": KEY_DATES, "type": "list.date", "value": json.dumps(dates)})
+            if "age" in kinds:
+                mfs.append({"ownerId": f"gid://shopify/Product/{pid}", "namespace": MF_NAMESPACE, "key": KEY_AGE, "type": "number_integer", "value": str(int(age_days.get(pid, 0)))})
+        # collections
+        if coll_handles:
+            coll_counts = _load_json(COLLECTION_VIEWS_JSON, {})
+            for h in coll_handles:
+                gid = get_collection_gid_by_handle(h)
+                if not gid:
+                    print(f"[PUSH][COLL] skip (no gid) handle={h}")
+                    continue
+                count = int(coll_counts.get(h, 0))
+                mfs.append({
+                    "ownerId": gid,
+                    "namespace": MF_NAMESPACE,
+                    "key": KEY_COLLECTION_VIEWS,
+                    "type": "number_integer",
+                    "value": str(count)
+                })
+        CHUNK = 25
+        items = list(mfs)
+        if items and not QUIET_PUSH:
+            try:
+                print(f"[PUSH] preview ownerId/key/type -> {items[0].get('ownerId')}, {items[0].get('key')}, {items[0].get('type')}")
+            except Exception:
+                pass
+        for i in range(0, len(items), CHUNK):
+            chunk = items[i:i+CHUNK]
+            ok = metafields_set(ADMIN_HOST_LOCAL, TOKEN_LOCAL, chunk)
+            if not QUIET_PUSH:
+                print(f"[PUSH] {ADMIN_HOST_LOCAL}: {len(chunk)} -> {'OK' if ok else 'ERR'}")
+            time.sleep(0.3)
+        _persist_all()
+        
+def flush_once():
+    ADMIN_HOST_LOCAL = list(ADMIN_TOKENS.keys())[0]
+    TOKEN_LOCAL = ADMIN_TOKENS[ADMIN_HOST_LOCAL]
+    with lock:
+        if not (dirty_views or dirty_atc or dirty_sales or dirty_age or dirty_collections):
+            print("[PUSH] nothing to flush", flush=True)
+            return
+        to_push = {}
+        for (_shop, pid) in dirty_views: to_push.setdefault(pid, set()).add("views")
+        for (_shop, pid) in dirty_atc:   to_push.setdefault(pid, set()).add("atc")
+        for (_shop, pid) in dirty_sales: to_push.setdefault(pid, set()).add("sales")
+        for (_shop, pid) in dirty_age:   to_push.setdefault(pid, set()).add("age")
+        coll_handles = list(dirty_collections)
+        dirty_views.clear(); dirty_atc.clear(); dirty_sales.clear(); dirty_age.clear(); dirty_collections.clear()
+
+    mfs = []
+    # products
+    for pid, kinds in to_push.items():
+        if "views" in kinds:
+            mfs.append({"ownerId": f"gid://shopify/Product/{pid}", "namespace": MF_NAMESPACE, "key": KEY_VIEWS, "type": "number_integer", "value": str(int(view_counts.get(pid, 0)))})
+        if "atc" in kinds:
+            mfs.append({"ownerId": f"gid://shopify/Product/{pid}", "namespace": MF_NAMESPACE, "key": KEY_ATC, "type": "number_integer", "value": str(int(atc_counts.get(pid, 0)))})
+        if "sales" in kinds:
+            mfs.append({"ownerId": f"gid://shopify/Product/{pid}", "namespace": MF_NAMESPACE, "key": KEY_SALES, "type": "number_integer", "value": str(int(sales_counts.get(pid, 0)))})
+            dates = sorted(list(sale_dates.get(pid, set())))
+            mfs.append({"ownerId": f"gid://shopify/Product/{pid}", "namespace": MF_NAMESPACE, "key": KEY_DATES, "type": "list.date", "value": json.dumps(dates)})
+        if "age" in kinds:
+            mfs.append({"ownerId": f"gid://shopify/Product/{pid}", "namespace": MF_NAMESPACE, "key": KEY_AGE, "type": "number_integer", "value": str(int(age_days.get(pid, 0)))})
+    # collections
+    if coll_handles:
+        coll_counts = _load_json(COLLECTION_VIEWS_JSON, {})
+        for h in coll_handles:
+            gid = get_collection_gid_by_handle(h)
+            if not gid:
+                print(f"[PUSH][COLL] skip (no gid) handle={h}", flush=True)
+                continue
+            count = int(coll_counts.get(h, 0))
+            mfs.append({
+                "ownerId": gid,
+                "namespace": MF_NAMESPACE,
+                "key": KEY_COLLECTION_VIEWS,
+                "type": "number_integer",
+                "value": str(count)
+            })
+    CHUNK = 25
+    items = list(mfs)
+    if items and not QUIET_PUSH:
+        print(f"[PUSH] preview ownerId/key/type -> {items[0].get('ownerId')}, {items[0].get('key')}, {items[0].get('type')}", flush=True)
+    for i in range(0, len(items), CHUNK):
+        chunk = items[i:i+CHUNK]
+        ok = metafields_set(ADMIN_HOST_LOCAL, TOKEN_LOCAL, chunk)
+        if not QUIET_PUSH:
+            print(f"[PUSH] {ADMIN_HOST_LOCAL}: {len(chunk)} -> {'OK' if ok else 'ERR'}", flush=True)
+        time.sleep(0.3)
+    _persist_all()
+
+# ========================= SCHEDULER / RUNNER =========================
+
+from threading import Thread, Lock
+run_lock = Lock()
+is_running = False
+
+def load_state():
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {"initialized": False}
+
+def save_state(obj):
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
+    os.replace(tmp, STATE_PATH)
+
+def run_cycle():
+    global is_running
+    with run_lock:
+        if is_running:
+            return "busy"
+        is_running = True
+    try:
+        state = load_state()
+        in_seen = load_json(IN_LAST_SEEN, {})
+        us_seen = load_json(US_LAST_SEEN, {})
+        first_cycle = (not state.get("initialized", False)) and (len(in_seen) == 0 and len(us_seen) == 0)
+
+        # Always (re)build index before scans
+        try: build_in_sku_index()
+        except Exception as e: log_row("⚠️", "SCHED", "WARN", message=str(e))
+
+        # India scan
+        scan_india_and_update(read_only=first_cycle)
+        sleep_ms(SLEEP_BETWEEN_SHOPS_MS)
+
+        # USA scan
+        if US_DOMAIN and US_TOKEN and US_COLLECTIONS:
+            scan_usa_and_mirror_to_india(read_only=first_cycle)
+
+        if first_cycle:
+            state["initialized"] = True
+            save_state(state)
+            log_row("🟢", "SCHED", "FIRST_CYCLE_DONE", message="Baselines learned; future cycles will apply deltas")
+        return "ok"
+    finally:
+        with run_lock:
+            is_running = False
+
+def scheduler_loop():
+    if RUN_EVERY_MIN <= 0:
+        return
+    while True:
+        try:
+            run_cycle()
+        except Exception as e:
+            log_row("⚠️", "SCHED", "WARN", message=str(e))
+        time.sleep(max(1, RUN_EVERY_MIN) * 60)
+
+# ========================= BOOTSTRAP =========================
+
+# Create pixel CSVs with headers if missing
+if not os.path.exists(EVENTS_CSV):
+    with open(EVENTS_CSV, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(["ts_iso","shop","productId","handle","sessionId","userAgent"])
+if not os.path.exists(ATC_CSV):
+    with open(ATC_CSV, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(["ts_iso","shop","productId","qty","handle","sessionId","userAgent","ip"])
+
+# Load counters lifetime state
+_view_disk = _load_json(VIEWS_JSON, {})
+for k, v in _view_disk.items(): view_counts[str(k)] = int(v)
+_atc_disk = _load_json(ATC_JSON, {})
+for k, v in _atc_disk.items(): atc_counts[str(k)] = int(v)
+_sales_disk = _load_json(SALES_JSON, {})
+for k, v in _sales_disk.items(): sales_counts[str(k)] = int(v)
+_dates_disk = _load_json(SALE_DATES_JSON, {})
+for k, lst in _dates_disk.items(): sale_dates[str(k)] = set(lst)
+_age_disk = _load_json(AGE_JSON, {})
+for k, v in _age_disk.items(): age_days[str(k)] = int(v)
+dob_cache.update(_load_json(DOB_CACHE_JSON, {}))
+processed_orders = set(_load_json(PROCESSED_ORDERS, []))
+last_avail.update(_load_json(AVAIL_BASELINE_JSON, {}))
+
+# Load per-day state (IST) & rollover if missed
+_load_today_state()
+try: _rollover_if_needed()
+except Exception as e: print("[BOOT] rollover check error:", e)
+
+# Start background workers
+Thread(target=flusher, daemon=True).start()
+Thread(target=daily_csv_worker, daemon=True).start()
+Thread(target=availability_poller, daemon=True).start()
+if ENABLE_SCHEDULER:
+    Thread(target=scheduler_loop, daemon=True).start()
+
+if __name__ == "__main__":
+    print(f"[BOOT] Unified app on port {PORT} | API {API_VERSION}")
+    print(f"[CFG] IN={IN_DOMAIN} (loc {IN_LOCATION_ID}) | US={US_DOMAIN} (loc {US_LOCATION_ID}) | ADMIN_HOST={ADMIN_HOST} | DATA_DIR={DATA_DIR}")
+    from werkzeug.serving import run_simple
+    run_simple("0.0.0.0", PORT, app)
