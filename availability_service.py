@@ -20,13 +20,10 @@ What this script does
    - (US→IN) Mirrors US decreases to IN stock (by SKU index) and syncs price-in-India metafield.
 
 2) Counters and Pixels:
-
-
-
-
    - Lightweight endpoints to record views/add-to-cart events and push rolling totals to metafields.
    - Maintains a daily CSV snapshot in IST.
    - Optional inventory polling to infer sales by availability drops.
+   - (NEW) Collection views: tracks collection page views and pushes to collection metafield `custom.collection_views_total`.
 
 3) Ops & Admin:
    - Health/diag endpoints, state persistence, index building, scheduler loop.
@@ -36,10 +33,12 @@ New in this version
 -------------------
 - Manual manufacturing gate: sets metafield `custom.start_manufacturing = "Start Manufacturing"`
   on any availability DROP in IN. Optional auto-clear on availability INCREASE.
+- (NEW) Collection view counter push to `custom.collection_views_total` metafield.
 - Config via:
     MF_START_MFG_KEY (default "start_manufacturing")
     START_MFG_VALUE  (default "Start Manufacturing")
     AUTO_CLEAR_START_MFG_ON_INCREASE (default "0" -> disabled)
+    KEY_COLLECTION_VIEWS (default "collection_views_total")
 """
 
 import os
@@ -104,8 +103,7 @@ KEY_VIEWS = os.getenv("KEY_VIEWS", "views_total").strip()
 KEY_ATC = os.getenv("KEY_ATC", "added_to_cart_total").strip()
 KEY_AGE = os.getenv("KEY_AGE", "age_in_days").strip()
 KEY_DOB = os.getenv("KEY_DOB", "dob").strip()
-
-# --- NEW: Collection views metafield key ---
+# NEW: Collection views metafield key on Collection owner
 KEY_COLLECTION_VIEWS = os.getenv("KEY_COLLECTION_VIEWS", "collection_views_total").strip()
 
 # --- Manufacturing trigger metafield (manual gate) ---
@@ -181,14 +179,14 @@ SALES_JSON = p("sales_counts.json")
 SALE_DATES_JSON = p("sale_dates.json")
 AGE_JSON   = p("age_days.json")
 DOB_CACHE_JSON = p("dob_cache.json")
-PROCESSED_ORDERS = p("processed_orders.json")  # retained placeholder
+PROCESSED_ORDERS = p("processed_orders.json")
 AVAIL_BASELINE_JSON = p("availability_baseline.json")
 
 DAILY_CSV = p("daily_metrics.csv")
 TODAY_STATE_JSON = p("today_state.json")
 DAILY_CSV_HEADER = ["date_ist","product_id","views_today","atc_today","sales_today","age_in_days_today"]
 
-# NEW: collection view counts persistence
+# NEW: collection views persistence
 COLLECTION_VIEWS_JSON = p("collection_view_counts.json")
 
 # =============================== HELPERS ===============================
@@ -793,7 +791,6 @@ def send_to_manufacturing(*, sku: str, delta: int, before: int, after: int,
         "Content-Type": "application/json",
         "X-A-Signature": sig,
         "X-Idempotency-Key": idem,
-        # calm some proxies/load balancers
         "Accept-Encoding": "identity",
         "Connection": "close",
     }
@@ -802,22 +799,17 @@ def send_to_manufacturing(*, sku: str, delta: int, before: int, after: int,
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             r = requests.post(B_ENDPOINT_URL, data=raw, headers=headers, timeout=TIMEOUT_S)
-            # Treat explicit ack from App B as success even if status is 5xx (edge glitch)
             if r.status_code < 400 or r.headers.get("X-AppB-Ack"):
                 print(f"[MFG] POST {B_ENDPOINT_URL} -> {r.status_code} {r.text[:200]}", flush=True)
                 return
-            # Retry only if status is in our retryable set; else stop
             if r.status_code not in RETRYABLE_STATUS:
                 print(f"[MFG] POST {B_ENDPOINT_URL} -> {r.status_code} {r.text[:200]}", flush=True)
                 return
         except requests.RequestException as e:
             last_err = e
-
-        # jittered exponential backoff
         sleep_s = min(CAP, BASE * (2 ** (attempt - 1))) + random.uniform(0.2, 0.8)
         time.sleep(sleep_s)
 
-    # Exhausted
     if last_err:
         print(f"[MFG] error (final): {last_err}", flush=True)
     else:
@@ -1024,8 +1016,10 @@ dirty_atc:   Set[Tuple[str, str]] = set()
 dirty_sales: Set[Tuple[str, str]] = set()
 dirty_age:   Set[Tuple[str, str]] = set()
 
-# NEW: track which collection handles changed
+# NEW: collection counters (in-memory) and dirty set
+coll_view_counts: Dict[str, int] = {}   # handle -> total views
 dirty_collections: Set[str] = set()
+coll_handle_gid_cache: Dict[str, str] = {}
 
 # Per-day state (IST)
 _today_ist_date_str: Optional[str] = None
@@ -1058,6 +1052,7 @@ def _persist_all():
         _save_json(DOB_CACHE_JSON, dob_cache)
         _save_json(PROCESSED_ORDERS, sorted(list(processed_orders)))
         _save_json(AVAIL_BASELINE_JSON, {k:int(v) for k,v in last_avail.items()})
+        _save_json(COLLECTION_VIEWS_JSON, {k:int(v) for k,v in coll_view_counts.items()})
 
 def _ist_today_date_str():
     return today_ist_str()
@@ -1121,7 +1116,6 @@ def daily_csv_worker():
         print("[DAILY CSV] initial rollover error:", e)
     while True:
         try:
-            # sleep until next midnight IST
             now = now_ist()
             next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
             time.sleep(max(1, int((next_midnight - now).total_seconds())))
@@ -1272,6 +1266,31 @@ def _list_all_product_nodes():
         if not after: break
     return nodes
 
+# ========================= COLLECTION HELPERS =========================
+
+def get_collection_gid_by_handle(handle: str) -> Optional[str]:
+    """Resolve a collection handle to its GID and cache it."""
+    if not handle:
+        return None
+    if handle in coll_handle_gid_cache:
+        return coll_handle_gid_cache[handle]
+    admin_host = list(ADMIN_TOKENS.keys())[0]
+    token = ADMIN_TOKENS[admin_host]
+    q = """
+      query($h:String!) {
+        collectionByHandle(handle:$h) { id }
+      }
+    """
+    try:
+        data = gql(admin_host, token, q, {"h": handle})
+        gid = (((data or {}).get("collectionByHandle") or {}) or {}).get("id") or None
+        if gid:
+            coll_handle_gid_cache[handle] = gid
+        return gid
+    except Exception as e:
+        print(f"[COLL] resolve handle error ({handle}): {e}")
+        return None
+
 # ========================= AVAILABILITY POLLER (COUNTERS) =========================
 
 def _compute_availability_from_variants(variants: list) -> int:
@@ -1416,6 +1435,9 @@ def diag():
         "allowed_pixel_hosts": sorted(list(ALLOWED_PIXEL_HOSTS)),
         "daily_csv": DAILY_CSV,
 
+        # NEW: collection views key
+        "collection_views_key": f"{MF_NAMESPACE}.{KEY_COLLECTION_VIEWS}",
+
         # manufacturing notifier
         "mfg_notify_enabled": ENABLE_MFG_NOTIFY,
         "b_endpoint": bool(B_ENDPOINT_URL),
@@ -1423,13 +1445,13 @@ def diag():
         "source_site": SOURCE_SITE,
     }
     return _cors(jsonify(info)), 200
+
 # === PIXEL ENDPOINTS =========================================================
 @app.route("/track/product", methods=["POST", "OPTIONS"])
 def pixel_product():
     if request.method == "OPTIONS":
         return _cors(make_response())
 
-    # auth via ?key=SECRET (same as your existing pixels)
     key = (request.args.get("key") or "").strip()
     if key != PIXEL_SHARED_SECRET:
         return _cors(make_response(("forbidden", 403)))
@@ -1439,7 +1461,6 @@ def pixel_product():
         return _cors(make_response(jsonify({"ok": True, "ignored": True})))
 
     payload = request.get_json(silent=True) or {}
-    # Expecting: { ts, productId, handle, sessionId, userAgent, shop }
     pid = str(payload.get("productId") or "").strip()
     shop = normalize_host(payload.get("shop") or "")
     handle = (payload.get("handle") or "").strip()
@@ -1493,7 +1514,7 @@ def pixel_collection():
     if request.method == "OPTIONS":
         return _cors(make_response())
 
-    # Allow either HMAC header or ?key= (kept simple to match your product/ATC pattern)
+    # Same auth as products/ATC
     key = (request.args.get("key") or "").strip()
     if key != PIXEL_SHARED_SECRET:
         return _cors(make_response(("forbidden", 403)))
@@ -1502,24 +1523,19 @@ def pixel_collection():
     if ip_is_ignored(ip):
         return _cors(make_response(jsonify({"ok": True, "ignored": True})))
 
-    try:
-        payload = request.get_json(silent=True) or {}
-    except Exception:
-        payload = {}
-
+    payload = request.get_json(silent=True) or {}
     shop_domain = normalize_host(payload.get("shop_domain") or "")
     handle = (payload.get("collection_handle") or "").strip()
 
-    # optional host allow-list
+    # allow-list and payload checks
     if (not handle) or (shop_domain not in ALLOWED_PIXEL_HOSTS):
         return _cors(make_response(jsonify({"ok": False, "error":"bad-payload"}), 400))
 
-    # Persist counts to disk JSON (collection → total views) and mark dirty
+    # bump in-memory + mark dirty + persist
     with lock:
-        cur = _load_json(COLLECTION_VIEWS_JSON, {})
-        cur[handle] = int(cur.get(handle, 0)) + 1
-        _save_json(COLLECTION_VIEWS_JSON, cur)
+        coll_view_counts[handle] = int(coll_view_counts.get(handle, 0)) + 1
         dirty_collections.add(handle)
+        _save_json(COLLECTION_VIEWS_JSON, {k:int(v) for k,v in coll_view_counts.items()})
 
     return _cors(make_response(jsonify({"ok": True})))
 # === END PIXEL ENDPOINTS =====================================================
@@ -1585,29 +1601,6 @@ def products_create():
 
 # ========================= FLUSHER (push counters) =========================
 
-def get_collection_gid_by_handle(handle: str) -> Optional[str]:
-    """Return gid://shopify/Collection/<id> for a given collection handle."""
-    try:
-        admin_host = list(ADMIN_TOKENS.keys())[0]
-        token = ADMIN_TOKENS[admin_host]
-        query = """
-          query($handle:String!){
-            collectionByHandle(handle:$handle){ id }
-          }
-        """
-        r = requests.post(
-            f"https://{admin_host}/admin/api/{API_VERSION}/graphql.json",
-            headers={"Content-Type":"application/json","X-Shopify-Access-Token":token},
-            json={"query": query, "variables": {"handle": handle}},
-            timeout=20
-        )
-        j = r.json()
-        cid = (((j.get("data") or {}).get("collectionByHandle") or {}) or {}).get("id")
-        return cid or None
-    except Exception as e:
-        print(f"[COLL] lookup error for {handle}: {e}")
-        return None
-
 def flusher():
     ADMIN_HOST_LOCAL = list(ADMIN_TOKENS.keys())[0]
     TOKEN_LOCAL = ADMIN_TOKENS[ADMIN_HOST_LOCAL]
@@ -1621,10 +1614,8 @@ def flusher():
             for (_shop, pid) in dirty_atc:   to_push.setdefault(pid, set()).add("atc")
             for (_shop, pid) in dirty_sales: to_push.setdefault(pid, set()).add("sales")
             for (_shop, pid) in dirty_age:   to_push.setdefault(pid, set()).add("age")
-            coll_handles = list(dirty_collections)
-            dirty_views.clear(); dirty_atc.clear(); dirty_sales.clear(); dirty_age.clear(); dirty_collections.clear()
+            dirty_views.clear(); dirty_atc.clear(); dirty_sales.clear(); dirty_age.clear()
         mfs = []
-        # products
         for pid, kinds in to_push.items():
             if "views" in kinds:
                 mfs.append({"ownerId": f"gid://shopify/Product/{pid}", "namespace": MF_NAMESPACE, "key": KEY_VIEWS, "type": "number_integer", "value": str(int(view_counts.get(pid, 0)))})
@@ -1636,22 +1627,6 @@ def flusher():
                 mfs.append({"ownerId": f"gid://shopify/Product/{pid}", "namespace": MF_NAMESPACE, "key": KEY_DATES, "type": "list.date", "value": json.dumps(dates)})
             if "age" in kinds:
                 mfs.append({"ownerId": f"gid://shopify/Product/{pid}", "namespace": MF_NAMESPACE, "key": KEY_AGE, "type": "number_integer", "value": str(int(age_days.get(pid, 0)))})
-        # collections
-        if coll_handles:
-            coll_counts = _load_json(COLLECTION_VIEWS_JSON, {})
-            for h in coll_handles:
-                gid = get_collection_gid_by_handle(h)
-                if not gid:
-                    print(f"[PUSH][COLL] skip (no gid) handle={h}")
-                    continue
-                count = int(coll_counts.get(h, 0))
-                mfs.append({
-                    "ownerId": gid,
-                    "namespace": MF_NAMESPACE,
-                    "key": KEY_COLLECTION_VIEWS,
-                    "type": "number_integer",
-                    "value": str(count)
-                })
         CHUNK = 25
         items = list(mfs)
         if items and not QUIET_PUSH:
@@ -1666,7 +1641,37 @@ def flusher():
                 print(f"[PUSH] {ADMIN_HOST_LOCAL}: {len(chunk)} -> {'OK' if ok else 'ERR'}")
             time.sleep(0.3)
         _persist_all()
-        
+
+        # --- NEW: push collection view counters ---
+        with lock:
+            dirty_handles = list(dirty_collections)
+            dirty_collections.clear()
+
+        if dirty_handles:
+            coll_mfs = []
+            for handle in dirty_handles:
+                gid = get_collection_gid_by_handle(handle)
+                if not gid:
+                    # keep dirty; we'll retry next flush
+                    with lock:
+                        dirty_collections.add(handle)
+                    continue
+                val = int(coll_view_counts.get(handle, 0))
+                coll_mfs.append({
+                    "ownerId": gid,
+                    "namespace": MF_NAMESPACE,
+                    "key": KEY_COLLECTION_VIEWS,
+                    "type": "number_integer",
+                    "value": str(val),
+                })
+
+            for i in range(0, len(coll_mfs), CHUNK):
+                chunk = coll_mfs[i:i+CHUNK]
+                ok = metafields_set(ADMIN_HOST_LOCAL, TOKEN_LOCAL, chunk)
+                if not QUIET_PUSH:
+                    print(f"[PUSH][COLL] {ADMIN_HOST_LOCAL}: {len(chunk)} -> {'OK' if ok else 'ERR'}")
+                time.sleep(0.3)
+
 def flush_once():
     ADMIN_HOST_LOCAL = list(ADMIN_TOKENS.keys())[0]
     TOKEN_LOCAL = ADMIN_TOKENS[ADMIN_HOST_LOCAL]
@@ -1679,11 +1684,9 @@ def flush_once():
         for (_shop, pid) in dirty_atc:   to_push.setdefault(pid, set()).add("atc")
         for (_shop, pid) in dirty_sales: to_push.setdefault(pid, set()).add("sales")
         for (_shop, pid) in dirty_age:   to_push.setdefault(pid, set()).add("age")
-        coll_handles = list(dirty_collections)
-        dirty_views.clear(); dirty_atc.clear(); dirty_sales.clear(); dirty_age.clear(); dirty_collections.clear()
+        dirty_views.clear(); dirty_atc.clear(); dirty_sales.clear(); dirty_age.clear()
 
     mfs = []
-    # products
     for pid, kinds in to_push.items():
         if "views" in kinds:
             mfs.append({"ownerId": f"gid://shopify/Product/{pid}", "namespace": MF_NAMESPACE, "key": KEY_VIEWS, "type": "number_integer", "value": str(int(view_counts.get(pid, 0)))})
@@ -1695,22 +1698,6 @@ def flush_once():
             mfs.append({"ownerId": f"gid://shopify/Product/{pid}", "namespace": MF_NAMESPACE, "key": KEY_DATES, "type": "list.date", "value": json.dumps(dates)})
         if "age" in kinds:
             mfs.append({"ownerId": f"gid://shopify/Product/{pid}", "namespace": MF_NAMESPACE, "key": KEY_AGE, "type": "number_integer", "value": str(int(age_days.get(pid, 0)))})
-    # collections
-    if coll_handles:
-        coll_counts = _load_json(COLLECTION_VIEWS_JSON, {})
-        for h in coll_handles:
-            gid = get_collection_gid_by_handle(h)
-            if not gid:
-                print(f"[PUSH][COLL] skip (no gid) handle={h}", flush=True)
-                continue
-            count = int(coll_counts.get(h, 0))
-            mfs.append({
-                "ownerId": gid,
-                "namespace": MF_NAMESPACE,
-                "key": KEY_COLLECTION_VIEWS,
-                "type": "number_integer",
-                "value": str(count)
-            })
     CHUNK = 25
     items = list(mfs)
     if items and not QUIET_PUSH:
@@ -1722,6 +1709,34 @@ def flush_once():
             print(f"[PUSH] {ADMIN_HOST_LOCAL}: {len(chunk)} -> {'OK' if ok else 'ERR'}", flush=True)
         time.sleep(0.3)
     _persist_all()
+
+    # --- NEW: push collection view counters on manual flush ---
+    with lock:
+        dirty_handles = list(dirty_collections)
+        dirty_collections.clear()
+
+    if dirty_handles:
+        coll_mfs = []
+        for handle in dirty_handles:
+            gid = get_collection_gid_by_handle(handle)
+            if not gid:
+                with lock:
+                    dirty_collections.add(handle)
+                continue
+            val = int(coll_view_counts.get(handle, 0))
+            coll_mfs.append({
+                "ownerId": gid,
+                "namespace": MF_NAMESPACE,
+                "key": KEY_COLLECTION_VIEWS,
+                "type": "number_integer",
+                "value": str(val),
+            })
+        for i in range(0, len(coll_mfs), CHUNK):
+            chunk = coll_mfs[i:i+CHUNK]
+            ok = metafields_set(ADMIN_HOST_LOCAL, TOKEN_LOCAL, chunk)
+            if not QUIET_PUSH:
+                print(f"[PUSH][COLL] {ADMIN_HOST_LOCAL}: {len(chunk)} -> {'OK' if ok else 'ERR'}", flush=True)
+            time.sleep(0.3)
 
 # ========================= SCHEDULER / RUNNER =========================
 
@@ -1809,6 +1824,11 @@ for k, v in _age_disk.items(): age_days[str(k)] = int(v)
 dob_cache.update(_load_json(DOB_CACHE_JSON, {}))
 processed_orders = set(_load_json(PROCESSED_ORDERS, []))
 last_avail.update(_load_json(AVAIL_BASELINE_JSON, {}))
+
+# Load collection views (NEW)
+_coll_disk = _load_json(COLLECTION_VIEWS_JSON, {})
+if isinstance(_coll_disk, dict):
+    coll_view_counts.update({str(k): int(v) for k, v in _coll_disk.items()})
 
 # Load per-day state (IST) & rollover if missed
 _load_today_state()
