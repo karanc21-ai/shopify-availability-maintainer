@@ -1414,6 +1414,106 @@ def diag():
         "source_site": SOURCE_SITE,
     }
     return _cors(jsonify(info)), 200
+# === PIXEL ENDPOINTS =========================================================
+@app.route("/track/product", methods=["POST", "OPTIONS"])
+def pixel_product():
+    if request.method == "OPTIONS":
+        return _cors(make_response())
+
+    # auth via ?key=SECRET (same as your existing pixels)
+    key = (request.args.get("key") or "").strip()
+    if key != PIXEL_SHARED_SECRET:
+        return _cors(make_response(("forbidden", 403)))
+
+    ip = get_client_ip(request)
+    if ip_is_ignored(ip):
+        return _cors(make_response(jsonify({"ok": True, "ignored": True})))
+
+    payload = request.get_json(silent=True) or {}
+    # Expecting: { ts, productId, handle, sessionId, userAgent, shop }
+    pid = str(payload.get("productId") or "").strip()
+    shop = normalize_host(payload.get("shop") or "")
+    handle = (payload.get("handle") or "").strip()
+
+    if not pid:
+        return _cors(make_response(jsonify({"ok": False, "error": "bad-payload"}), 400))
+
+    ts_iso = to_iso8601(payload.get("ts"))
+    with open(EVENTS_CSV, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([ts_iso, shop, pid, handle, payload.get("sessionId") or "", payload.get("userAgent") or ""])
+
+    with lock:
+        view_counts[pid] = int(view_counts.get(pid, 0)) + 1
+        views_today[pid] = int(views_today.get(pid, 0)) + 1
+        dirty_views.add((ADMIN_HOST, pid))
+    return _cors(make_response(jsonify({"ok": True})))
+
+@app.route("/track/atc", methods=["POST", "OPTIONS"])
+def pixel_atc():
+    if request.method == "OPTIONS":
+        return _cors(make_response())
+
+    key = (request.args.get("key") or "").strip()
+    if key != PIXEL_SHARED_SECRET:
+        return _cors(make_response(("forbidden", 403)))
+
+    ip = get_client_ip(request)
+    if ip_is_ignored(ip):
+        return _cors(make_response(jsonify({"ok": True, "ignored": True})))
+
+    payload = request.get_json(silent=True) or {}
+    pid = str(payload.get("productId") or "").strip()
+    qty = int(payload.get("qty") or 1)
+    shop = normalize_host(payload.get("shop") or "")
+    handle = (payload.get("handle") or "").strip()
+    if not pid:
+        return _cors(make_response(jsonify({"ok": False, "error": "bad-payload"}), 400))
+
+    ts_iso = to_iso8601(payload.get("ts"))
+    with open(ATC_CSV, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([ts_iso, shop, pid, qty, handle, payload.get("sessionId") or "", payload.get("userAgent") or "", ip])
+
+    with lock:
+        atc_counts[pid] = int(atc_counts.get(pid, 0)) + qty
+        atc_today[pid]  = int(atc_today.get(pid, 0)) + qty
+        dirty_atc.add((ADMIN_HOST, pid))
+    return _cors(make_response(jsonify({"ok": True})))
+
+@app.route("/pixel/collection", methods=["POST", "OPTIONS"])
+def pixel_collection():
+    if request.method == "OPTIONS":
+        return _cors(make_response())
+
+    # Allow either HMAC header or ?key= (kept simple to match your product/ATC pattern)
+    key = (request.args.get("key") or "").strip()
+    if key != PIXEL_SHARED_SECRET:
+        return _cors(make_response(("forbidden", 403)))
+
+    ip = get_client_ip(request)
+    if ip_is_ignored(ip):
+        return _cors(make_response(jsonify({"ok": True, "ignored": True})))
+
+    try:
+        payload = request.get_json(silent=True) or {}
+    except Exception:
+        payload = {}
+
+    shop_domain = normalize_host(payload.get("shop_domain") or "")
+    handle = (payload.get("collection_handle") or "").strip()
+
+    # optional host allow-list
+    if (not handle) or (shop_domain not in ALLOWED_PIXEL_HOSTS):
+        return _cors(make_response(jsonify({"ok": False, "error":"bad-payload"}), 400))
+
+    # Persist counts to disk JSON (collection → total views)
+    COLLV = p("collection_view_counts.json")
+    with lock:
+        cur = _load_json(COLLV, {})
+        cur[handle] = int(cur.get(handle, 0)) + 1
+        _save_json(COLLV, cur)
+
+    return _cors(make_response(jsonify({"ok": True})))
+# === END PIXEL ENDPOINTS =====================================================
 
 @app.route("/debug/flush_now", methods=["POST","GET"])
 def debug_flush_now():
