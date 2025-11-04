@@ -39,6 +39,10 @@ New in this version
     START_MFG_VALUE  (default "Start Manufacturing")
     AUTO_CLEAR_START_MFG_ON_INCREASE (default "0" -> disabled)
     KEY_COLLECTION_VIEWS (default "collection_views_total")
+
+- (NEW) Mirror IN → US delivery text:
+    Mirrors IN `custom.delivery_time` into US `custom.status_in_india`.
+    Toggle via ENABLE_MIRROR_STATUS_IN_INDIA (default ON).
 """
 
 import os
@@ -158,6 +162,10 @@ B_ENDPOINT_URL = os.getenv("B_ENDPOINT_URL", "").strip()  # e.g. https://manufac
 A_TO_B_SHARED_SECRET = os.getenv("A_TO_B_SHARED_SECRET", "").strip()
 SOURCE_SITE = os.getenv("SOURCE_SITE", "IN").strip()
 
+# ---- NEW: IN → US delivery mirror ----
+MF_STATUS_IN_INDIA_KEY = os.getenv("MF_STATUS_IN_INDIA_KEY", "status_in_india").strip()
+ENABLE_MIRROR_STATUS_IN_INDIA = os.getenv("ENABLE_MIRROR_STATUS_IN_INDIA", "1") == "1"
+
 # ---- Server & persistence ----
 DATA_DIR = os.getenv("DATA_DIR", ".").rstrip("/")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -227,6 +235,7 @@ def gql(domain: str, token: str, query: str, variables: dict = None) -> dict:
             last_err = e
             time.sleep(_backoff_delay(attempt, base=0.4))
     raise RuntimeError(str(last_err) if last_err else "GraphQL throttled/5xx repeatedly")
+
 def get_rts_stamp_time(product_gid: str) -> Optional[datetime]:
     """
     Reads custom.was_ready_at and returns it as a timezone-aware datetime.
@@ -341,7 +350,7 @@ def ensure_log_header():
     if need:
         with open(LOG_CSV, "w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(["ts", "phase", "shop", "note", "product_id", "variant_id", "sku", "delta", "message"])
-           
+
 def update_us_prices_for_product(us_product_node: dict, in_rupees: float = None):
     """
     Reads priceinindia (or uses `in_rupees` if provided), applies FX/markup/addend,
@@ -502,6 +511,7 @@ query ($handle:String!, $cursor:String) {{
 }}
 """
 
+# >>> NEW FIELD added: statusInIndia
 QUERY_COLLECTION_PAGE_US = f"""
 query ($handle:String!, $cursor:String) {{
   collectionByHandle(handle:$handle){{
@@ -513,6 +523,7 @@ query ($handle:String!, $cursor:String) {{
         metafield(namespace:"{MF_NAMESPACE}", key:"sku"){{ value }}
         tdisc: metafield(namespace:"{MF_NAMESPACE}", key:"{TEMP_DISC_KEY}"){{ id value type }}
         pricein: metafield(namespace:"{MF_NAMESPACE}", key:"{MF_PRICEIN_KEY}"){{ id value type }}
+        statusInIndia: metafield(namespace:"{MF_NAMESPACE}", key:"{MF_STATUS_IN_INDIA_KEY}"){{ id value type }}
         variants(first: 100){{
           nodes{{
             id
@@ -544,6 +555,23 @@ def get_mf_def_type(domain: str, token: str, owner_type: str, namespace: str, ke
     tname = ((((edges[0] if edges else {}).get("node") or {}).get("type") or {}).get("name")) or ""
     _MF_DEF_CACHE[ck] = tname or "single_line_text_field"
     return _MF_DEF_CACHE[ck]
+
+# --- NEW: helper to read IN delivery_time value for a product
+def get_in_delivery_time(product_gid: str) -> Optional[str]:
+    """
+    Returns IN product metafield custom.delivery_time string or None.
+    """
+    try:
+        q = """
+        query($id:ID!, $ns:String!, $key:String!){
+          product(id:$id){
+            dtime: metafield(namespace:$ns, key:$key){ value }
+          }
+        }"""
+        data = gql(IN_DOMAIN, IN_TOKEN, q, {"id": product_gid, "ns": MF_NAMESPACE, "key": MF_DELIVERY_KEY})
+        return ((((data or {}).get("product") or {}).get("dtime") or {}).get("value") or "").strip() or None
+    except Exception:
+        return None
 
 # ========================= AVAILABILITY & METAFIELDS =========================
 
@@ -706,6 +734,7 @@ def set_was_ready_flags(domain: str, token: str, product_gid: str, *, ready_valu
             log_row("⏱️", "IN", "WAS_RTS_SET", product_id=gid_num(product_gid), message=f"{MF_NAMESPACE}.{MF_WAS_RTS_KEY}={ready_value}, {MF_NAMESPACE}.{MF_WAS_RTS_AT}={at_iso}")
     except Exception as e:
         log_row("⚠️", "IN", "WAS_RTS_ERROR", product_id=gid_num(product_gid), message=str(e))
+
 def clear_was_ready_flags(domain: str, token: str, product_gid: str):
     try:
         delm = """
@@ -885,6 +914,63 @@ def sync_priceinindia_for_us_product(us_product_node: dict, idx: dict):
                 log_row("⚠️", "US", "PRICE_FROM_IN_WARN", product_id=pid_us, variant_id=str(vid_us), sku=(v.get("sku") or sku or ""), message=str(e))
     except Exception as e:
         log_row("⚠️", "US", "PRICE_FROM_IN_ERROR", product_id=pid_us, sku=sku, message=str(e))
+
+# --- NEW: Mirror IN delivery_time → US status_in_india
+def mirror_status_in_india(us_product_node: dict, in_idx: dict):
+    """
+    Mirror IN custom.delivery_time --> US custom.status_in_india.
+    Only writes when the value actually differs.
+    """
+    if not ENABLE_MIRROR_STATUS_IN_INDIA or not in_idx:
+        return
+    try:
+        in_pid = str(in_idx.get("product_id") or "").strip()
+        if not in_pid:
+            return
+        in_gid = f"gid://shopify/Product/{in_pid}"
+
+        # 1) Read IN delivery_time
+        val_in = get_in_delivery_time(in_gid)
+        if val_in is None:
+            return
+
+        # 2) Determine US metafield type for target key
+        mf_type = get_mf_def_type(US_DOMAIN, US_TOKEN, "PRODUCT", MF_NAMESPACE, MF_STATUS_IN_INDIA_KEY) or "single_line_text_field"
+
+        # 3) Current US value (if any)
+        current_node = (us_product_node.get("statusInIndia") or {})
+        current_val = (current_node.get("value") or "").strip()
+
+        if current_val == val_in:
+            return  # already in sync
+
+        # 4) Write to US product
+        mutation = """
+          mutation($mfs:[MetafieldsSetInput!]!){
+            metafieldsSet(metafields:$mfs){ userErrors{ field message } }
+          }"""
+        mfs = [{
+            "ownerId": us_product_node["id"],
+            "namespace": MF_NAMESPACE,
+            "key": MF_STATUS_IN_INDIA_KEY,
+            "type": mf_type,
+            "value": val_in,
+        }]
+        data = gql(US_DOMAIN, US_TOKEN, mutation, {"mfs": mfs})
+        errs = ((data.get("metafieldsSet") or {}).get("userErrors") or [])
+        if errs:
+            log_row("⚠️", "US", "STATUS_IN_INDIA_WARN",
+                   product_id=gid_num(us_product_node["id"]),
+                   message=f"metafieldsSet errors: {errs}")
+        else:
+            log_row("🔄", "US", "STATUS_IN_INDIA_SET",
+                   product_id=gid_num(us_product_node["id"]),
+                   message=f"{MF_NAMESPACE}.{MF_STATUS_IN_INDIA_KEY} = \"{val_in}\"")
+    except Exception as e:
+        log_row("⚠️", "US", "STATUS_IN_INDIA_ERR",
+               product_id=gid_num(us_product_node.get("id") or ""),
+               message=str(e))
+
 # ========================= INDEX BUILDER (IN) =========================
 
 def build_in_sku_index():
@@ -1136,66 +1222,115 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
         while True:
             data = gql(US_DOMAIN, US_TOKEN, QUERY_COLLECTION_PAGE_US, {"handle": handle, "cursor": cursor})
             coll = data.get("collectionByHandle")
-            if not coll: break
+            if not coll:
+                break
             prods = ((coll.get("products") or {}).get("nodes") or [])
             pageInfo = ((coll.get("products") or {}).get("pageInfo") or {})
+
             for p in prods:
                 p_sku = (((p.get("metafield") or {}).get("value")) or "").strip()
                 title = p.get("title") or ""
+
+                # Total availability across variants
                 us_avail = 0
                 for v0 in ((p.get("variants") or {}).get("nodes") or []):
                     us_avail += int(v0.get("inventoryQuantity") or 0)
-                if not read_only:
-                    try: maybe_apply_temp_discount_for_product("US", US_DOMAIN, US_TOKEN, p, us_avail)
-                    except Exception as e: log_row("⚠️", "DISC", "WARN", product_id=gid_num(p["id"]), message=f"US apply discount pass error: {e}")
-                if not read_only and p_sku and p_sku in in_index:
-                    try: sync_priceinindia_for_us_product(p, in_index.get(p_sku))
-                    except Exception as e: log_row("⚠️", "US", "PRICEINDIA_WARN", product_id=gid_num(p["id"]), sku=p_sku, message=f"sync error: {e}")
-                if not read_only and ENABLE_US_PRICE_FROM_PRICEININDIA:
-                    try: update_us_prices_for_product(p) 
-                    except Exception as e: log_row("⚠️", "US", "PRICE_SET_WARN", product_id=gid_num(p["id"]), sku=p_sku, message=f"price set error: {e}")
 
+                # US temp discount application
+                if not read_only:
+                    try:
+                        maybe_apply_temp_discount_for_product("US", US_DOMAIN, US_TOKEN, p, us_avail)
+                    except Exception as e:
+                        log_row("⚠️", "DISC", "WARN",
+                               product_id=gid_num(p["id"]), message=f"US apply discount pass error: {e}")
+
+                # INR → US metafields mirror (priceinindia + status_in_india)
+                if not read_only and p_sku and p_sku in in_index:
+                    try:
+                        sync_priceinindia_for_us_product(p, in_index.get(p_sku))
+                    except Exception as e:
+                        log_row("⚠️", "US", "PRICEINDIA_WARN",
+                               product_id=gid_num(p["id"]), sku=p_sku, message=f"sync error: {e}")
+
+                    try:
+                        mirror_status_in_india(p, in_index.get(p_sku))
+                    except Exception as e:
+                        log_row("⚠️", "US", "STATUS_IN_INDIA_WARN",
+                               product_id=gid_num(p["id"]), sku=p_sku, message=f"mirror error: {e}")
+
+                # (Optional) drive US variant prices from priceinindia using your FX/markup rule
+                if not read_only and ENABLE_US_PRICE_FROM_PRICEININDIA:
+                    try:
+                        update_us_prices_for_product(p)
+                    except Exception as e:
+                        log_row("⚠️", "US", "PRICE_SET_WARN",
+                               product_id=gid_num(p["id"]), sku=p_sku, message=f"price set error: {e}")
+
+                # Per-variant mirroring of US→IN availability drops
                 for v in ((p.get("variants") or {}).get("nodes") or []):
                     vid = gid_num(v.get("id"))
                     raw_sku = v.get("sku") or p_sku
                     sku_exact = (raw_sku or "").strip()
                     qty = int(v.get("inventoryQuantity") or 0)
+
                     prev = _as_int_or_none(last_seen.get(vid))
                     if prev is None:
                         last_seen[vid] = qty
                         continue
+
                     delta = qty - int(prev)
                     if delta == 0:
                         last_seen[vid] = qty
                         continue
+
+                    # Ignore increases unless explicitly enabled
                     if delta > 0:
                         if not MIRROR_US_INCREASES:
-                            log_row("🙅‍♂️➕", "US→IN", "IGNORED_INCREASE", variant_id=vid, sku=sku_exact, delta=str(delta), title=title, message="US qty increase; mirroring disabled", before=str(prev), after=str(qty))
+                            log_row("🙅‍♂️➕", "US→IN", "IGNORED_INCREASE",
+                                   variant_id=vid, sku=sku_exact, delta=str(delta),
+                                   title=title, message="US qty increase; mirroring disabled",
+                                   before=str(prev), after=str(qty))
                             last_seen[vid] = qty
                             continue
+
+                    # Mirror decreases into IN, by exact SKU index
                     if not read_only and delta < 0 and sku_exact:
                         idx = in_index.get(sku_exact)
                         if not idx:
-                            log_row("⚠️", "US→IN", "WARN_SKU_NOT_FOUND", variant_id=vid, sku=sku_exact, delta=str(delta), title=title, message="No matching SKU in India index")
+                            log_row("⚠️", "US→IN", "WARN_SKU_NOT_FOUND",
+                                   variant_id=vid, sku=sku_exact, delta=str(delta),
+                                   title=title, message="No matching SKU in India index")
                         else:
                             in_inv_item_id = int(idx.get("inventory_item_id") or 0)
                             try:
                                 rest_adjust_inventory(IN_DOMAIN, IN_TOKEN, in_inv_item_id, int(IN_LOCATION_ID), delta)
-                                log_row("🔁", "US→IN", "APPLIED_DELTA", variant_id=vid, sku=sku_exact, delta=str(delta), title=title, message=f"Adjusted IN inventory_item_id={in_inv_item_id} by {delta} (via EXACT index)")
+                                log_row("🔁", "US→IN", "APPLIED_DELTA",
+                                       variant_id=vid, sku=sku_exact, delta=str(delta),
+                                       title=title, message=f"Adjusted IN inventory_item_id={in_inv_item_id} by {delta} (via EXACT index)")
                                 time.sleep(MUTATION_SLEEP_SEC)
                             except Exception as e:
-                                log_row("⚠️", "US→IN", "ERROR_APPLYING_DELTA", variant_id=vid, sku=sku_exact, delta=str(delta), title=title, message=str(e))
+                                log_row("⚠️", "US→IN", "ERROR_APPLYING_DELTA",
+                                       variant_id=vid, sku=sku_exact, delta=str(delta),
+                                       title=title, message=str(e))
+
+                    # Clamp negatives on US if they appear
                     if not read_only and qty < 0:
                         try:
                             inv_item_gid = (((v.get("inventoryItem") or {}).get("id")) or "")
                             if inv_item_gid:
                                 rest_adjust_inventory(US_DOMAIN, US_TOKEN, int(gid_num(inv_item_gid)), int(US_LOCATION_ID), -qty)
-                                log_row("🧰0️⃣", "US", "CLAMP_TO_ZERO_US", variant_id=vid, sku=sku_exact, delta=f"+{-qty}", title=title, message=f"Raised US availability to 0 on inventory_item_id={gid_num(inv_item_gid)}", before=str(qty), after="0")
+                                log_row("🧰0️⃣", "US", "CLAMP_TO_ZERO_US",
+                                       variant_id=vid, sku=sku_exact, delta=f"+{-qty}",
+                                       title=title, message=f"Raised US availability to 0 on inventory_item_id={gid_num(inv_item_gid)}",
+                                       before=str(qty), after="0")
                                 qty = 0
                         except Exception as e:
-                            log_row("⚠️", "US→IN", "WARN", variant_id=vid, sku=sku_exact, title=title, message=f"US clamp error: {e}")
+                            log_row("⚠️", "US→IN", "WARN",
+                                   variant_id=vid, sku=sku_exact, title=title, message=f"US clamp error: {e}")
+
                     last_seen[vid] = qty
                     sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
+
             save_json(US_LAST_SEEN, last_seen)
             sleep_ms(SLEEP_BETWEEN_PAGES_MS)
             if pageInfo.get("hasNextPage"):
@@ -1651,6 +1786,10 @@ def diag():
         "b_endpoint": bool(B_ENDPOINT_URL),
         "a_to_b_secret": bool(A_TO_B_SHARED_SECRET),
         "source_site": SOURCE_SITE,
+
+        # NEW: status_in_india mirror
+        "status_in_india_key": f"{MF_NAMESPACE}.{MF_STATUS_IN_INDIA_KEY}",
+        "mirror_status_in_india": ENABLE_MIRROR_STATUS_IN_INDIA,
     }
     return _cors(jsonify(info)), 200
 
