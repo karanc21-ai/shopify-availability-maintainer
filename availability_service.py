@@ -128,6 +128,11 @@ CLAMP_AVAIL_TO_ZERO = os.getenv("CLAMP_AVAIL_TO_ZERO", "1") == "1"
 ROUND_STEP_INR = int(os.getenv("DISCOUNT_ROUND_STEP_INR", "5"))
 ROUND_STEP_USD = int(os.getenv("DISCOUNT_ROUND_STEP_USD", "5"))
 
+ENABLE_US_PRICE_FROM_PRICEININDIA = os.getenv("ENABLE_US_PRICE_FROM_PRICEININDIA", "0") == "1"
+FX_INR_PER_USD = float(os.getenv("FX_INR_PER_USD", "85"))
+US_MARKUP_MULT = float(os.getenv("US_MARKUP_MULT", "1.55"))
+US_SHIP_ADD    = float(os.getenv("US_SHIP_ADD", "50"))
+
 # ---- Counters app: Admin host/token (single-host counters target) ----
 ADMIN_HOST = os.getenv("ADMIN_HOST", IN_DOMAIN or "silver-rudradhan.myshopify.com")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", IN_TOKEN)
@@ -760,36 +765,68 @@ def normalize_price_for_meta(value_rupees: float, meta_type: str) -> str:
     return str(v_int)  # use integer string regardless of metafield type
 
 def sync_priceinindia_for_us_product(us_product_node: dict, idx: dict):
-    if not idx: return
+    if not idx:
+        return
     pid_us = gid_num(us_product_node["id"])
     title = us_product_node.get("title") or ""
     sku = (((us_product_node.get("metafield") or {}).get("value")) or "").strip()
     in_variant_id = idx.get("variant_id")
-    if not in_variant_id: return
+    if not in_variant_id:
+        return
+
+    # 1) Read IN price of first variant
     try:
-        var = rest_get_variant(IN_DOMAIN, IN_TOKEN, int(in_variant_id))
+        var_in = rest_get_variant(IN_DOMAIN, IN_TOKEN, int(in_variant_id))
         time.sleep(0.51)
-        in_price = float(var.get("price") or 0.0)
+        in_price = float(var_in.get("price") or 0.0)
     except Exception as e:
         log_row("⚠️", "US", "PRICEINDIA_WARN", product_id=pid_us, sku=sku, message=f"read IN price error: {e}")
         return
+
+    # 2) Ensure US metafield priceinindia mirrors the INR number
     pin_node = us_product_node.get("pricein") or {}
     mf_type = pin_node.get("type") or get_mf_def_type(US_DOMAIN, US_TOKEN, "PRODUCT", MF_NAMESPACE, MF_PRICEIN_KEY) or "single_line_text_field"
-    desired = normalize_price_for_meta(in_price, mf_type)
-    current = (pin_node.get("value") or "").strip()
-    if current == desired: return
-    mutation = "mutation($mfs:[MetafieldsSetInput!]!){ metafieldsSet(metafields:$mfs){ userErrors{ field message } } }"
-    mfs = [{"ownerId": us_product_node["id"], "namespace": MF_NAMESPACE, "key": MF_PRICEIN_KEY, "type": mf_type, "value": desired}]
-    try:
-        data = gql(US_DOMAIN, US_TOKEN, mutation, {"mfs": mfs})
-        errs = ((data.get("metafieldsSet") or {}).get("userErrors") or [])
-        if errs:
-            log_row("⚠️", "US", "PRICEINDIA_WARN", product_id=pid_us, sku=sku, message=f"sync error: {errs}")
-        else:
-            log_row("🏷️", "US", "PRICEINDIA_SET", product_id=pid_us, sku=sku, delta=desired, title=title, message=f"Set US {MF_NAMESPACE}.{MF_PRICEIN_KEY} = {desired}")
-    except Exception as e:
-        log_row("⚠️", "US", "PRICEINDIA_WARN", product_id=pid_us, sku=sku, message=f"sync error: {e}")
+    desired_meta = normalize_price_for_meta(in_price, mf_type)
+    current_meta = (pin_node.get("value") or "").strip()
+    if current_meta != desired_meta:
+        try:
+            mutation = "mutation($mfs:[MetafieldsSetInput!]!){ metafieldsSet(metafields:$mfs){ userErrors{ field message } } }"
+            mfs = [{"ownerId": us_product_node["id"], "namespace": MF_NAMESPACE, "key": MF_PRICEIN_KEY, "type": mf_type, "value": desired_meta}]
+            data = gql(US_DOMAIN, US_TOKEN, mutation, {"mfs": mfs})
+            errs = ((data.get("metafieldsSet") or {}).get("userErrors") or [])
+            if errs:
+                log_row("⚠️", "US", "PRICEINDIA_WARN", product_id=pid_us, sku=sku, message=f"sync error: {errs}")
+            else:
+                log_row("🏷️", "US", "PRICEINDIA_SET", product_id=pid_us, sku=sku, delta=desired_meta, title=title, message=f"Set US {MF_NAMESPACE}.{MF_PRICEIN_KEY} = {desired_meta}")
+        except Exception as e:
+            log_row("⚠️", "US", "PRICEINDIA_WARN", product_id=pid_us, sku=sku, message=f"sync error: {e}")
 
+    # 3) (Optional) Drive US variant price from priceinindia using your formula
+    if not ENABLE_US_PRICE_FROM_PRICEININDIA:
+        return
+
+    try:
+        # Convert INR → USD, apply margin & shipping addend
+        base_us = (in_price / max(FX_INR_PER_USD, 0.0001)) * US_MARKUP_MULT + US_SHIP_ADD
+        step = discount_round_step_for_domain(US_DOMAIN)  # uses ROUND_STEP_USD (default 5)
+        target_us = ceil_to_step(base_us, step)
+
+        # Update ALL US variants on this product if needed
+        for v in ((us_product_node.get("variants") or {}).get("nodes") or []):
+            vid_us = int(gid_num(v.get("id") or "0") or 0)
+            if not vid_us:
+                continue
+            try:
+                var_us = rest_get_variant(US_DOMAIN, US_TOKEN, vid_us)
+                cur_price = float(var_us.get("price") or 0.0)
+                if abs(cur_price - target_us) >= 0.01:
+                    rest_update_variant_price(US_DOMAIN, US_TOKEN, vid_us, str(int(target_us)))
+                    log_row("💵", "US", "PRICE_FROM_IN", product_id=pid_us, variant_id=str(vid_us), sku=(v.get("sku") or sku or ""), title=title, before=str(cur_price), after=str(target_us), message=f"INR {in_price} → USD {target_us} (fx={FX_INR_PER_USD}, mult={US_MARKUP_MULT}, add={US_SHIP_ADD}, step={step})")
+                    time.sleep(MUTATION_SLEEP_SEC)
+            except Exception as e:
+                log_row("⚠️", "US", "PRICE_FROM_IN_WARN", product_id=pid_us, variant_id=str(vid_us), sku=(v.get("sku") or sku or ""), message=str(e))
+    except Exception as e:
+        log_row("⚠️", "US", "PRICE_FROM_IN_ERROR", product_id=pid_us, sku=sku, message=str(e))
 # ========================= INDEX BUILDER (IN) =========================
 
 def build_in_sku_index():
@@ -1056,6 +1093,10 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
                 if not read_only and p_sku and p_sku in in_index:
                     try: sync_priceinindia_for_us_product(p, in_index.get(p_sku))
                     except Exception as e: log_row("⚠️", "US", "PRICEINDIA_WARN", product_id=gid_num(p["id"]), sku=p_sku, message=f"sync error: {e}")
+                if not read_only:
+                    try: update_us_prices_for_product(p) 
+                    except Exception as e: log_row("⚠️", "US", "PRICE_SET_WARN", product_id=gid_num(p["id"]), sku=p_sku, message=f"price set error: {e}")
+
                 for v in ((p.get("variants") or {}).get("nodes") or []):
                     vid = gid_num(v.get("id"))
                     raw_sku = v.get("sku") or p_sku
