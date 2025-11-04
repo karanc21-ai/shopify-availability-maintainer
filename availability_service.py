@@ -506,17 +506,19 @@ def normalize_host(h: str) -> str:
 
 # ========================= GRAPHQL FRAGMENTS =========================
 
-QUERY_COLLECTION_PAGE_IN"""
+# ========================= GRAPHQL FRAGMENTS =========================
+
+QUERY_COLLECTION_PAGE_IN = """
 query ($handle:String!, $cursor:String) {{
-  collectionByHandle(handle:$handle){
-    products(first: 60, after:$cursor){
+  collectionByHandle(handle:$handle){{
+    products(first: 60, after:$cursor){{
       pageInfo{{ hasNextPage endCursor }}
       nodes{{
         id
         title
         status
-        metafield(namespace:"{MF_NAMESPACE}", key:"sku"){{ value }}
-        tdisc: metafield(namespace:"{MF_NAMESPACE}", key:"{TEMP_DISC_KEY}"){{ id value type }}
+        metafield(namespace:"{ns}", key:"sku"){{ value }}
+        tdisc: metafield(namespace:"{ns}", key:"{tdisc}"){{ id value type }}
         variants(first: 100){{
           nodes{{
             id
@@ -527,29 +529,36 @@ query ($handle:String!, $cursor:String) {{
             inventoryPolicy
           }}
         }}
-        badges: metafield(namespace:"{MF_NAMESPACE}", key:"{MF_BADGES_KEY}"){{ id value type }}
-        dtime:  metafield(namespace:"{MF_NAMESPACE}", key:"{MF_DELIVERY_KEY}"){{ id value type }}
-        salesTotal: metafield(namespace:"{MF_NAMESPACE}", key:"{KEY_SALES}"){{ id value type }}
-        salesDates: metafield(namespace:"{MF_NAMESPACE}", key:"{KEY_DATES}"){{ id value type }}
+        badges: metafield(namespace:"{ns}", key:"{badges}"){{ id value type }}
+        dtime:  metafield(namespace:"{ns}", key:"{delivery}"){{ id value type }}
+        salesTotal: metafield(namespace:"{ns}", key:"{sales}"){{ id value type }}
+        salesDates: metafield(namespace:"{ns}", key:"{dates}"){{ id value type }}
       }}
     }}
   }}
 }}
-"""
+""".format(
+    ns=MF_NAMESPACE,
+    tdisc=TEMP_DISC_KEY,
+    badges=MF_BADGES_KEY,
+    delivery=MF_DELIVERY_KEY,
+    sales=KEY_SALES,
+    dates=KEY_DATES,
+)
 
 # >>> UPDATED: include variant price so we can avoid no-op writes
-QUERY_COLLECTION_PAGE_US"""
+QUERY_COLLECTION_PAGE_US = """
 query ($handle:String!, $cursor:String) {{
-  collectionByHandle(handle:$handle){
-    products(first: 60, after:$cursor){
+  collectionByHandle(handle:$handle){{
+    products(first: 60, after:$cursor){{
       pageInfo{{ hasNextPage endCursor }}
       nodes{{
         id
         title
-        metafield(namespace:"{MF_NAMESPACE}", key:"sku"){{ value }}
-        tdisc: metafield(namespace:"{MF_NAMESPACE}", key:"{TEMP_DISC_KEY}"){{ id value type }}
-        pricein: metafield(namespace:"{MF_NAMESPACE}", key:"{MF_PRICEIN_KEY}"){{ id value type }}
-        statusInIndia: metafield(namespace:"{MF_NAMESPACE}", key:"{MF_STATUS_IN_INDIA_KEY}"){{ id value type }}
+        metafield(namespace:"{ns}", key:"sku"){{ value }}
+        tdisc: metafield(namespace:"{ns}", key:"{tdisc}"){{ id value type }}
+        pricein: metafield(namespace:"{ns}", key:"{pricein}"){{ id value type }}
+        statusInIndia: metafield(namespace:"{ns}", key:"{statuskey}"){{ id value type }}
         variants(first: 100){{
           nodes{{
             id
@@ -563,7 +572,12 @@ query ($handle:String!, $cursor:String) {{
     }}
   }}
 }}
-"""
+""".format(
+    ns=MF_NAMESPACE,
+    tdisc=TEMP_DISC_KEY,
+    pricein=MF_PRICEIN_KEY,
+    statuskey=MF_STATUS_IN_INDIA_KEY,
+)
 
 # Metafield definition cache
 _MF_DEF_CACHE: Dict[Tuple[str, str, str], str] = {}
