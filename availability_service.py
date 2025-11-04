@@ -341,6 +341,62 @@ def ensure_log_header():
     if need:
         with open(LOG_CSV, "w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(["ts", "phase", "shop", "note", "product_id", "variant_id", "sku", "delta", "message"])
+           
+def update_us_prices_for_product(us_product_node: dict, in_rupees: float = None):
+    """
+    Reads priceinindia (or uses `in_rupees` if provided), applies FX/markup/addend,
+    rounds to USD step, and updates ALL US variants only if different.
+
+    ENV:
+      FX_INR_PER_USD (default "85")
+      US_MARKUP_MULT (default "1.55")
+      US_SHIP_ADD    (default "50")
+      DISCOUNT_ROUND_STEP_USD or ROUND_STEP_USD (we use ROUND_STEP_USD you already have)
+    """
+    try:
+        fx   = float(os.getenv("FX_INR_PER_USD", "85"))
+        mult = float(os.getenv("US_MARKUP_MULT", "1.55"))
+        add  = float(os.getenv("US_SHIP_ADD", "50"))
+    except Exception:
+        fx, mult, add = 85.0, 1.55, 50.0
+
+    # Pull rupee source
+    if in_rupees is None:
+        pin_node = us_product_node.get("pricein") or {}
+        try:
+            in_rupees = float((pin_node.get("value") or "0").strip() or 0)
+        except Exception:
+            in_rupees = 0.0
+
+    if in_rupees <= 0 or fx <= 0:
+        return  # nothing to do
+
+    # Compute target USD price and round to your configured step
+    raw_us = (in_rupees / fx) * mult + add
+    target = ceil_to_step(raw_us, ROUND_STEP_USD)
+
+    # Update each variant only if changed
+    for v in ((us_product_node.get("variants") or {}).get("nodes") or []):
+        vid = gid_num(v.get("id") or "")
+        if not vid:
+            continue
+        try:
+            var = rest_get_variant(US_DOMAIN, US_TOKEN, int(vid))
+            cur = float(var.get("price") or 0.0)
+        except Exception:
+            continue
+        if abs(cur - target) >= 0.01:
+            try:
+                rest_update_variant_price(US_DOMAIN, US_TOKEN, int(vid), str(int(target)))
+                log_row("💵", "US", "PRICE_SET",
+                        variant_id=vid,
+                        sku=(v.get("sku") or (us_product_node.get("metafield") or {}).get("value") or "").strip(),
+                        delta=f"{cur}->{target}",
+                        title=us_product_node.get("title") or "",
+                        message=f"FX={fx} mult={mult} add={add} step={ROUND_STEP_USD}")
+                time.sleep(MUTATION_SLEEP_SEC)
+            except Exception as e:
+                log_row("⚠️", "US", "PRICE_SET_ERR", variant_id=vid, message=str(e))
 
 def log_row(
     emoji_phase: str,
