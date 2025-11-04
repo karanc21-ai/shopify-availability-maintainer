@@ -506,7 +506,7 @@ def normalize_host(h: str) -> str:
 
 # ========================= GRAPHQL FRAGMENTS =========================
 
-QUERY_COLLECTION_PAGE_IN = f"""
+QUERY_COLLECTION_PAGE_IN"""
 query ($handle:String!, $cursor:String) {{
   collectionByHandle(handle:$handle){
     products(first: 60, after:$cursor){
@@ -537,43 +537,11 @@ query ($handle:String!, $cursor:String) {{
 }}
 """
 
-# >>> IN collection page (unchanged fields, braces escaped)
-QUERY_COLLECTION_PAGE_IN = f"""
+# >>> UPDATED: include variant price so we can avoid no-op writes
+QUERY_COLLECTION_PAGE_US"""
 query ($handle:String!, $cursor:String) {{
-  collectionByHandle(handle:$handle){{
-    products(first: 60, after:$cursor){{
-      pageInfo{{ hasNextPage endCursor }}
-      nodes{{
-        id
-        title
-        status
-        metafield(namespace:"{MF_NAMESPACE}", key:"sku"){{ value }}
-        tdisc: metafield(namespace:"{MF_NAMESPACE}", key:"{TEMP_DISC_KEY}"){{ id value type }}
-        variants(first: 100){{
-          nodes{{
-            id
-            title
-            sku
-            inventoryQuantity
-            inventoryItem{{ id tracked }}
-            inventoryPolicy
-          }}
-        }}
-        badges: metafield(namespace:"{MF_NAMESPACE}", key:"{MF_BADGES_KEY}"){{ id value type }}
-        dtime:  metafield(namespace:"{MF_NAMESPACE}", key:"{MF_DELIVERY_KEY}"){{ id value type }}
-        salesTotal: metafield(namespace:"{MF_NAMESPACE}", key:"{KEY_SALES}"){{ id value type }}
-        salesDates: metafield(namespace:"{MF_NAMESPACE}", key:"{KEY_DATES}"){{ id value type }}
-      }}
-    }}
-  }}
-}}
-"""
-
-# >>> US collection page (includes variant price; ALL braces escaped)
-QUERY_COLLECTION_PAGE_US = f"""
-query ($handle:String!, $cursor:String) {{
-  collectionByHandle(handle:$handle){{
-    products(first: 60, after:$cursor){{
+  collectionByHandle(handle:$handle){
+    products(first: 60, after:$cursor){
       pageInfo{{ hasNextPage endCursor }}
       nodes{{
         id
@@ -596,7 +564,6 @@ query ($handle:String!, $cursor:String) {{
   }}
 }}
 """
-
 
 # Metafield definition cache
 _MF_DEF_CACHE: Dict[Tuple[str, str, str], str] = {}
