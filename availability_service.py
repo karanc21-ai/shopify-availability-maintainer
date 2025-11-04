@@ -354,7 +354,7 @@ def ensure_log_header():
 def update_us_prices_for_product(us_product_node: dict, in_rupees: float = None):
     """
     Reads priceinindia (or uses `in_rupees` if provided), applies FX/markup/addend,
-    rounds to USD step, and updates ALL US variants only if different.
+    rounds to USD step, and updates ONLY the PRIMARY US variant (position==1, else first).
 
     ENV:
       FX_INR_PER_USD (default "85")
@@ -384,28 +384,48 @@ def update_us_prices_for_product(us_product_node: dict, in_rupees: float = None)
     raw_us = (in_rupees / fx) * mult + add
     target = ceil_to_step(raw_us, ROUND_STEP_USD)
 
-    # Update each variant only if changed
-    for v in ((us_product_node.get("variants") or {}).get("nodes") or []):
-        vid = gid_num(v.get("id") or "")
-        if not vid:
-            continue
+    # ----- choose PRIMARY variant only -----
+    nodes = ((us_product_node.get("variants") or {}).get("nodes") or [])
+    if not nodes:
+        return
+
+    primary = None
+    # Prefer node with position==1 if present
+    for n in nodes:
         try:
-            var = rest_get_variant(US_DOMAIN, US_TOKEN, int(vid))
-            cur = float(var.get("price") or 0.0)
+            if int(n.get("position") or 0) == 1:
+                primary = n
+                break
         except Exception:
-            continue
-        if abs(cur - target) >= 0.01:
-            try:
-                rest_update_variant_price(US_DOMAIN, US_TOKEN, int(vid), str(int(target)))
-                log_row("💵", "US", "PRICE_SET",
-                        variant_id=vid,
-                        sku=(v.get("sku") or (us_product_node.get("metafield") or {}).get("value") or "").strip(),
-                        delta=f"{cur}->{target}",
-                        title=us_product_node.get("title") or "",
-                        message=f"FX={fx} mult={mult} add={add} step={ROUND_STEP_USD}")
-                time.sleep(MUTATION_SLEEP_SEC)
-            except Exception as e:
-                log_row("⚠️", "US", "PRICE_SET_ERR", variant_id=vid, message=str(e))
+            pass
+    if primary is None:
+        primary = nodes[0]  # fallback: first node
+
+    vid = gid_num(primary.get("id") or "")
+    if not vid:
+        return
+
+    # Read current price of the primary variant, update only if changed
+    try:
+        var = rest_get_variant(US_DOMAIN, US_TOKEN, int(vid))
+        cur = float(var.get("price") or 0.0)
+    except Exception:
+        return
+
+    if abs(cur - target) >= 0.01:
+        try:
+            # keep payload style same as before; target cast to str(int) like your code
+            rest_update_variant_price(US_DOMAIN, US_TOKEN, int(vid), str(int(target)))
+            log_row("💵", "US", "PRICE_SET",
+                    variant_id=vid,
+                    sku=(primary.get("sku") or (us_product_node.get("metafield") or {}).get("value") or "").strip(),
+                    delta=f"{cur}->{target}",
+                    title=us_product_node.get("title") or "",
+                    message=f"(primary only) FX={fx} mult={mult} add={add} step={ROUND_STEP_USD}")
+            time.sleep(MUTATION_SLEEP_SEC)
+        except Exception as e:
+            log_row("⚠️", "US", "PRICE_SET_ERR", variant_id=vid, message=str(e))
+
 
 def log_row(
     emoji_phase: str,
