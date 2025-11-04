@@ -709,8 +709,8 @@ def set_was_ready_flags(domain: str, token: str, product_gid: str, *, ready_valu
 def clear_was_ready_flags(domain: str, token: str, product_gid: str):
     try:
         delm = """
-          mutation($ids:[MetafieldIdentifierInput!]!){
-            metafieldsDelete(metafields:$ids){
+          mutation($metafields:[MetafieldIdentifierInput!]!){
+            metafieldsDelete(metafields:$metafields){
               userErrors{ field message }
             }
           }"""
@@ -719,9 +719,11 @@ def clear_was_ready_flags(domain: str, token: str, product_gid: str):
             {"ownerId": product_gid, "namespace": MF_NAMESPACE, "key": MF_WAS_RTS_AT},
         ]
         gql(domain, token, delm, {"metafields": ids})
-        log_row("🧹", "IN", "WAS_RTS_CLEARED", product_id=gid_num(product_gid), message="deleted was_ready_* metafields")
+        log_row("🧹", "IN", "WAS_RTS_CLEARED",
+                product_id=gid_num(product_gid), message="deleted was_ready_* metafields")
     except Exception as e:
-        log_row("⚠️", "IN", "WAS_RTS_CLEAR_WARN", product_id=gid_num(product_gid), message=str(e))
+        log_row("⚠️", "IN", "WAS_RTS_CLEAR_WARN",
+                product_id=gid_num(product_gid), message=str(e))
 
 # --- temp discount helpers ---
 def ceil_to_step(value: float, step: int) -> float:
@@ -1149,7 +1151,7 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
                 if not read_only and p_sku and p_sku in in_index:
                     try: sync_priceinindia_for_us_product(p, in_index.get(p_sku))
                     except Exception as e: log_row("⚠️", "US", "PRICEINDIA_WARN", product_id=gid_num(p["id"]), sku=p_sku, message=f"sync error: {e}")
-                if not read_only:
+                if not read_only and ENABLE_US_PRICE_FROM_PRICEININDIA:
                     try: update_us_prices_for_product(p) 
                     except Exception as e: log_row("⚠️", "US", "PRICE_SET_WARN", product_id=gid_num(p["id"]), sku=p_sku, message=f"price set error: {e}")
 
