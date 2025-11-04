@@ -43,6 +43,11 @@ New in this version
 - (NEW) Mirror IN → US delivery text:
     Mirrors IN `custom.delivery_time` into US `custom.status_in_india`.
     Toggle via ENABLE_MIRROR_STATUS_IN_INDIA (default ON).
+
+- (UPDATED) US pricing logic:
+    • All US variants are updated to the computed target price.
+    • No per-variant REST GETs (avoids 429s); optional compare using GraphQL `price` if present.
+    • `sync_priceinindia_for_us_product` now ONLY mirrors the metafield and does not do pricing; pricing is centralized in `update_us_prices_for_product`.
 """
 
 import os
@@ -78,7 +83,8 @@ ENABLE_SCHEDULER = os.getenv("ENABLE_SCHEDULER", "0") == "1"
 SLEEP_BETWEEN_PRODUCTS_MS = int(os.getenv("SLEEP_BETWEEN_PRODUCTS_MS", "120"))
 SLEEP_BETWEEN_PAGES_MS = int(os.getenv("SLEEP_BETWEEN_PAGES_MS", "400"))
 SLEEP_BETWEEN_SHOPS_MS = int(os.getenv("SLEEP_BETWEEN_SHOPS_MS", "800"))
-MUTATION_SLEEP_SEC = float(os.getenv("MUTATION_SLEEP_SEC", "0.35"))
+# Slightly higher default to stay safely under 2 rps when doing consecutive writes
+MUTATION_SLEEP_SEC = float(os.getenv("MUTATION_SLEEP_SEC", "0.6"))
 
 # ---- India shop (Dual-site) ----
 IN_DOMAIN = os.getenv("IN_DOMAIN", "").strip()
@@ -320,6 +326,7 @@ def today_ist_str():
     return now_ist().date().isoformat()
 
 def sleep_ms(ms: int): time.sleep(max(0, ms)/1000.0)
+
 def gid_num(gid: str) -> str: return (gid or "").split("/")[-1]
 
 def _as_int_or_none(v):
@@ -345,22 +352,24 @@ def save_json(path: str, obj):
     os.replace(tmp, path)
 
 # -------- Logging (Dual-site) --------
+
 def ensure_log_header():
     need = (not os.path.exists(LOG_CSV)) or (os.path.getsize(LOG_CSV) == 0)
     if need:
         with open(LOG_CSV, "w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(["ts", "phase", "shop", "note", "product_id", "variant_id", "sku", "delta", "message"])
 
+
 def update_us_prices_for_product(us_product_node: dict, in_rupees: float = None):
     """
     Reads priceinindia (or uses `in_rupees` if provided), applies FX/markup/addend,
-    rounds to USD step, and updates ONLY the PRIMARY US variant (position==1, else first).
+    rounds to USD step, and updates ALL US variants (no per-variant REST GETs).
 
     ENV:
       FX_INR_PER_USD (default "85")
       US_MARKUP_MULT (default "1.55")
       US_SHIP_ADD    (default "50")
-      DISCOUNT_ROUND_STEP_USD or ROUND_STEP_USD (we use ROUND_STEP_USD you already have)
+      DISCOUNT_ROUND_STEP_USD or ROUND_STEP_USD
     """
     try:
         fx   = float(os.getenv("FX_INR_PER_USD", "85"))
@@ -384,47 +393,40 @@ def update_us_prices_for_product(us_product_node: dict, in_rupees: float = None)
     raw_us = (in_rupees / fx) * mult + add
     target = ceil_to_step(raw_us, ROUND_STEP_USD)
 
-    # ----- choose PRIMARY variant only -----
+    # Update ALL variants (no REST GETs); optionally skip no-ops if GraphQL price is present
     nodes = ((us_product_node.get("variants") or {}).get("nodes") or [])
     if not nodes:
         return
 
-    primary = None
-    # Prefer node with position==1 if present
+    pid = gid_num(us_product_node.get("id") or "")
+    title = us_product_node.get("title") or ""
+    sku_fallback = (((us_product_node.get("metafield") or {}).get("value")) or "").strip()
+
     for n in nodes:
+        vid = gid_num(n.get("id") or "")
+        if not vid:
+            continue
+        # Try GraphQL variant price if available to avoid no-op writes
+        cur = None
         try:
-            if int(n.get("position") or 0) == 1:
-                primary = n
-                break
+            cur = float(str(n.get("price"))) if n.get("price") is not None else None
         except Exception:
-            pass
-    if primary is None:
-        primary = nodes[0]  # fallback: first node
-
-    vid = gid_num(primary.get("id") or "")
-    if not vid:
-        return
-
-    # Read current price of the primary variant, update only if changed
-    try:
-        var = rest_get_variant(US_DOMAIN, US_TOKEN, int(vid))
-        cur = float(var.get("price") or 0.0)
-    except Exception:
-        return
-
-    if abs(cur - target) >= 0.01:
+            cur = None
+        need_update = (cur is None) or (abs(cur - target) >= 0.01)
+        if not need_update:
+            continue
         try:
-            # keep payload style same as before; target cast to str(int) like your code
             rest_update_variant_price(US_DOMAIN, US_TOKEN, int(vid), str(int(target)))
             log_row("💵", "US", "PRICE_SET",
+                    product_id=pid,
                     variant_id=vid,
-                    sku=(primary.get("sku") or (us_product_node.get("metafield") or {}).get("value") or "").strip(),
-                    delta=f"{cur}->{target}",
-                    title=us_product_node.get("title") or "",
-                    message=f"(primary only) FX={fx} mult={mult} add={add} step={ROUND_STEP_USD}")
-            time.sleep(MUTATION_SLEEP_SEC)
+                    sku=(n.get("sku") or sku_fallback),
+                    delta=f"{cur if cur is not None else '?'}->{target}",
+                    title=title,
+                    message=f"(all variants) FX={FX_INR_PER_USD} mult={US_MARKUP_MULT} add={US_SHIP_ADD} step={ROUND_STEP_USD}")
+            time.sleep(max(0.6, MUTATION_SLEEP_SEC))  # gentle throttle, stay < 2 rps
         except Exception as e:
-            log_row("⚠️", "US", "PRICE_SET_ERR", variant_id=vid, message=str(e))
+            log_row("⚠️", "US", "PRICE_SET_ERR", product_id=pid, variant_id=vid, message=str(e))
 
 
 def log_row(
@@ -460,6 +462,7 @@ def log_row(
         print(human, flush=True)
 
 # -------- IP tools (pixel) --------
+
 def _parse_networks(items: List[str]):
     nets = []
     for s in items:
@@ -476,6 +479,7 @@ def _parse_networks(items: List[str]):
 
 IGNORE_NETS = _parse_networks(IGNORE_IPS_ENV)
 
+
 def get_client_ip(req) -> str:
     h = req.headers
     ip = (h.get("CF-Connecting-IP")
@@ -485,6 +489,7 @@ def get_client_ip(req) -> str:
           or "")
     return ip
 
+
 def ip_is_ignored(ip: str) -> bool:
     if not ip: return False
     try:
@@ -492,6 +497,7 @@ def ip_is_ignored(ip: str) -> bool:
     except Exception:
         return False
     return any(ip_obj in net for net in IGNORE_NETS)
+
 
 def normalize_host(h: str) -> str:
     h = (h or "").lower().strip()
@@ -502,8 +508,8 @@ def normalize_host(h: str) -> str:
 
 QUERY_COLLECTION_PAGE_IN = f"""
 query ($handle:String!, $cursor:String) {{
-  collectionByHandle(handle:$handle){{
-    products(first: 60, after:$cursor){{
+  collectionByHandle(handle:$handle){
+    products(first: 60, after:$cursor){
       pageInfo{{ hasNextPage endCursor }}
       nodes{{
         id
@@ -531,11 +537,11 @@ query ($handle:String!, $cursor:String) {{
 }}
 """
 
-# >>> NEW FIELD added: statusInIndia
+# >>> UPDATED: include variant price so we can avoid no-op writes
 QUERY_COLLECTION_PAGE_US = f"""
 query ($handle:String!, $cursor:String) {{
-  collectionByHandle(handle:$handle){{
-    products(first: 60, after:$cursor){{
+  collectionByHandle(handle:$handle){
+    products(first: 60, after:$cursor){
       pageInfo{{ hasNextPage endCursor }}
       nodes{{
         id
@@ -548,6 +554,7 @@ query ($handle:String!, $cursor:String) {{
           nodes{{
             id
             sku
+            price
             inventoryQuantity
             inventoryItem{{ id }}
           }}
@@ -560,6 +567,7 @@ query ($handle:String!, $cursor:String) {{
 
 # Metafield definition cache
 _MF_DEF_CACHE: Dict[Tuple[str, str, str], str] = {}
+
 
 def get_mf_def_type(domain: str, token: str, owner_type: str, namespace: str, key: str) -> str:
     ck = (owner_type, namespace, key)
@@ -577,6 +585,7 @@ def get_mf_def_type(domain: str, token: str, owner_type: str, namespace: str, ke
     return _MF_DEF_CACHE[ck]
 
 # --- NEW: helper to read IN delivery_time value for a product
+
 def get_in_delivery_time(product_gid: str) -> Optional[str]:
     """
     Returns IN product metafield custom.delivery_time string or None.
@@ -606,6 +615,7 @@ def compute_product_availability(variants: List[dict], include_untracked: bool) 
             total += qty
     return total if counted else 0
 
+
 def desired_state(avail: int) -> Tuple[str, str, str]:
     if avail > 0:
         return ("ACTIVE", BADGE_READY, DELIVERY_READY)
@@ -620,6 +630,7 @@ mutation ProductUpdate($input: ProductInput!) {
 }
 """
 
+
 def update_product_status(domain: str, token: str, product_gid: str, target_status: str) -> bool:
     data = gql(domain, token, MUTATION_PRODUCT_UPDATE, {"input": {"id": product_gid, "status": target_status}})
     errs = ((data.get("productUpdate") or {}).get("userErrors") or [])
@@ -628,6 +639,7 @@ def update_product_status(domain: str, token: str, product_gid: str, target_stat
         return False
     time.sleep(MUTATION_SLEEP_SEC)
     return True
+
 
 def set_product_metafields(domain: str, token: str, product_gid: str, badges_node: dict, dtime_node: dict, target_badge: str, target_delivery: str):
     badges_type = (badges_node or {}).get("type") or get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, MF_BADGES_KEY)
@@ -649,6 +661,7 @@ def set_product_metafields(domain: str, token: str, product_gid: str, badges_nod
         errs = ((data.get("metafieldsSet") or {}).get("userErrors") or [])
         if errs:
             log_row("⚠️", "IN", "WARN", product_id=gid_num(product_gid), message=f"metafieldsSet errors: {errs}")
+
 
 def bump_sales_in(domain: str, token: str, product_gid: str, sales_total_node: dict, sales_dates_node: dict, sold: int, today: str):
     st_type = (sales_total_node or {}).get("type") or get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, KEY_SALES) or "number_integer"
@@ -684,6 +697,7 @@ def bump_sales_in(domain: str, token: str, product_gid: str, sales_total_node: d
         log_row("⚠️", "IN", "WARN", product_id=gid_num(product_gid), message=f"sales metafieldsSet errors: {errs}")
 
 # --- NEW: manual manufacturing flag helper ---
+
 def set_start_manufacturing_flag(domain: str, token: str, product_gid: str, value: str):
     """
     Sets custom.start_manufacturing to the given value (string).
@@ -726,6 +740,7 @@ def set_start_manufacturing_flag(domain: str, token: str, product_gid: str, valu
     except Exception as e:
         log_row("⚠️", "IN", "START_MFG_ERROR", product_id=gid_num(product_gid), message=str(e))
 
+
 def set_was_ready_flags(domain: str, token: str, product_gid: str, *, ready_value: str, at_iso: str):
     """
     Writes:
@@ -755,6 +770,7 @@ def set_was_ready_flags(domain: str, token: str, product_gid: str, *, ready_valu
     except Exception as e:
         log_row("⚠️", "IN", "WAS_RTS_ERROR", product_id=gid_num(product_gid), message=str(e))
 
+
 def clear_was_ready_flags(domain: str, token: str, product_gid: str):
     try:
         delm = """
@@ -775,16 +791,22 @@ def clear_was_ready_flags(domain: str, token: str, product_gid: str):
                 product_id=gid_num(product_gid), message=str(e))
 
 # --- temp discount helpers ---
+
 def ceil_to_step(value: float, step: int) -> float:
     if step <= 1: return math.ceil(value * 100) / 100.0
     return float(int(math.ceil(value / step) * step))
 
+
 def discount_round_step_for_domain(domain: str) -> int:
     return ROUND_STEP_INR if domain == IN_DOMAIN else ROUND_STEP_USD
 
+
 def load_disc_state() -> Dict[str, Any]: return load_json(DISC_STATE, {})
+
 def save_disc_state(state: Dict[str, Any]) -> None: save_json(DISC_STATE, state)
+
 def disc_key(shop_tag: str, pid: str, vid: str) -> str: return f"{shop_tag}:{pid}:{vid}"
+
 
 def parse_percent(node: dict) -> int:
     v = ((node or {}).get("value") or "").strip()
@@ -792,6 +814,7 @@ def parse_percent(node: dict) -> int:
         return max(0, int(float(v)))
     except:
         return 0
+
 
 def set_temp_discount_percent(domain: str, token: str, product_gid: str, node: dict, percent: int):
     mtype = (node or {}).get("type") or get_mf_def_type(domain, token, "PRODUCT", MF_NAMESPACE, TEMP_DISC_KEY) or "number_integer"
@@ -802,9 +825,9 @@ def set_temp_discount_percent(domain: str, token: str, product_gid: str, node: d
     if errs:
         log_row("⚠️", "IN", "WARN", product_id=gid_num(product_gid), message=f"temp_discount_active set errors: {errs}")
 
+
 def maybe_apply_temp_discount_for_product(shop_tag: str, domain: str, token: str, product_node: dict, availability: int):
-    tdisc_node = product_node.get("tdisc") or {}
-    percent = parse_percent(tdisc_node)
+    percent = parse_percent(product_node.get("tdisc") or {})
     if percent <= 0 or availability <= 0:
         return
     step = discount_round_step_for_domain(domain)
@@ -839,6 +862,7 @@ def maybe_apply_temp_discount_for_product(shop_tag: str, domain: str, token: str
     if changed_any or percent > 0:
         save_disc_state(disc_state)
 
+
 def revert_temp_discount_for_product(shop_tag: str, domain: str, token: str, product_node: dict):
     pid = gid_num(product_node["id"])
     title = product_node.get("title") or ""
@@ -864,12 +888,14 @@ def revert_temp_discount_for_product(shop_tag: str, domain: str, token: str, pro
     set_temp_discount_percent(domain, token, product_node["id"], product_node.get("tdisc") or {}, 0)
 
 # --- priceinindia helpers (US) ---
+
 def normalize_price_for_meta(value_rupees: float, meta_type: str) -> str:
     try:
         v_int = int(round(float(value_rupees)))
     except:
         v_int = 0
     return str(v_int)  # use integer string regardless of metafield type
+
 
 def sync_priceinindia_for_us_product(us_product_node: dict, idx: dict):
     if not idx:
@@ -908,34 +934,12 @@ def sync_priceinindia_for_us_product(us_product_node: dict, idx: dict):
         except Exception as e:
             log_row("⚠️", "US", "PRICEINDIA_WARN", product_id=pid_us, sku=sku, message=f"sync error: {e}")
 
-    # 3) (Optional) Drive US variant price from priceinindia using your formula
-    if not ENABLE_US_PRICE_FROM_PRICEININDIA:
-        return
-
-    try:
-        # Convert INR → USD, apply margin & shipping addend
-        base_us = (in_price / max(FX_INR_PER_USD, 0.0001)) * US_MARKUP_MULT + US_SHIP_ADD
-        step = discount_round_step_for_domain(US_DOMAIN)  # uses ROUND_STEP_USD (default 5)
-        target_us = ceil_to_step(base_us, step)
-
-        # Update ALL US variants on this product if needed
-        for v in ((us_product_node.get("variants") or {}).get("nodes") or []):
-            vid_us = int(gid_num(v.get("id") or "0") or 0)
-            if not vid_us:
-                continue
-            try:
-                var_us = rest_get_variant(US_DOMAIN, US_TOKEN, vid_us)
-                cur_price = float(var_us.get("price") or 0.0)
-                if abs(cur_price - target_us) >= 0.01:
-                    rest_update_variant_price(US_DOMAIN, US_TOKEN, vid_us, str(int(target_us)))
-                    log_row("💵", "US", "PRICE_FROM_IN", product_id=pid_us, variant_id=str(vid_us), sku=(v.get("sku") or sku or ""), title=title, before=str(cur_price), after=str(target_us), message=f"INR {in_price} → USD {target_us} (fx={FX_INR_PER_USD}, mult={US_MARKUP_MULT}, add={US_SHIP_ADD}, step={step})")
-                    time.sleep(MUTATION_SLEEP_SEC)
-            except Exception as e:
-                log_row("⚠️", "US", "PRICE_FROM_IN_WARN", product_id=pid_us, variant_id=str(vid_us), sku=(v.get("sku") or sku or ""), message=str(e))
-    except Exception as e:
-        log_row("⚠️", "US", "PRICE_FROM_IN_ERROR", product_id=pid_us, sku=sku, message=str(e))
+    # 3) Centralize price updates in update_us_prices_for_product (ALL variants)
+    # NOTE: Do not update variant prices here to avoid duplicate writes and 429s.
+    return
 
 # --- NEW: Mirror IN delivery_time → US status_in_india
+
 def mirror_status_in_india(us_product_node: dict, in_idx: dict):
     """
     Mirror IN custom.delivery_time --> US custom.status_in_india.
@@ -1031,6 +1035,7 @@ def build_in_sku_index():
 def _mfg_hmac_b64(secret: str, raw: bytes) -> str:
     import hashlib, hmac, base64
     return base64.b64encode(hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).digest()).decode()
+
 
 def send_to_manufacturing(*, sku: str, delta: int, before: int, after: int,
                           product_id: str = "", variant_id: str = "", title: str = "") -> None:
@@ -1278,7 +1283,7 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
                         log_row("⚠️", "US", "STATUS_IN_INDIA_WARN",
                                product_id=gid_num(p["id"]), sku=p_sku, message=f"mirror error: {e}")
 
-                # (Optional) drive US variant prices from priceinindia using your FX/markup rule
+                # Centralized pricing: update ALL variants once per product
                 if not read_only and ENABLE_US_PRICE_FROM_PRICEININDIA:
                     try:
                         update_us_prices_for_product(p)
@@ -1439,7 +1444,7 @@ def _save_today_state():
 def _ensure_daily_csv_header():
     if not Path(DAILY_CSV).exists():
         with open(DAILY_CSV, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(DAILY_CSV_HEADER)
+            csv.writer(f).writerow(["date_ist","product_id","views_today","atc_today","sales_today","age_in_days_today"])
 
 def _write_daily_csv_for_date(ist_date: str):
     _ensure_daily_csv_header()
@@ -1537,6 +1542,7 @@ def metafields_set(shop_host, token, metafields):
             time.sleep(_backoff_delay(attempt, base=0.3))
     return False
 
+
 def fetch_product_dob(pid: str) -> str:
     admin_host = list(ADMIN_TOKENS.keys())[0]
     token = ADMIN_TOKENS[admin_host]
@@ -1558,6 +1564,7 @@ def fetch_product_dob(pid: str) -> str:
     except Exception as e:
         print(f"[DOB] fetch error for {pid}: {e}")
     return ""
+
 
 def _compute_age_for_pid(pid: str, today_date):
     dob = dob_cache.get(pid)
@@ -1581,6 +1588,7 @@ def _compute_age_for_pid(pid: str, today_date):
         return True
     return False
 
+
 def _recompute_age_for_known_pids():
     today = datetime.now(timezone.utc).date()
     with lock:
@@ -1595,6 +1603,7 @@ def _recompute_age_for_known_pids():
     if changed:
         _persist_all()
     return changed
+
 
 def _list_all_product_nodes():
     admin_host = list(ADMIN_TOKENS.keys())[0]
@@ -1666,6 +1675,7 @@ def _compute_availability_from_variants(variants: list) -> int:
             total += max(qty, 0)
     return total if any_tracked else 0
 
+
 def _list_products_availability(limit_to_pids: Optional[Set[str]] = None) -> Dict[str, int]:
     admin_host = list(ADMIN_TOKENS.keys())[0]
     token = ADMIN_TOKENS[admin_host]
@@ -1707,6 +1717,7 @@ def _list_products_availability(limit_to_pids: Optional[Set[str]] = None) -> Dic
         if not after: break
     return out
 
+
 def _availability_seed_all():
     current = _list_products_availability(AVAIL_POLL_PRODUCT_IDS if AVAIL_POLL_PRODUCT_IDS else None)
     with lock:
@@ -1714,6 +1725,7 @@ def _availability_seed_all():
         last_avail.update({k:int(v) for k,v in current.items()})
     _persist_all()
     return len(current)
+
 
 def _availability_poll_once():
     today_date = datetime.now(timezone.utc).date()
@@ -1739,6 +1751,7 @@ def _availability_poll_once():
     if changed_sales:
         _persist_all()
     return changed_sales
+
 
 def availability_poller():
     if INVENTORY_POLL_SEC <= 0:
@@ -1814,7 +1827,7 @@ def diag():
     return _cors(jsonify(info)), 200
 
 # === PIXEL ENDPOINTS =========================================================
-@app.route("/track/product", methods=["POST", "OPTIONS"])
+@app.route("/track/product", methods=["POST", "OPTIONS"]) 
 def pixel_product():
     if request.method == "OPTIONS":
         return _cors(make_response())
@@ -1837,7 +1850,7 @@ def pixel_product():
 
     ts_iso = to_iso8601(payload.get("ts"))
     with open(EVENTS_CSV, "a", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow([ts_iso, shop, pid, handle, payload.get("sessionId") or "", payload.get("userAgent") or ""])
+        csv.writer(f).writerow([ts_iso, shop, pid, handle, payload.get("sessionId") or "", payload.get("userAgent") or ""]) 
 
     with lock:
         view_counts[pid] = int(view_counts.get(pid, 0)) + 1
@@ -1845,7 +1858,7 @@ def pixel_product():
         dirty_views.add((ADMIN_HOST, pid))
     return _cors(make_response(jsonify({"ok": True})))
 
-@app.route("/track/atc", methods=["POST", "OPTIONS"])
+@app.route("/track/atc", methods=["POST", "OPTIONS"]) 
 def pixel_atc():
     if request.method == "OPTIONS":
         return _cors(make_response())
@@ -1876,7 +1889,7 @@ def pixel_atc():
         dirty_atc.add((ADMIN_HOST, pid))
     return _cors(make_response(jsonify({"ok": True})))
 
-@app.route("/pixel/collection", methods=["POST", "OPTIONS"])
+@app.route("/pixel/collection", methods=["POST", "OPTIONS"]) 
 def pixel_collection():
     if request.method == "OPTIONS":
         return _cors(make_response())
@@ -1907,7 +1920,7 @@ def pixel_collection():
     return _cors(make_response(jsonify({"ok": True})))
 # === END PIXEL ENDPOINTS =====================================================
 
-@app.route("/debug/flush_now", methods=["POST","GET"])
+@app.route("/debug/flush_now", methods=["POST","GET"]) 
 def debug_flush_now():
     key = (request.args.get("key") or "").strip()
     if key != PIXEL_SHARED_SECRET:
@@ -1916,7 +1929,7 @@ def debug_flush_now():
     return "flushed", 200
 
 
-@app.route("/rebuild_index", methods=["POST"])
+@app.route("/rebuild_index", methods=["POST"]) 
 def rebuild_index():
     key = (request.args.get("key") or request.form.get("key") or "").strip()
     if key != PIXEL_SHARED_SECRET:
@@ -1924,7 +1937,7 @@ def rebuild_index():
     build_in_sku_index()
     return _cors(jsonify({"status": "ok", "entries": len(load_json(IN_SKU_INDEX, {}))})), 200
 
-@app.route("/run", methods=["POST"])
+@app.route("/run", methods=["POST"]) 
 def run_now():
     key = (request.args.get("key") or request.form.get("key") or "").strip()
     if key != PIXEL_SHARED_SECRET:
@@ -1933,6 +1946,7 @@ def run_now():
     return _cors(jsonify({"status": status})), 200 if status == "ok" else 409
 
 # ---- DOB / AGE endpoints ----
+
 def verify_hmac(req_body: bytes, header_hmac: str) -> bool:
     try:
         digest = hmac.new(key=SHOPIFY_WEBHOOK_SECRET.encode("utf-8"), msg=req_body, digestmod="sha256").digest()
@@ -1941,7 +1955,7 @@ def verify_hmac(req_body: bytes, header_hmac: str) -> bool:
     except Exception:
         return False
 
-@app.route("/webhook/products_create", methods=["POST"])
+@app.route("/webhook/products_create", methods=["POST"]) 
 def products_create():
     h = request.headers.get("X-Shopify-Hmac-SHA256", "")
     raw = request.get_data()
@@ -2038,6 +2052,7 @@ def flusher():
                 if not QUIET_PUSH:
                     print(f"[PUSH][COLL] {ADMIN_HOST_LOCAL}: {len(chunk)} -> {'OK' if ok else 'ERR'}")
                 time.sleep(0.3)
+
 
 def flush_once():
     ADMIN_HOST_LOCAL = list(ADMIN_TOKENS.keys())[0]
@@ -2156,6 +2171,7 @@ def run_cycle():
     finally:
         with run_lock:
             is_running = False
+
 
 def scheduler_loop():
     if RUN_EVERY_MIN <= 0:
