@@ -140,7 +140,7 @@ ROUND_STEP_USD = int(os.getenv("DISCOUNT_ROUND_STEP_USD", "5"))
 
 ENABLE_US_PRICE_FROM_PRICEININDIA = os.getenv("ENABLE_US_PRICE_FROM_PRICEININDIA", "1") == "1"
 FX_INR_PER_USD = float(os.getenv("FX_INR_PER_USD", "85"))
-US_MARKUP_MULT = float(os.getenv("US_MARKUP_MULT", "1.55"))
+US_MARKUP_MULT = float(os.getenv("US_MARKUP_MULT", "1.8"))
 US_SHIP_ADD    = float(os.getenv("US_SHIP_ADD", "50"))
 
 # ---- Counters app: Admin host/token (single-host counters target) ----
