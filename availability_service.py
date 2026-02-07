@@ -1142,7 +1142,7 @@ def scan_india_and_update(read_only: bool = False):
 
                 if not read_only:
                     try:
-                        # maybe_apply_temp_discount_for_product("IN", IN_DOMAIN, IN_TOKEN, p, avail)
+                       # maybe_apply_temp_discount_for_product("IN", IN_DOMAIN, IN_TOKEN, p, avail)
                     except Exception as e:
                         log_row("⚠️", "DISC", "WARN", product_id=pid, sku=sku, message=f"Apply discount pass error: {e}")
 
