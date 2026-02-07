@@ -1122,36 +1122,44 @@ def send_to_manufacturing(*, sku: str, delta: int, before: int, after: int,
 def scan_india_and_update(read_only: bool = False):
     last_seen: Dict[str, int] = load_json(IN_LAST_SEEN, {})
     today = today_ist_str()
+
     for handle in IN_COLLECTIONS:
         cursor = None
+
         while True:
             data = gql(IN_DOMAIN, IN_TOKEN, QUERY_COLLECTION_PAGE_IN, {"handle": handle, "cursor": cursor})
             coll = data.get("collectionByHandle")
             if not coll:
                 log_row("⚠️", "IN", "WARN", message=f"Collection not found: {handle}")
                 break
+
             prods = ((coll.get("products") or {}).get("nodes") or [])
             pageInfo = ((coll.get("products") or {}).get("pageInfo") or {})
+
             for p in prods:
                 pid = gid_num(p["id"])
+                pid_str = str(pid)
+
                 title = p.get("title") or ""
                 status = (p.get("status") or "").upper()
                 sku = (((p.get("metafield") or {}).get("value")) or "").strip()
+
                 variants = ((p.get("variants") or {}).get("nodes") or [])
                 avail = compute_product_availability(variants, IN_INCLUDE_UNTRACKED)
 
                 if not read_only:
                     try:
-                       # maybe_apply_temp_discount_for_product("IN", IN_DOMAIN, IN_TOKEN, p, avail)
+                        # maybe_apply_temp_discount_for_product("IN", IN_DOMAIN, IN_TOKEN, p, avail)
+                        pass
                     except Exception as e:
                         log_row("⚠️", "DISC", "WARN", product_id=pid, sku=sku, message=f"Apply discount pass error: {e}")
 
-                prev = _as_int_or_none(last_seen.get(pid))
+                prev = _as_int_or_none(last_seen.get(pid_str))
                 if prev is None:
                     prev = 0
 
                 # NEW: Auto-clear manual manufacturing flag if availability increased (optional)
-                if not read_only and AUTO_CLEAR_START_MFG_ON_INCREASE and avail > prev:
+                if (not read_only) and AUTO_CLEAR_START_MFG_ON_INCREASE and (avail > prev):
                     try:
                         set_start_manufacturing_flag(IN_DOMAIN, IN_TOKEN, p["id"], "")
                     except Exception as e:
@@ -1164,10 +1172,21 @@ def scan_india_and_update(read_only: bool = False):
                         except Exception as e:
                             log_row("⚠️", "IN", "WAS_RTS_CLEAR_WARN", product_id=pid, sku=sku, message=f"clear error: {e}")
 
-                if not read_only and avail < prev:
+                if (not read_only) and (avail < prev):
                     sold = prev - avail
-                    bump_sales_in(IN_DOMAIN, IN_TOKEN, p["id"], p.get("salesTotal") or {}, p.get("salesDates") or {}, sold, today)
-                    log_row("🧾➖", "IN", "SALES_BUMP", product_id=pid, sku=sku, delta=f"-{sold}", message=f"avail {prev}->{avail} (sold={sold})", title=title, before=str(prev), after=str(avail))
+                    bump_sales_in(
+                        IN_DOMAIN, IN_TOKEN, p["id"],
+                        p.get("salesTotal") or {},
+                        p.get("salesDates") or {},
+                        sold, today
+                    )
+                    log_row(
+                        "🧾➖", "IN", "SALES_BUMP",
+                        product_id=pid, sku=sku,
+                        delta=f"-{sold}",
+                        message=f"avail {prev}->{avail} (sold={sold})",
+                        title=title, before=str(prev), after=str(avail)
+                    )
 
                     # If it *was* Ready-To-Ship (prev > 0) and got sold, stamp the RTS proof fields
                     try:
@@ -1192,9 +1211,12 @@ def scan_india_and_update(read_only: bool = False):
                         variant_id = gid_num(v0.get("id") or "")
                         sku_eff = (sku or v0.get("sku") or "").strip()
 
-                        print(f'[MFG] DROP DETECTED site={SOURCE_SITE} sku="{sku_eff}" {prev}->{avail} delta={avail - prev}', flush=True)
+                        print(
+                            f'[MFG] DROP DETECTED site={SOURCE_SITE} sku="{sku_eff}" {prev}->{avail} delta={avail - prev}',
+                            flush=True
+                        )
 
-                        if ENABLE_MFG_NOTIFY and (avail < prev):
+                        if ENABLE_MFG_NOTIFY:
                             ok = notify_mfg_sale(
                                 endpoint_url=B_ENDPOINT_URL or None,          # use env if blank
                                 shared_secret=A_TO_B_SHARED_SECRET or None,   # use env if blank
@@ -1216,37 +1238,51 @@ def scan_india_and_update(read_only: bool = False):
                         print(f"[MFG] invoke error: {e}", flush=True)
 
                     try:
-                        #revert_temp_discount_for_product("IN", IN_DOMAIN, IN_TOKEN, p)
+                        # revert_temp_discount_for_product("IN", IN_DOMAIN, IN_TOKEN, p)
+                        pass
                     except Exception as e:
                         log_row("⚠️", "DISC", "WARN", product_id=pid, sku=sku, message=f"Revert on sale error: {e}")
 
-                if not read_only and CLAMP_AVAIL_TO_ZERO and avail < 0 and variants:
+                if (not read_only) and CLAMP_AVAIL_TO_ZERO and (avail < 0) and variants:
                     inv_item_gid = (((variants[0].get("inventoryItem") or {}).get("id")) or "")
                     inv_item_id = int(gid_num(inv_item_gid) or "0")
                     try:
                         rest_adjust_inventory(IN_DOMAIN, IN_TOKEN, inv_item_id, int(IN_LOCATION_ID), -avail)
-                        log_row("🧰0️⃣", "IN", "CLAMP_TO_ZERO", product_id=pid, sku=sku, delta=f"+{-avail}", message=f"Raised availability to 0 on inventory_item_id={inv_item_id}", title=title, before=str(avail), after="0")
+                        log_row(
+                            "🧰0️⃣", "IN", "CLAMP_TO_ZERO",
+                            product_id=pid, sku=sku, delta=f"+{-avail}",
+                            message=f"Raised availability to 0 on inventory_item_id={inv_item_id}",
+                            title=title, before=str(avail), after="0"
+                        )
                         avail = 0
                     except Exception as e:
                         log_row("⚠️", "IN", "WARN", product_id=pid, sku=sku, message=f"Clamp error: {e}")
 
                 _, target_badge, target_delivery = desired_state(avail)
                 if not read_only:
-                    set_product_metafields(IN_DOMAIN, IN_TOKEN, p["id"], p.get("badges") or {}, p.get("dtime") or {}, target_badge, target_delivery)
+                    set_product_metafields(
+                        IN_DOMAIN, IN_TOKEN, p["id"],
+                        p.get("badges") or {},
+                        p.get("dtime") or {},
+                        target_badge, target_delivery
+                    )
 
                 if (not read_only) and IN_CHANGE_STATUS and SPECIAL_STATUS_HANDLE and (handle == SPECIAL_STATUS_HANDLE):
-                    if avail < 1 and status == "ACTIVE":
+                    if (avail < 1) and (status == "ACTIVE"):
                         ok = update_product_status(IN_DOMAIN, IN_TOKEN, p["id"], "DRAFT")
-                        log_row("🛑", "IN", "STATUS_TO_DRAFT" if ok else "STATUS_TO_DRAFT_FAILED", product_id=pid, sku=sku, delta=str(avail), title=title, message=f"handle={handle}")
-                    elif avail >= 1 and status == "DRAFT":
+                        log_row("🛑", "IN", "STATUS_TO_DRAFT" if ok else "STATUS_TO_DRAFT_FAILED",
+                                product_id=pid, sku=sku, delta=str(avail), title=title, message=f"handle={handle}")
+                    elif (avail >= 1) and (status == "DRAFT"):
                         ok = update_product_status(IN_DOMAIN, IN_TOKEN, p["id"], "ACTIVE")
-                        log_row("✅", "IN", "STATUS_TO_ACTIVE" if ok else "STATUS_TO_ACTIVE_FAILED", product_id=pid, sku=sku, delta=str(avail), title=title, message=f"handle={handle}")
+                        log_row("✅", "IN", "STATUS_TO_ACTIVE" if ok else "STATUS_TO_ACTIVE_FAILED",
+                                product_id=pid, sku=sku, delta=str(avail), title=title, message=f"handle={handle}")
 
-                last_seen[pid] = max(0, int(avail))
+                last_seen[pid_str] = max(0, int(avail))
                 sleep_ms(SLEEP_BETWEEN_PRODUCTS_MS)
 
             save_json(IN_LAST_SEEN, last_seen)
             sleep_ms(SLEEP_BETWEEN_PAGES_MS)
+
             if pageInfo.get("hasNextPage"):
                 cursor = pageInfo.get("endCursor")
             else:
