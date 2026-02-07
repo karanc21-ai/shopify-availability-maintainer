@@ -1315,6 +1315,7 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
                 if not read_only:
                     try:
                        # maybe_apply_temp_discount_for_product("US", US_DOMAIN, US_TOKEN, p, us_avail)
+                       pass
                     except Exception as e:
                         log_row("⚠️", "DISC", "WARN",
                                product_id=gid_num(p["id"]), message=f"US apply discount pass error: {e}")
