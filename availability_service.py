@@ -1142,7 +1142,7 @@ def scan_india_and_update(read_only: bool = False):
 
                 if not read_only:
                     try:
-                        maybe_apply_temp_discount_for_product("IN", IN_DOMAIN, IN_TOKEN, p, avail)
+                        # maybe_apply_temp_discount_for_product("IN", IN_DOMAIN, IN_TOKEN, p, avail)
                     except Exception as e:
                         log_row("⚠️", "DISC", "WARN", product_id=pid, sku=sku, message=f"Apply discount pass error: {e}")
 
@@ -1216,7 +1216,7 @@ def scan_india_and_update(read_only: bool = False):
                         print(f"[MFG] invoke error: {e}", flush=True)
 
                     try:
-                        revert_temp_discount_for_product("IN", IN_DOMAIN, IN_TOKEN, p)
+                        #revert_temp_discount_for_product("IN", IN_DOMAIN, IN_TOKEN, p)
                     except Exception as e:
                         log_row("⚠️", "DISC", "WARN", product_id=pid, sku=sku, message=f"Revert on sale error: {e}")
 
@@ -1278,7 +1278,7 @@ def scan_usa_and_mirror_to_india(read_only: bool = False):
                 # US temp discount application
                 if not read_only:
                     try:
-                        maybe_apply_temp_discount_for_product("US", US_DOMAIN, US_TOKEN, p, us_avail)
+                       # maybe_apply_temp_discount_for_product("US", US_DOMAIN, US_TOKEN, p, us_avail)
                     except Exception as e:
                         log_row("⚠️", "DISC", "WARN",
                                product_id=gid_num(p["id"]), message=f"US apply discount pass error: {e}")
