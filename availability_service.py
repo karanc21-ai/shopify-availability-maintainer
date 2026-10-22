@@ -1188,14 +1188,17 @@ def scan_india_and_update(read_only: bool = False):
                         title=title, before=str(prev), after=str(avail)
                     )
 
-                    # If it *was* Ready-To-Ship (prev > 0) and got sold, stamp the RTS proof fields
+                    # Record the most recently observed stock decrease explicitly.
+                    # A previous RTS sale must not leave a stale "yes" when the
+                    # next detected sale starts with no available stock.
+                    # This product-level signal is NOT an order-line classification.
                     try:
-                        if prev > 0:
-                            set_was_ready_flags(
-                                IN_DOMAIN, IN_TOKEN, p["id"],
-                                ready_value="yes",
-                                at_iso=now_ist().isoformat()
-                            )
+                        detected_ready = "yes" if prev > 0 else "no"
+                        set_was_ready_flags(
+                            IN_DOMAIN, IN_TOKEN, p["id"],
+                            ready_value=detected_ready,
+                            at_iso=now_ist().isoformat()
+                        )
                     except Exception as e:
                         log_row("⚠️", "IN", "WAS_RTS_WARN", product_id=pid, sku=sku, message=f"stamp error: {e}")
 
