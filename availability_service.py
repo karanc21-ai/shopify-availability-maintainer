@@ -61,6 +61,7 @@ import hmac
 import base64
 import threading
 import ipaddress
+import sqlite3
 from typing import Dict, Any, List, Optional, Tuple, Set
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -2005,6 +2006,82 @@ def verify_hmac(req_body: bytes, header_hmac: str) -> bool:
         return hmac.compare_digest(expected, header_hmac or "")
     except Exception:
         return False
+
+# Order webhook ledger: persistent event intake, NOT inventory classification.
+# Mount a persistent disk at DATA_DIR before enabling this endpoint.
+ORDER_LEDGER_DB = p("order_events.sqlite3")
+ORDER_LEDGER_READ_TOKEN = os.getenv("ORDER_LEDGER_READ_TOKEN", "").strip()
+
+def _order_ledger_db():
+    connection = sqlite3.connect(ORDER_LEDGER_DB, timeout=15)
+    connection.execute("PRAGMA busy_timeout=15000")
+    connection.execute("""CREATE TABLE IF NOT EXISTS order_events (
+        order_id TEXT PRIMARY KEY,
+        order_name TEXT,
+        created_at TEXT NOT NULL,
+        received_at TEXT NOT NULL,
+        shop TEXT NOT NULL,
+        line_items_json TEXT NOT NULL
+    )""")
+    return connection
+
+@app.route("/webhook/orders_create", methods=["POST"])
+def orders_create_ledger():
+    # Always authenticate against the raw body, never JSON reserialization.
+    raw = request.get_data()
+    if not SHOPIFY_WEBHOOK_SECRET or not verify_hmac(raw, request.headers.get("X-Shopify-Hmac-SHA256", "")):
+        return "unauthorized", 401
+    sender = normalize_host(request.headers.get("X-Shopify-Shop-Domain", "").strip())
+    if sender != normalize_host(IN_DOMAIN):
+        return "forbidden", 403
+    try:
+        payload = json.loads(raw)
+        order_id = str(payload.get("id") or "")
+        created_at = str(payload.get("created_at") or "")
+        if not order_id or not created_at:
+            return "bad request", 400
+        line_items = []
+        for line in payload.get("line_items", []):
+            if not isinstance(line, dict):
+                continue
+            line_items.append({
+                "line_item_id": str(line.get("id") or ""),
+                "sku": str(line.get("sku") or ""),
+                "variant_id": str(line.get("variant_id") or ""),
+                "product_id": str(line.get("product_id") or ""),
+                "quantity": int(line.get("quantity") or 0)
+            })
+        with _order_ledger_db() as conn:
+            conn.execute("""INSERT OR IGNORE INTO order_events
+                (order_id, order_name, created_at, received_at, shop, line_items_json)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (order_id, str(payload.get("name") or ""), created_at,
+                 datetime.now(timezone.utc).isoformat(), sender, json.dumps(line_items)))
+        return "ok", 200
+    except (ValueError, TypeError, sqlite3.Error) as ex:
+        print(f"[ORDER_LEDGER] insert failed: {ex}", flush=True)
+        return "temporarily unavailable", 503
+
+@app.route("/api/order-ledger", methods=["GET"])
+def order_ledger_list():
+    # Fail closed until a dedicated read token is configured.
+    supplied = request.headers.get("Authorization", "")
+    if not ORDER_LEDGER_READ_TOKEN or not hmac.compare_digest(supplied, "Bearer " + ORDER_LEDGER_READ_TOKEN):
+        return "unauthorized", 401
+    try:
+        limit = min(500, max(1, int(request.args.get("limit", "100"))))
+        with _order_ledger_db() as conn:
+            rows = conn.execute("""SELECT order_id, order_name, created_at, received_at,
+                shop, line_items_json FROM order_events
+                ORDER BY created_at DESC LIMIT ?""", (limit,)).fetchall()
+        return jsonify({"orders": [
+            {"order_id": row[0], "order_name": row[1], "created_at": row[2],
+             "received_at": row[3], "shop": row[4], "line_items": json.loads(row[5])}
+            for row in rows
+        ]})
+    except (ValueError, sqlite3.Error) as ex:
+        print(f"[ORDER_LEDGER] read failed: {ex}", flush=True)
+        return "temporarily unavailable", 503
 
 @app.route("/webhook/products_create", methods=["POST"]) 
 def products_create():
