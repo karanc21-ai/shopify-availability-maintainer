@@ -61,6 +61,7 @@ import hmac
 import base64
 import threading
 import ipaddress
+import sqlite3
 from typing import Dict, Any, List, Optional, Tuple, Set
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -2006,6 +2007,143 @@ def verify_hmac(req_body: bytes, header_hmac: str) -> bool:
     except Exception:
         return False
 
+# Order webhook ledger: persistent event intake, NOT inventory classification.
+# Mount a persistent disk at DATA_DIR before enabling this endpoint.
+ORDER_LEDGER_DB = p("order_events.sqlite3")
+ORDER_LEDGER_READ_TOKEN = os.getenv("ORDER_LEDGER_READ_TOKEN", "").strip()
+ORDER_LEDGER_POLL_ENABLED = os.getenv("ORDER_LEDGER_POLL_ENABLED", "0") == "1"
+ORDER_LEDGER_POLL_SECONDS = max(180, int(os.getenv("ORDER_LEDGER_POLL_SECONDS", "300")))
+# The polling job re-reads a rolling window, so outages do not create gaps.
+ORDER_LEDGER_LOOKBACK_DAYS = max(1, min(30, int(os.getenv("ORDER_LEDGER_LOOKBACK_DAYS", "7"))))
+
+
+def _order_ledger_db():
+    connection = sqlite3.connect(ORDER_LEDGER_DB, timeout=15)
+    connection.execute("PRAGMA busy_timeout=15000")
+    connection.execute("""CREATE TABLE IF NOT EXISTS order_events (
+        order_id TEXT PRIMARY KEY,
+        order_name TEXT,
+        created_at TEXT NOT NULL,
+        received_at TEXT NOT NULL,
+        shop TEXT NOT NULL,
+        line_items_json TEXT NOT NULL
+    )""")
+    return connection
+
+@app.route("/webhook/orders_create", methods=["POST"])
+def orders_create_ledger():
+    # Always authenticate against the raw body, never JSON reserialization.
+    raw = request.get_data()
+    if not SHOPIFY_WEBHOOK_SECRET or not verify_hmac(raw, request.headers.get("X-Shopify-Hmac-SHA256", "")):
+        return "unauthorized", 401
+    sender = normalize_host(request.headers.get("X-Shopify-Shop-Domain", "").strip())
+    if sender != normalize_host(IN_DOMAIN):
+        return "forbidden", 403
+    try:
+        payload = json.loads(raw)
+        order_id = str(payload.get("id") or "")
+        created_at = str(payload.get("created_at") or "")
+        if not order_id or not created_at:
+            return "bad request", 400
+        line_items = []
+        for line in payload.get("line_items", []):
+            if not isinstance(line, dict):
+                continue
+            line_items.append({
+                "line_item_id": str(line.get("id") or ""),
+                "sku": str(line.get("sku") or ""),
+                "variant_id": str(line.get("variant_id") or ""),
+                "product_id": str(line.get("product_id") or ""),
+                "quantity": int(line.get("quantity") or 0)
+            })
+        with _order_ledger_db() as conn:
+            conn.execute("""INSERT OR IGNORE INTO order_events
+                (order_id, order_name, created_at, received_at, shop, line_items_json)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (order_id, str(payload.get("name") or ""), created_at,
+                 datetime.now(timezone.utc).isoformat(), sender, json.dumps(line_items)))
+        return "ok", 200
+    except (ValueError, TypeError, sqlite3.Error) as ex:
+        print(f"[ORDER_LEDGER] insert failed: {ex}", flush=True)
+        return "temporarily unavailable", 503
+
+
+def poll_shopify_orders_to_ledger():
+    """Recover orders missed by webhooks. This does not infer RTS/MTO."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=ORDER_LEDGER_LOOKBACK_DAYS)
+    cutoff_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+    query = """query($cursor:String,$filter:String!) {
+      orders(first:100,after:$cursor,sortKey:CREATED_AT,reverse:true,query:$filter) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id name createdAt
+          lineItems(first:100) { nodes { id sku quantity variant { id product { id } } } }
+        }
+      }
+    }"""
+    cursor = None
+    count = 0
+    while True:
+        data = gql(IN_DOMAIN, IN_TOKEN, query, {"cursor": cursor, "filter": f"created_at:>={cutoff_iso}"})
+        connection = data["orders"]
+        with _order_ledger_db() as db_conn:
+            for order in connection.get("nodes", []):
+                details = []
+                for line in order["lineItems"]["nodes"]:
+                    variant = line.get("variant") or {}
+                    product = variant.get("product") or {}
+                    details.append({
+                        "line_item_id": str(line["id"]).rsplit("/", 1)[-1],
+                        "sku": line.get("sku") or "",
+                        "quantity": int(line.get("quantity") or 0),
+                        "variant_id": str(variant.get("id") or "").rsplit("/", 1)[-1],
+                        "product_id": str(product.get("id") or "").rsplit("/", 1)[-1]
+                    })
+                db_conn.execute("""INSERT OR IGNORE INTO order_events
+                    (order_id,order_name,created_at,received_at,shop,line_items_json)
+                    VALUES (?,?,?,?,?,?)""",(
+                        str(order["id"]).rsplit("/", 1)[-1], order["name"],
+                        order["createdAt"], datetime.now(timezone.utc).isoformat(),
+                        normalize_host(IN_DOMAIN), json.dumps(details)
+                    ))
+                count += 1
+        if not connection["pageInfo"]["hasNextPage"]:
+            break
+        cursor = connection["pageInfo"]["endCursor"]
+        if not cursor:
+            raise RuntimeError("Order pagination hasNextPage without cursor")
+    print(f"[ORDER_LEDGER] Poll reconciled {count} orders", flush=True)
+    return count
+
+def _order_ledger_poller():
+    while True:
+        try:
+            poll_shopify_orders_to_ledger()
+        except Exception as ex:
+            print(f"[ORDER_LEDGER] poll error: {ex}", flush=True)
+        time.sleep(ORDER_LEDGER_POLL_SECONDS)
+
+@app.route("/api/order-ledger", methods=["GET"])
+def order_ledger_list():
+    # Fail closed until a dedicated read token is configured.
+    supplied = request.headers.get("Authorization", "")
+    if not ORDER_LEDGER_READ_TOKEN or not hmac.compare_digest(supplied, "Bearer " + ORDER_LEDGER_READ_TOKEN):
+        return "unauthorized", 401
+    try:
+        limit = min(500, max(1, int(request.args.get("limit", "100"))))
+        with _order_ledger_db() as conn:
+            rows = conn.execute("""SELECT order_id, order_name, created_at, received_at,
+                shop, line_items_json FROM order_events
+                ORDER BY created_at DESC LIMIT ?""", (limit,)).fetchall()
+        return jsonify({"orders": [
+            {"order_id": row[0], "order_name": row[1], "created_at": row[2],
+             "received_at": row[3], "shop": row[4], "line_items": json.loads(row[5])}
+            for row in rows
+        ]})
+    except (ValueError, sqlite3.Error) as ex:
+        print(f"[ORDER_LEDGER] read failed: {ex}", flush=True)
+        return "temporarily unavailable", 503
+
 @app.route("/webhook/products_create", methods=["POST"]) 
 def products_create():
     h = request.headers.get("X-Shopify-Hmac-SHA256", "")
@@ -2273,6 +2411,10 @@ except Exception as e: print("[BOOT] rollover check error:", e)
 Thread(target=flusher, daemon=True).start()
 Thread(target=daily_csv_worker, daemon=True).start()
 Thread(target=availability_poller, daemon=True).start()
+# Only enable this on the durable web service, never the inventory worker.
+if ORDER_LEDGER_POLL_ENABLED:
+    Thread(target=_order_ledger_poller, daemon=True).start()
+
 if ENABLE_SCHEDULER:
     Thread(target=scheduler_loop, daemon=True).start()
 
