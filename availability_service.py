@@ -2123,6 +2123,37 @@ def _order_ledger_poller():
             print(f"[ORDER_LEDGER] poll error: {ex}", flush=True)
         time.sleep(ORDER_LEDGER_POLL_SECONDS)
 
+# Explicit, auditable operator decisions. Never infer RTS from post-order stock.
+@app.route("/api/order-ledger/decision", methods=["POST"])
+def order_ledger_decision():
+    supplied = request.headers.get("Authorization", "")
+    if not ORDER_LEDGER_READ_TOKEN or not hmac.compare_digest(supplied, "Bearer " + ORDER_LEDGER_READ_TOKEN):
+        return "unauthorized", 401
+    obj = request.get_json(silent=True) or {}
+    order_id = str(obj.get("order_id") or "").strip()
+    line_id = str(obj.get("line_item_id") or "").rsplit("/", 1)[-1].strip()
+    readiness = str(obj.get("readiness") or "")
+    note = str(obj.get("evidence") or "").strip()
+    if not order_id.isdigit() or not line_id.isdigit() or readiness not in ("Ready", "MTO") or not note or len(note)>500:
+        return jsonify(error="order_id, line_item_id, Ready/MTO, and evidence required"), 400
+    try:
+        with _order_ledger_db() as conn:
+            row = conn.execute("SELECT line_items_json FROM order_events WHERE order_id=?", (order_id,)).fetchone()
+            if not row:
+                return jsonify(error="Order not captured yet"), 404
+            lines = json.loads(row[0])
+            match = next((line for line in lines if str(line.get("line_item_id") or "").rsplit("/",1)[-1]==line_id), None)
+            if not match:
+                return jsonify(error="Line item not in this order"), 404
+            match["readiness"] = readiness
+            match["readiness_source"] = "Verified operator evidence: " + note
+            match["readiness_recorded_at"] = datetime.now(timezone.utc).isoformat()
+            conn.execute("UPDATE order_events SET line_items_json=? WHERE order_id=?", (json.dumps(lines), order_id))
+        return jsonify(ok=True, order_id=order_id, line_item_id=line_id, readiness=readiness)
+    except (ValueError, sqlite3.Error) as ex:
+        print(f"[ORDER_LEDGER] decision failed: {ex}", flush=True)
+        return "temporarily unavailable", 503
+
 @app.route("/api/order-ledger", methods=["GET"])
 def order_ledger_list():
     # Fail closed until a dedicated read token is configured.
